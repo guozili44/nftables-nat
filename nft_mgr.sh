@@ -15,26 +15,18 @@ PLAIN='\033[0m'
 # --- 自动设置快捷命令 ---
 function setup_alias() {
     local shell_rc="$HOME/.bashrc"
-    # 获取当前脚本的绝对路径
     local current_path=$(realpath "$0" 2>/dev/null || readlink -f "$0")
     
-    # 防止在定时任务等非终端环境中执行
-    if [[ ! -t 0 ]]; then
-        return
-    fi
+    if [[ ! -t 0 ]]; then return; fi
 
-    # 检查并添加/更新别名
     if ! grep -q "alias nft=" "$shell_rc" 2>/dev/null; then
         echo "alias nft='bash \"$current_path\"'" >> "$shell_rc"
         echo -e "${GREEN}[系统提示] 快捷命令 'nft' 已添加！下次重新连接 SSH 后，可直接输入 nft 打开面板。${PLAIN}"
         sleep 2
     else
-        # 如果路径有变，自动更新别名指向的路径
         sed -i "s|alias nft=.*|alias nft='bash \"$current_path\"'|g" "$shell_rc"
     fi
 }
-
-# 脚本启动时自动执行快捷命令检查
 setup_alias
 
 # --- 系统优化与 BBR ---
@@ -48,6 +40,7 @@ net.ipv6.conf.all.forwarding = 1
 EOF
     sudo sysctl --system
     echo -e "${GREEN}系统优化配置已应用。${PLAIN}"
+    sleep 2
 }
 
 # --- 域名解析函数 ---
@@ -78,12 +71,14 @@ function add_forward() {
     tip=$(get_ip "$taddr")
     if [ -z "$tip" ]; then
         echo -e "${RED}无法解析地址，请检查输入。${PLAIN}"
+        sleep 2
         return
     fi
 
     echo "$lport|$taddr|$tport|$tip" >> $CONFIG_FILE
     apply_rules
     echo -e "${GREEN}添加成功！${PLAIN}"
+    sleep 2
 }
 
 # --- 应用规则到内核 ---
@@ -105,25 +100,58 @@ function apply_rules() {
     nft list ruleset > $NFT_CONF
 }
 
-# --- 查看转发 ---
-function show_forward() {
-    echo -e "\n${YELLOW}当前转发列表：${PLAIN}"
-    echo "-----------------------------------------------------------"
-    printf "%-10s | %-20s | %-10s | %-15s\n" "本地端口" "目标地址" "目标端口" "当前映射IP"
+# --- 新增：合并后的查看与删除功能 ---
+function view_and_del_forward() {
+    clear
+    if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}当前没有任何转发规则。${PLAIN}"
+        read -p "按回车返回主菜单..."
+        return
+    fi
+
+    echo -e "${GREEN}--- 当前转发列表 ---${PLAIN}"
+    echo "----------------------------------------------------------------------"
+    printf "%-5s | %-10s | %-20s | %-10s | %-15s\n" "序号" "本地端口" "目标地址" "目标端口" "当前映射IP"
+    
+    local i=1
     while IFS='|' read -r lp addr tp last_ip; do
         current_ip=$(get_ip "$addr")
-        printf "%-10s | %-20s | %-10s | %-15s\n" "$lp" "$addr" "$tp" "$current_ip"
-    done < $CONFIG_FILE
-    echo "-----------------------------------------------------------"
-}
+        printf "%-5s | %-10s | %-20s | %-10s | %-15s\n" "$i" "$lp" "$addr" "$tp" "$current_ip"
+        ((i++))
+    done < "$CONFIG_FILE"
+    echo "----------------------------------------------------------------------"
 
-# --- 删除转发 ---
-function del_forward() {
-    show_forward
-    read -p "请输入要删除的本地端口: " del_port
-    sed -i "/^$del_port|/d" $CONFIG_FILE
+    echo -e "${YELLOW}提示: 输入规则前面的【序号】即可删除，输入【0】或直接按回车返回主菜单。${PLAIN}"
+    read -p "请选择操作: " action
+
+    # 如果直接回车或输入 0
+    if [ -z "$action" ] || [ "$action" == "0" ]; then
+        return
+    fi
+
+    # 验证输入是否为数字
+    if [[ ! "$action" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}输入无效，请输入正确的数字序号。${PLAIN}"
+        sleep 2
+        return
+    fi
+
+    # 验证序号是否超出范围
+    local total_lines=$(wc -l < "$CONFIG_FILE")
+    if [ "$action" -lt 1 ] || [ "$action" -gt "$total_lines" ]; then
+        echo -e "${RED}序号超出范围，没有该规则！${PLAIN}"
+        sleep 2
+        return
+    fi
+
+    # 提取被删除的本地端口以便提示
+    local del_port=$(sed -n "${action}p" "$CONFIG_FILE" | cut -d'|' -f1)
+    
+    # 根据序号（行号）删除配置
+    sed -i "${action}d" "$CONFIG_FILE"
     apply_rules
-    echo -e "${GREEN}已删除端口 $del_port 的转发规则。${PLAIN}"
+    echo -e "${GREEN}已成功删除序号 $action (本地端口: $del_port) 的转发规则。${PLAIN}"
+    sleep 2
 }
 
 # --- 监控脚本 (DDNS 追踪更新) ---
@@ -177,3 +205,39 @@ function manage_cron() {
 }
 
 # --- 主菜单 ---
+function main_menu() {
+    clear
+    echo -e "${GREEN}--- nftables 端口转发管理面板 ---${PLAIN}"
+    echo "1. 开启 BBR + 系统转发优化"
+    echo "2. 新增端口转发 (支持域名/IP)"
+    echo "3. 查看 / 删除端口转发"
+    echo "4. 清空所有转发规则"
+    echo "5. 管理定时监控 (DDNS 同步)"
+    echo "0. 退出"
+    echo "--------------------------------"
+    read -p "请选择操作 [0-5]: " choice
+
+    case $choice in
+        1) optimize_system ;;
+        2) add_forward ;;
+        3) view_and_del_forward ;;
+        4) > $CONFIG_FILE ; apply_rules ; echo -e "${GREEN}所有转发规则已清空。${PLAIN}" ; sleep 2 ;;
+        5) manage_cron ;;
+        0) exit 0 ;;
+        *) echo "无效选项" ; sleep 1 ;;
+    esac
+}
+
+# 检查依赖
+if ! command -v dig &> /dev/null; then
+    apt-get update && apt-get install -y dnsutils || yum install -y bind-utils
+fi
+
+# 如果带参数运行（用于定时任务）
+if [ "$1" == "--cron" ]; then
+    ddns_update
+    exit 0
+fi
+
+# 保持循环
+while true; do main_menu; done
