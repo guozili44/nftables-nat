@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# 脚本名称: SSR 综合管理脚本 (巅峰修复版)
-# 核心功能: 二进制热替换、守护进程、SSH密钥中心、TFO、IPv6满血BBR、保留ShadowTLS
+# 脚本名称: SSR 综合管理脚本 (满血修复版)
+# 核心功能: 找回基础管理功能、二进制热替换、SSH密钥中心、IPv6满血BBR、保留ShadowTLS
 # 全局命令: ssr [可选参数: bbr | clean | update | daemon | hot_upgrade]
 # ==============================================================================
 
@@ -10,7 +10,7 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
-readonly SCRIPT_VERSION="19.1-Apex-Fixed"
+readonly SCRIPT_VERSION="19.2-Ultimate-Restored"
 readonly CONF_FILE="/etc/sysctl.d/99-bbr.conf"
 
 trap 'echo -e "\n${GREEN}已安全退出脚本。${RESET}"; exit 0' SIGINT
@@ -43,7 +43,7 @@ install_global_command() {
 }
 
 # ==========================================================
-# 核心组件二进制无感热替换 (API 防崩与校验机制)
+# 核心组件二进制无感热替换
 # ==========================================================
 hot_update_components() {
     local is_silent=$1
@@ -59,7 +59,6 @@ hot_update_components() {
         [[ "$is_silent" != "silent" ]] && echo -e "${RED}暂不支持此架构: $arch${RESET}"; return
     fi
 
-    # 1. SS-Rust 安全热替换
     if [[ -x "/usr/local/bin/ss-rust" ]]; then
         local ss_api=$(curl -s --max-time 10 https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest)
         local ss_latest=$(echo "$ss_api" | jq -r .tag_name 2>/dev/null)
@@ -79,7 +78,6 @@ hot_update_components() {
         fi
     fi
 
-    # 2. ShadowTLS 安全热替换
     if [[ -x "/usr/local/bin/shadow-tls" ]]; then
         local st_api=$(curl -s --max-time 10 https://api.github.com/repos/ihciah/shadow-tls/releases/latest)
         local st_latest=$(echo "$st_api" | jq -r .tag_name 2>/dev/null)
@@ -102,7 +100,43 @@ hot_update_components() {
 }
 
 # ==========================================================
-# 极客专属模块 (TFO / 流媒体检测 / SSH 密钥 / 守护进程)
+# 基础管理功能 (找回的 SSH端口、密码、时间同步)
+# ==========================================================
+change_ssh_port() {
+    read -rp "请输入新的 SSH 端口号 (1-65535): " new_port
+    if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
+        if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then ufw allow "$new_port"/tcp >/dev/null 2>&1; fi
+        if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$new_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+        sed -i "s/^#\?Port [0-9]*/Port $new_port/g" /etc/ssh/sshd_config
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+        echo -e "${GREEN}✅ SSH 端口已成功修改为 $new_port (防火墙已自动放行)。${RESET}"
+    else
+        echo -e "${RED}输入无效，端口未修改。${RESET}"
+    fi
+}
+
+change_root_password() {
+    read -rp "请输入新的 root 密码: " new_pass
+    [[ -z "$new_pass" ]] && return
+    read -rp "请再次输入确认: " new_pass_confirm
+    [[ "$new_pass" != "$new_pass_confirm" ]] && echo -e "${RED}两次密码不一致！${RESET}" && return
+    echo "root:$new_pass" | chpasswd && echo -e "${GREEN}✅ 密码修改成功！请牢记您的新密码。${RESET}"
+}
+
+sync_server_time() {
+    echo -e "${CYAN}>>> 正在同步服务器时间...${RESET}"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -yqq systemd-timesyncd
+        systemctl enable --now systemd-timesyncd 2>/dev/null
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -yq chrony
+        systemctl enable --now chronyd 2>/dev/null
+    fi
+    echo -e "${GREEN}✅ 时间防偏移自动同步服务已启动！${RESET}"
+}
+
+# ==========================================================
+# 极客专属模块与系统调优
 # ==========================================================
 enable_tfo() {
     echo -e "${CYAN}>>> 正在配置内核级 TCP Fast Open...${RESET}"
@@ -127,64 +161,6 @@ run_daemon_check() {
     done
 }
 
-apply_ssh_key_sec() {
-    sed -i 's/^#\?PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config
-    sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication no/g' /etc/ssh/sshd_config
-    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
-    echo -e "${GREEN}✅ 已彻底封锁密码登录通道！仅允许密钥验证。${RESET}"
-}
-
-ssh_key_github() {
-    read -rp "请输入你的 GitHub 用户名: " gh_user; [[ -z "$gh_user" ]] && return
-    mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    local keys=$(curl -s --max-time 10 "https://github.com/${gh_user}.keys")
-    if [[ -z "$keys" || "$keys" == "Not Found" ]]; then
-        echo -e "${RED}❌ 未找到公钥或网络超时，请检查后重试。${RESET}"; return
-    fi
-    echo "$keys" >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
-    echo -e "${GREEN}✅ 已成功从 GitHub 拉取并配置公钥！${RESET}"; apply_ssh_key_sec
-}
-
-ssh_key_manual() {
-    read -rp "请粘贴你的 SSH 公钥: " manual_key; [[ -z "$manual_key" ]] && return
-    mkdir -p ~/.ssh && chmod 700 ~/.ssh; echo "$manual_key" >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
-    echo -e "${GREEN}✅ 手动配置公钥成功！${RESET}"; apply_ssh_key_sec
-}
-
-ssh_key_generate() {
-    echo -e "${CYAN}>>> 正在生成密钥对...${RESET}"; mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    rm -f ~/.ssh/id_ed25519*; ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
-    cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
-    echo -e "\n${YELLOW}======================================================${RESET}"
-    echo -e "${RED}⚠️ 请务必立即复制并保存以下私钥内容，否则将永远无法登录！⚠️${RESET}"
-    echo -e "${YELLOW}======================================================${RESET}"
-    cat ~/.ssh/id_ed25519
-    echo -e "${YELLOW}======================================================${RESET}"
-    read -rp "已保存私钥，确认关闭密码登录 (y/N): " confirm
-    [[ "$confirm" == "y" || "$confirm" == "Y" ]] && apply_ssh_key_sec
-}
-
-ssh_key_restore() {
-    sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
-    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; echo -e "${GREEN}✅ 已重新开启密码登录。${RESET}"
-}
-
-ssh_key_menu() {
-    clear; echo -e "${CYAN}========= SSH 密钥登录管理中心 (绝对防御) =========${RESET}"
-    echo -e "${YELLOW} 1.${RESET} 自动拉取公钥 (从 GitHub 获取)"
-    echo -e "${YELLOW} 2.${RESET} 手动填写公钥 (粘贴本地公钥)"
-    echo -e "${YELLOW} 3.${RESET} 一键生成密钥对 (直接在服务器生成)"
-    echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${RED} 4. 恢复密码登录 (禁用密钥强制机制)${RESET}"
-    echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e " 0. 返回"
-    read -rp "输入数字 [0-4]: " skm_num
-    case "$skm_num" in 1) ssh_key_github ;; 2) ssh_key_manual ;; 3) ssh_key_generate ;; 4) ssh_key_restore ;; 0) return ;; esac
-}
-
-# ==========================================================
-# 网络调优与系统管控模块
-# ==========================================================
 smart_optimization() {
     local total_mem=$(free -m | awk '/^Mem:/{print $2}' | tr -d '\r')
     local rmem_max="67108864"; local somaxconn="32768"; local conntrack_max="524288"; local file_max="1048576"
@@ -196,11 +172,9 @@ net.core.rmem_max = $rmem_max
 net.core.wmem_max = $rmem_max
 net.ipv4.tcp_rmem = 8192 262144 $rmem_max
 net.ipv4.tcp_wmem = 8192 262144 $rmem_max
-# 补充 IPv6 加速支持
 net.ipv6.conf.all.disable_ipv6 = 0
 net.ipv6.conf.default.disable_ipv6 = 0
 net.ipv6.conf.all.forwarding = 1
-
 net.core.somaxconn = $somaxconn
 net.core.netdev_max_backlog = $somaxconn
 net.ipv4.tcp_tw_reuse = 1
@@ -251,44 +225,87 @@ safe_install() {
     fi
 }
 
+# [SSH 密钥中心]
+apply_ssh_key_sec() {
+    sed -i 's/^#\?PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config
+    sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication no/g' /etc/ssh/sshd_config
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+    echo -e "${GREEN}✅ 已彻底封锁密码登录通道！仅允许密钥验证。${RESET}"
+}
+ssh_key_github() {
+    read -rp "请输入你的 GitHub 用户名: " gh_user; [[ -z "$gh_user" ]] && return
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    local keys=$(curl -s --max-time 10 "https://github.com/${gh_user}.keys")
+    if [[ -z "$keys" || "$keys" == "Not Found" ]]; then echo -e "${RED}❌ 未找到公钥。${RESET}"; return; fi
+    echo "$keys" >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
+    echo -e "${GREEN}✅ 已成功从 GitHub 拉取配置公钥！${RESET}"; apply_ssh_key_sec
+}
+ssh_key_manual() {
+    read -rp "请粘贴你的 SSH 公钥: " manual_key; [[ -z "$manual_key" ]] && return
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh; echo "$manual_key" >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
+    echo -e "${GREEN}✅ 手动配置公钥成功！${RESET}"; apply_ssh_key_sec
+}
+ssh_key_generate() {
+    echo -e "${CYAN}>>> 正在生成密钥对...${RESET}"; mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    rm -f ~/.ssh/id_ed25519*; ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+    cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
+    echo -e "\n${YELLOW}======================================================${RESET}"
+    echo -e "${RED}⚠️ 请保存以下私钥内容，否则无法登录！⚠️${RESET}"
+    echo -e "${YELLOW}======================================================${RESET}"
+    cat ~/.ssh/id_ed25519; echo -e "${YELLOW}======================================================${RESET}"
+    read -rp "确认关闭密码登录 (y/N): " confirm; [[ "$confirm" == "y" || "$confirm" == "Y" ]] && apply_ssh_key_sec
+}
+ssh_key_restore() {
+    sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; echo -e "${GREEN}✅ 恢复密码登录。${RESET}"
+}
+ssh_key_menu() {
+    clear; echo -e "${CYAN}========= SSH 密钥登录管理中心 =========${RESET}"
+    echo -e "${YELLOW} 1.${RESET} 自动拉取公钥 (GitHub)"; echo -e "${YELLOW} 2.${RESET} 手动填写公钥"; echo -e "${YELLOW} 3.${RESET} 一键生成密钥对"
+    echo -e "${RED} 4. 恢复密码登录${RESET}"; echo -e " 0. 返回"
+    read -rp "输入数字 [0-4]: " skm_num
+    case "$skm_num" in 1) ssh_key_github ;; 2) ssh_key_manual ;; 3) ssh_key_generate ;; 4) ssh_key_restore ;; 0) return ;; esac
+}
+
 # ==========================================================
-# 组件专项卸载中心
+# 组件专项卸载与全量清理
 # ==========================================================
 uninstall_bbrv3() {
     echo -e "${RED}⚠️ 警告: 强制卸载内核极其危险！${RESET}"
-    echo -e "${CYAN}安全回退指南：${RESET}"
-    echo -e "1. 请返回主菜单运行【开启 BBRv3 魔改内核】。"
-    echo -e "2. 在弹出的菜单中，选择 ${YELLOW}卸载全部内核${RESET} 或 ${YELLOW}安装系统自带内核${RESET}。"
+    echo -e "${CYAN}请返回主菜单运行【开启 BBRv3 魔改内核】，并在内部菜单卸载。${RESET}"
 }
 
 total_uninstall() {
     echo -e "${RED}⚠️ 正在执行毁灭性全量卸载...${RESET}"
     
+    # 清理 SS-Rust
     systemctl stop ss-rust 2>/dev/null; systemctl disable ss-rust 2>/dev/null
     rm -rf /etc/ss-rust /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service
     
+    # 清理 ShadowTLS
     for s in $(systemctl list-units --type=service --all --no-legend | grep "shadowtls-" | awk '{print $1}'); do
         systemctl stop "$s" 2>/dev/null; systemctl disable "$s" 2>/dev/null; rm -f "/etc/systemd/system/$s"
     done
     rm -f /usr/local/bin/shadow-tls
     
+    # 还原环境
     rm -f "$CONF_FILE" && sysctl --system >/dev/null 2>&1
     crontab -l 2>/dev/null | grep -vE "ssr auto_task|ssr daemon_check" | crontab -
     rm -f /usr/local/bin/ssr /usr/local/bin/ssr.sh
     
     systemctl daemon-reload
-    echo -e "${GREEN}✅ 卸载完成！你的系统已完全恢复洁净如初。${RESET}"
+    echo -e "${GREEN}✅ 全量干净卸载完成！你的系统已洁净如初。${RESET}"
     exit 0
 }
 
 uninstall_menu() {
     clear
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${RED}             组件专项卸载中心${RESET}"
+    echo -e "${RED}             组件专项卸载与清理中心${RESET}"
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${YELLOW} 1.${RESET} 卸载 BBRv3 魔改内核 (查看安全回退指南)"
+    echo -e "${YELLOW} 1.${RESET} 卸载 BBRv3 魔改内核"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${RED} 2. 全量彻底卸载 (SS/ShadowTLS/脚本及环境)${RESET}"
+    echo -e "${RED} 2. 全量干净卸载脚本及组件 (完全还原服务器)${RESET}"
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e " 0. 返回主菜单"
     read -rp "请输入对应数字 [0-2]: " uni_num
@@ -315,14 +332,18 @@ opt_menu() {
 }
 
 sys_menu() {
-    clear; echo -e "${CYAN}========= 极客与系统管理菜单 =========${RESET}"
-    echo -e "${YELLOW} 1.${RESET} 流媒体与 AI 纯净解锁检测"
-    echo -e "${YELLOW} 2.${RESET} SSH 密钥登录管理中心"
-    echo -e "${YELLOW} 3.${RESET} 安全热替换升级核心组件 (绝对保护配置)"
-    echo -e "${YELLOW} 4.${RESET} 手动更新 SSR 管理脚本本身"
+    clear; echo -e "${CYAN}========= 系统基础与极客管理菜单 =========${RESET}"
+    echo -e "${YELLOW} 1.${RESET} 一键修改 SSH 安全端口"
+    echo -e "${YELLOW} 2.${RESET} 一键修改 Root 密码"
+    echo -e "${YELLOW} 3.${RESET} 服务器时间防偏移同步"
+    echo -e "${CYAN}--------------------------------------------${RESET}"
+    echo -e "${YELLOW} 4.${RESET} SSH 密钥登录管理中心 (防爆破神器)"
+    echo -e "${YELLOW} 5.${RESET} 流媒体与 AI 纯净解锁检测"
+    echo -e "${YELLOW} 6.${RESET} 安全热替换升级核心组件 (无损配置)"
+    echo -e "${YELLOW} 7.${RESET} 手动更新 SSR 管理脚本本身"
     echo -e " 0. 返回主菜单"
-    read -rp "输入数字 [0-4]: " sys_num
-    case "$sys_num" in 1) media_unlock_check ;; 2) ssh_key_menu ;; 3) hot_update_components ;; 4) update_script ;; 0) return ;; esac
+    read -rp "输入数字 [0-7]: " sys_num
+    case "$sys_num" in 1) change_ssh_port ;; 2) change_root_password ;; 3) sync_server_time ;; 4) ssh_key_menu ;; 5) media_unlock_check ;; 6) hot_update_components ;; 7) update_script ;; 0) return ;; esac
 }
 
 main_menu() {
@@ -345,8 +366,8 @@ main_menu() {
     echo -e "${YELLOW} 3.${RESET} ShadowTLS 安装/管理"
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${YELLOW} 4.${RESET} 网络与系统优化 (BBR / TFO / 清理)"
-    echo -e "${YELLOW} 5.${RESET} 极客与系统管理 (流媒体检测 / 热升级 / SSH)"
-    echo -e "${RED} 6. 组件专项卸载中心${RESET}"
+    echo -e "${YELLOW} 5.${RESET} 系统与极客管控 (端口/密码/时间/升级/密钥)"
+    echo -e "${RED} 6. 组件专项卸载与全量清理${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 退出脚本"
     
