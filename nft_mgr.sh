@@ -1,54 +1,26 @@
+cat > nft_mgr.sh << 'EOF'
 #!/bin/bash
-
-# 配置路径
 CONFIG_FILE="/etc/nft_forward_list.conf"
 NFT_CONF="/etc/nftables.conf"
-SYS_OPT_CONF="/etc/sysctl.d/99-sys-opt.conf"
-
-# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
 PLAIN='\033[0m'
 
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行!${PLAIN}" && exit 1
 
-# --- 1. 自动检查并安装依赖 ---
-function check_dependencies() {
-    local apps=("nft" "dig")
-    local missing=()
-    for app in "${apps[@]}"; do
-        if ! command -v "$app" &> /dev/null; then missing+=("$app"); fi
-    done
-
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}安装必要依赖...${PLAIN}"
-        if [ -f /etc/debian_version ]; then
-            apt-get update && apt-get install -y nftables dnsutils cron
-            systemctl enable cron && systemctl start cron
-        else
-            yum install -y nftables bind-utils cronie
-            systemctl enable crond && systemctl start crond
-        fi
-    fi
-    systemctl enable nftables && systemctl start nftables
-}
-
-# --- 2. 系统优化与 BBR ---
 function optimize_system() {
-    echo -e "${YELLOW}开启 BBR 和内核转发...${PLAIN}"
-    sudo tee $SYS_OPT_CONF > /dev/null <<EOF
+    echo -e "${YELLOW}正在配置 BBR 和内核转发...${PLAIN}"
+    sudo tee /etc/sysctl.d/99-sys-opt.conf > /dev/null <<EOF2
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
-EOF
+EOF2
     sudo sysctl --system
-    echo -e "${GREEN}系统优化已应用。${PLAIN}"
+    echo -e "${GREEN}系统优化配置已应用。${PLAIN}"
 }
 
-# --- 3. 核心转发逻辑 ---
 function get_ip() {
     local addr=$1
     if [[ $addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -76,84 +48,97 @@ function apply_rules() {
     nft list ruleset > "$NFT_CONF"
 }
 
-# --- 4. 卸载脚本功能 ---
-function uninstall_all() {
-    echo -e "${RED}确认要完全卸载此脚本及所有转发规则吗？${PLAIN}"
-    read -p "请输入 [y/n]: " confirm
+function add_forward() {
+    read -p "请输入本地监听端口: " lport
+    read -p "请输入目标地址 (IP 或 域名): " taddr
+    read -p "请输入目标端口: " tport
+    tip=$(get_ip "$taddr")
+    if [ -z "$tip" ]; then
+        echo -e "${RED}无法解析地址，请检查输入。${PLAIN}"
+        return
+    fi
+    echo "$lport|$taddr|$tport|$tip" >> "$CONFIG_FILE"
+    apply_rules
+    echo -e "${GREEN}添加成功！${PLAIN}"
+}
+
+function show_forward() {
+    if [ ! -s "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}当前没有任何转发规则。${PLAIN}"
+        return
+    fi
+    echo -e "\n${YELLOW}当前转发列表：${PLAIN}"
+    printf "%-10s | %-20s | %-10s | %-15s\n" "本地端口" "目标地址" "目标端口" "解析IP"
+    while IFS='|' read -r lp addr tp last_ip; do
+        current_ip=$(get_ip "$addr")
+        printf "%-10s | %-20s | %-10s | %-15s\n" "$lp" "$addr" "$tp" "$current_ip"
+    done < "$CONFIG_FILE"
+}
+
+function del_forward() {
+    show_forward
+    [ ! -s "$CONFIG_FILE" ] && return
+    read -p "请输入要删除的本地端口: " del_port
+    sed -i "/^$del_port|/d" "$CONFIG_FILE"
+    apply_rules
+    echo -e "${GREEN}已删除。${PLAIN}"
+}
+
+function reset_all() {
+    read -p "确定要删除配置文件并清空所有规则吗？(y/n): " confirm
     if [[ "$confirm" == [yY] ]]; then
-        # 1. 清理定时任务
-        local script_path=$(realpath "$0")
-        crontab -l 2>/dev/null | grep -v "$script_path" | crontab -
-        
-        # 2. 清理 nftables 规则
+        rm -f "$CONFIG_FILE" && touch "$CONFIG_FILE"
         nft flush ruleset
-        systemctl stop nftables
-        systemctl disable nftables
-        
-        # 3. 删除配置文件
-        rm -f "$CONFIG_FILE"
-        rm -f "$NFT_CONF"
-        rm -f "$SYS_OPT_CONF"
-        
-        echo -e "${GREEN}转发规则已清空，配置文件已删除。${PLAIN}"
-        echo -e "${YELLOW}脚本即将自删...${PLAIN}"
-        rm -f "$script_path"
-        exit 0
-    else
-        echo "卸载已取消。"
+        echo "" > "$NFT_CONF"
+        echo -e "${GREEN}环境已彻底清空。${PLAIN}"
     fi
 }
 
-# --- 5. 菜单与交互 ---
-function manage_cron() {
-    local script_path=$(realpath "$0")
-    if crontab -l 2>/dev/null | grep -q "$script_path"; then
-        echo -e "${GREEN}状态：定时监控运行中${PLAIN}"
-        read -p "是否关闭？(y/n): " opt
-        [[ "$opt" == [yY] ]] && crontab -l | grep -v "$script_path" | crontab -
-    else
-        echo -e "${RED}状态：定时监控未开启${PLAIN}"
-        read -p "是否开启每5分钟同步？(y/n): " opt
-        [[ "$opt" == [yY] ]] && (crontab -l 2>/dev/null; echo "*/5 * * * * $script_path --cron > /dev/null 2>&1") | crontab -
-    fi
+function ddns_update() {
+    [ ! -f "$CONFIG_FILE" ] && exit 0
+    local changed=0
+    temp_file=$(mktemp)
+    while IFS='|' read -r lp addr tp last_ip; do
+        current_ip=$(get_ip "$addr")
+        if [ "$current_ip" != "$last_ip" ] && [ ! -z "$current_ip" ]; then
+            echo "$lp|$addr|$tp|$current_ip" >> "$temp_file"
+            changed=1
+        else
+            echo "$lp|$addr|$tp|$last_ip" >> "$temp_file"
+        fi
+    done < "$CONFIG_FILE"
+    mv "$temp_file" "$CONFIG_FILE"
+    [ $changed -eq 1 ] && apply_rules
 }
 
-if [ "$1" == "--cron" ]; then apply_rules ; exit 0 ; fi
-check_dependencies
+if ! command -v dig &> /dev/null; then
+    apt-get update && apt-get install -y dnsutils || yum install -y bind-utils
+fi
+
+if [ "$1" == "--cron" ]; then
+    ddns_update
+    exit 0
+fi
 
 while true; do
-    echo -e "\n${BLUE}==============================${PLAIN}"
-    echo -e "${GREEN}   nftables 域名转发管理面板   ${PLAIN}"
-    echo -e "${BLUE}==============================${PLAIN}"
-    echo "1. 开启 BBR + 系统转发优化"
-    echo "2. 新增端口转发 (支持域名)"
-    echo "3. 查看当前转发列表"
-    echo "4. 删除指定端口转发"
-    echo "5. 彻底清空配置与规则 (防冲突)"
-    echo "6. 管理定时监控 (DDNS 自动同步)"
-    echo -e "${RED}7. 卸载脚本并清理环境${PLAIN}"
+    echo -e "\n${GREEN}--- nftables 转发管理器 ---${PLAIN}"
+    echo "1. 开启 BBR + 系统优化"
+    echo "2. 新增转发 (支持域名)"
+    echo "3. 查看当前列表"
+    echo "4. 删除单条转发"
+    echo "5. 彻底清空配置与规则"
+    echo "6. 立即同步域名 IP"
     echo "0. 退出"
-    echo "------------------------------"
-    read -p "请选择: " choice
+    read -p "选择: " choice
     case $choice in
         1) optimize_system ;;
-        2) 
-            read -p "本地端口: " lp
-            read -p "目标地址: " ad
-            read -p "目标端口: " tp
-            echo "$lp|$ad|$tp|$(get_ip $ad)" >> "$CONFIG_FILE"
-            apply_rules ;;
-        3) 
-            echo -e "\n本地端口 | 目标地址 | 目标端口 | 解析IP"
-            while IFS='|' read -r lp ad tp li; do printf "%-8s | %-12s | %-8s | %-15s\n" "$lp" "$ad" "$tp" "$(get_ip $ad)"; done < "$CONFIG_FILE"
-            read -p "回车继续..." ;;
-        4) 
-            read -p "输入要删除的本地端口: " dp
-            sed -i "/^$dp|/d" "$CONFIG_FILE" ; apply_rules ;;
-        5) 
-            rm -f "$CONFIG_FILE" && touch "$CONFIG_FILE" ; nft flush ruleset ; echo "" > "$NFT_CONF" ;;
-        6) manage_cron ;;
-        7) uninstall_all ;;
+        2) add_forward ;;
+        3) show_forward ; read -p "按回车继续..." ;;
+        4) del_forward ;;
+        5) reset_all ;;
+        6) ddns_update ; echo "更新完成。" ;;
         0) exit 0 ;;
     esac
 done
+EOF
+chmod +x nft_mgr.sh && ./nft_mgr.sh
