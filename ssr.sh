@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# 脚本名称: SSR 综合管理脚本 (逻辑合并版)
-# 核心功能: BBR+TFO一键聚合、凌晨2点自动清理、防丢命令、守护进程、保留ShadowTLS
+# 脚本名称: SSR 综合管理脚本 (专属更新源版)
+# 核心功能: 专属更新链接、BBR+TFO一键聚合、凌晨自动清理、守护进程、保留ShadowTLS
 # 全局命令: ssr [可选参数: bbr | clean | update | daemon | hot_upgrade]
 # ==============================================================================
 
@@ -10,7 +10,7 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
-readonly SCRIPT_VERSION="19.4-Optimized"
+readonly SCRIPT_VERSION="19.5-Custom-Source"
 readonly CONF_FILE="/etc/sysctl.d/99-bbr.conf"
 
 trap 'echo -e "\n${GREEN}已安全退出脚本。${RESET}"; exit 0' SIGINT
@@ -203,10 +203,10 @@ auto_clean() {
     [[ "$is_silent" != "silent" ]] && echo -e "${GREEN}✅ 系统垃圾与安装缓存清理完毕！${RESET}"
 }
 
-# 自身原子级热更新机制
+# 自身原子级热更新机制 (更新源已替换)
 update_script() {
     echo -e "${CYAN}>>> 正在安全同步最新版脚本数据...${RESET}"
-    curl -sL "https://raw.githubusercontent.com/jinqians/menu/main/menu.sh" -o /tmp/ssr_update.sh
+    curl -sL "https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/ssr.sh" -o /tmp/ssr_update.sh
     if [[ -s /tmp/ssr_update.sh ]]; then
         mv -f /tmp/ssr_update.sh /usr/local/bin/ssr
         chmod +x /usr/local/bin/ssr
