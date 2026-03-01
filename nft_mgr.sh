@@ -56,7 +56,6 @@ function add_forward() {
         return
     fi
 
-    # 写入配置文件以便追踪: local_port|target_addr|target_port|last_known_ip
     echo "$lport|$taddr|$tport|$tip" >> $CONFIG_FILE
     apply_rules
     echo -e "${GREEN}添加成功！${PLAIN}"
@@ -123,6 +122,38 @@ function ddns_update() {
     fi
 }
 
+# --- 新增：管理定时监控 (DDNS 同步) ---
+function manage_cron() {
+    clear
+    echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) ---${PLAIN}"
+    echo "1. 自动添加定时任务 (每分钟检测)"
+    echo "2. 一键删除定时任务"
+    echo "0. 返回主菜单"
+    echo "--------------------------------"
+    read -p "请选择操作 [0-2]: " cron_choice
+
+    case $cron_choice in
+        1)
+            # 获取脚本绝对路径
+            SCRIPT_PATH=$(realpath "$0")
+            # 检查是否已存在
+            (crontab -l 2>/dev/null | grep -q "$SCRIPT_PATH --cron") && echo -e "${YELLOW}定时任务已存在。${PLAIN}" && sleep 2 && return
+            # 添加任务
+            (crontab -l 2>/dev/null; echo "* * * * * $SCRIPT_PATH --cron > /dev/null 2>&1") | crontab -
+            echo -e "${GREEN}定时任务已添加！每分钟将自动执行 IP 同步。${PLAIN}"
+            sleep 2
+            ;;
+        2)
+            SCRIPT_PATH=$(realpath "$0")
+            crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --cron" | crontab -
+            echo -e "${YELLOW}定时任务已清除。${PLAIN}"
+            sleep 2
+            ;;
+        0) return ;;
+        *) echo "无效选项" ; sleep 1 ;;
+    esac
+}
+
 # --- 主菜单 ---
 function main_menu() {
     clear
@@ -132,7 +163,7 @@ function main_menu() {
     echo "3. 查看当前转发列表"
     echo "4. 删除指定端口转发"
     echo "5. 清空所有转发规则"
-    echo "6. 立即触发 DDNS IP 更新检测"
+    echo "6. 管理定时监控 (DDNS 同步)"
     echo "0. 退出"
     echo "--------------------------------"
     read -p "请选择操作 [0-6]: " choice
@@ -143,7 +174,7 @@ function main_menu() {
         3) show_forward ; read -p "按回车返回..." ;;
         4) del_forward ;;
         5) > $CONFIG_FILE ; apply_rules ; echo "已清空。" ;;
-        6) ddns_update ;;
+        6) manage_cron ;;
         0) exit 0 ;;
         *) echo "无效选项" ;;
     esac
@@ -160,4 +191,5 @@ if [ "$1" == "--cron" ]; then
     exit 0
 fi
 
+# 保持循环
 while true; do main_menu; done
