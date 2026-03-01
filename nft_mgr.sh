@@ -33,7 +33,7 @@ function setup_alias() {
 }
 setup_alias
 
-# --- 系统优化与 BBR ---
+# --- 优化 6：系统优化与 BBR，加入开机自启 ---
 function optimize_system() {
     echo -e "${YELLOW}正在配置 BBR 和内核转发...${PLAIN}"
     sudo tee /etc/sysctl.d/99-sys-opt.conf > /dev/null <<EOF
@@ -42,8 +42,13 @@ net.ipv4.tcp_congestion_control=bbr
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
-    sudo sysctl --system
-    echo -e "${GREEN}系统优化配置已应用。${PLAIN}"
+    sudo sysctl --system >/dev/null 2>&1
+    
+    echo -e "${YELLOW}正在设置 nftables 开机自启...${PLAIN}"
+    systemctl enable nftables >/dev/null 2>&1
+    systemctl start nftables >/dev/null 2>&1
+    
+    echo -e "${GREEN}系统优化配置及开机自启已应用。${PLAIN}"
     sleep 2
 }
 
@@ -66,22 +71,50 @@ function init_nft() {
     touch $CONFIG_FILE
 }
 
-# --- 新增转发 ---
+# --- 优化 3：新增转发 (加入严格的输入校验与防冲突) ---
 function add_forward() {
-    read -p "请输入本地监听端口: " lport
-    read -p "请输入目标地址 (IP 或 域名): " taddr
-    read -p "请输入目标端口: " tport
+    read -p "请输入本地监听端口 (1-65535): " lport
+    
+    # 校验本地端口格式与范围
+    if [[ ! "$lport" =~ ^[0-9]+$ ]] || [ "$lport" -lt 1 ] || [ "$lport" -gt 65535 ]; then
+        echo -e "${RED}错误: 本地端口必须是 1 到 65535 之间的纯数字。${PLAIN}"
+        sleep 2
+        return
+    fi
 
+    # 防冲突检测：检查配置文件中是否已有该本地端口
+    if grep -q "^$lport|" "$CONFIG_FILE" 2>/dev/null; then
+        echo -e "${RED}错误: 本地端口 $lport 已被占用！请先在菜单中删除旧规则。${PLAIN}"
+        sleep 2
+        return
+    fi
+
+    read -p "请输入目标地址 (IP 或 域名): " taddr
+    if [ -z "$taddr" ]; then
+        echo -e "${RED}错误: 目标地址不能为空。${PLAIN}"
+        sleep 2
+        return
+    fi
+
+    read -p "请输入目标端口 (1-65535): " tport
+    # 校验目标端口格式与范围
+    if [[ ! "$tport" =~ ^[0-9]+$ ]] || [ "$tport" -lt 1 ] || [ "$tport" -gt 65535 ]; then
+        echo -e "${RED}错误: 目标端口必须是 1 到 65535 之间的纯数字。${PLAIN}"
+        sleep 2
+        return
+    fi
+
+    echo -e "${YELLOW}正在解析目标地址...${PLAIN}"
     tip=$(get_ip "$taddr")
     if [ -z "$tip" ]; then
-        echo -e "${RED}无法解析地址，请检查输入。${PLAIN}"
+        echo -e "${RED}错误: 无法解析该地址，请检查输入或服务器网络。${PLAIN}"
         sleep 2
         return
     fi
 
     echo "$lport|$taddr|$tport|$tip" >> $CONFIG_FILE
     apply_rules
-    echo -e "${GREEN}添加成功！${PLAIN}"
+    echo -e "${GREEN}添加成功！本地端口 $lport 已转发至 $taddr:$tport (${tip})。${PLAIN}"
     sleep 2
 }
 
@@ -101,6 +134,7 @@ function apply_rules() {
         fi
     done < $CONFIG_FILE
     
+    # 将规则保存到系统默认配置文件，确保开机自启生效
     nft list ruleset > $NFT_CONF
 }
 
@@ -277,7 +311,6 @@ function uninstall_script() {
     echo -e "${GREEN}卸载彻底完成！所有痕迹已被抹除。${PLAIN}"
     echo -e "${YELLOW}注意: 当前 SSH 会话中的 'nft' 快捷命令缓存依然存在，你可以输入 'unalias nft' 或重新连接 SSH 即可完全失效。${PLAIN}"
     
-    # 彻底退出脚本，打破循环直接返回命令行
     exit 0
 }
 
