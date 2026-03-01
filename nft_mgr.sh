@@ -12,6 +12,31 @@ PLAIN='\033[0m'
 
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行!${PLAIN}" && exit 1
 
+# --- 自动设置快捷命令 ---
+function setup_alias() {
+    local shell_rc="$HOME/.bashrc"
+    # 获取当前脚本的绝对路径
+    local current_path=$(realpath "$0" 2>/dev/null || readlink -f "$0")
+    
+    # 防止在定时任务等非终端环境中执行
+    if [[ ! -t 0 ]]; then
+        return
+    fi
+
+    # 检查并添加/更新别名
+    if ! grep -q "alias nft=" "$shell_rc" 2>/dev/null; then
+        echo "alias nft='bash \"$current_path\"'" >> "$shell_rc"
+        echo -e "${GREEN}[系统提示] 快捷命令 'nft' 已添加！下次重新连接 SSH 后，可直接输入 nft 打开面板。${PLAIN}"
+        sleep 2
+    else
+        # 如果路径有变，自动更新别名指向的路径
+        sed -i "s|alias nft=.*|alias nft='bash \"$current_path\"'|g" "$shell_rc"
+    fi
+}
+
+# 脚本启动时自动执行快捷命令检查
+setup_alias
+
 # --- 系统优化与 BBR ---
 function optimize_system() {
     echo -e "${YELLOW}正在配置 BBR 和内核转发...${PLAIN}"
@@ -122,7 +147,7 @@ function ddns_update() {
     fi
 }
 
-# --- 新增：管理定时监控 (DDNS 同步) ---
+# --- 管理定时监控 (DDNS 同步) ---
 function manage_cron() {
     clear
     echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) ---${PLAIN}"
@@ -134,11 +159,8 @@ function manage_cron() {
 
     case $cron_choice in
         1)
-            # 获取脚本绝对路径
             SCRIPT_PATH=$(realpath "$0")
-            # 检查是否已存在
             (crontab -l 2>/dev/null | grep -q "$SCRIPT_PATH --cron") && echo -e "${YELLOW}定时任务已存在。${PLAIN}" && sleep 2 && return
-            # 添加任务
             (crontab -l 2>/dev/null; echo "* * * * * $SCRIPT_PATH --cron > /dev/null 2>&1") | crontab -
             echo -e "${GREEN}定时任务已添加！每分钟将自动执行 IP 同步。${PLAIN}"
             sleep 2
@@ -155,41 +177,3 @@ function manage_cron() {
 }
 
 # --- 主菜单 ---
-function main_menu() {
-    clear
-    echo -e "${GREEN}--- nftables 端口转发管理面板 ---${PLAIN}"
-    echo "1. 开启 BBR + 系统转发优化"
-    echo "2. 新增端口转发 (支持域名/IP)"
-    echo "3. 查看当前转发列表"
-    echo "4. 删除指定端口转发"
-    echo "5. 清空所有转发规则"
-    echo "6. 管理定时监控 (DDNS 同步)"
-    echo "0. 退出"
-    echo "--------------------------------"
-    read -p "请选择操作 [0-6]: " choice
-
-    case $choice in
-        1) optimize_system ;;
-        2) add_forward ;;
-        3) show_forward ; read -p "按回车返回..." ;;
-        4) del_forward ;;
-        5) > $CONFIG_FILE ; apply_rules ; echo "已清空。" ;;
-        6) manage_cron ;;
-        0) exit 0 ;;
-        *) echo "无效选项" ;;
-    esac
-}
-
-# 检查依赖
-if ! command -v dig &> /dev/null; then
-    apt-get update && apt-get install -y dnsutils || yum install -y bind-utils
-fi
-
-# 如果带参数运行（用于定时任务）
-if [ "$1" == "--cron" ]; then
-    ddns_update
-    exit 0
-fi
-
-# 保持循环
-while true; do main_menu; done
