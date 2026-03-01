@@ -4,6 +4,10 @@
 CONFIG_FILE="/etc/nft_forward_list.conf"
 NFT_CONF="/etc/nftables.conf"
 
+# Github 脚本更新链接
+RAW_URL="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
+PROXY_URL="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -100,7 +104,7 @@ function apply_rules() {
     nft list ruleset > $NFT_CONF
 }
 
-# --- 新增：合并后的查看与删除功能 ---
+# --- 查看与删除功能合并 ---
 function view_and_del_forward() {
     clear
     if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
@@ -121,22 +125,19 @@ function view_and_del_forward() {
     done < "$CONFIG_FILE"
     echo "----------------------------------------------------------------------"
 
-    echo -e "${YELLOW}提示: 输入规则前面的【序号】即可删除，输入【0】或直接按回车返回主菜单。${PLAIN}"
+    echo -e "${YELLOW}提示: 输入规则前面的【序号】即可删除，输入【0】或直接按回车返回。${PLAIN}"
     read -p "请选择操作: " action
 
-    # 如果直接回车或输入 0
     if [ -z "$action" ] || [ "$action" == "0" ]; then
         return
     fi
 
-    # 验证输入是否为数字
     if [[ ! "$action" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}输入无效，请输入正确的数字序号。${PLAIN}"
         sleep 2
         return
     fi
 
-    # 验证序号是否超出范围
     local total_lines=$(wc -l < "$CONFIG_FILE")
     if [ "$action" -lt 1 ] || [ "$action" -gt "$total_lines" ]; then
         echo -e "${RED}序号超出范围，没有该规则！${PLAIN}"
@@ -144,10 +145,8 @@ function view_and_del_forward() {
         return
     fi
 
-    # 提取被删除的本地端口以便提示
     local del_port=$(sed -n "${action}p" "$CONFIG_FILE" | cut -d'|' -f1)
     
-    # 根据序号（行号）删除配置
     sed -i "${action}d" "$CONFIG_FILE"
     apply_rules
     echo -e "${GREEN}已成功删除序号 $action (本地端口: $del_port) 的转发规则。${PLAIN}"
@@ -204,6 +203,50 @@ function manage_cron() {
     esac
 }
 
+# --- 手动跟随 GitHub 更新脚本 ---
+function update_script() {
+    clear
+    echo -e "${GREEN}--- 脚本更新 ---${PLAIN}"
+    echo "1. 从 GitHub 官方直连更新 (推荐海外机)"
+    echo "2. 从 GHProxy 代理更新 (推荐国内机)"
+    echo "0. 取消并返回主菜单"
+    echo "--------------------------------"
+    read -p "请选择更新线路 [0-2]: " up_choice
+
+    local target_url=""
+    case $up_choice in
+        1) target_url="$RAW_URL" ;;
+        2) target_url="$PROXY_URL" ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项。${PLAIN}" ; sleep 1 ; return ;;
+    esac
+
+    echo -e "${YELLOW}正在拉取最新代码...${PLAIN}"
+    SCRIPT_PATH=$(realpath "$0")
+    TEMP_FILE=$(mktemp)
+
+    if curl -sL "$target_url" -o "$TEMP_FILE"; then
+        # 严格校验下载内容是否为 bash 脚本
+        if grep -q "#!/bin/bash" "$TEMP_FILE"; then
+            cat "$TEMP_FILE" > "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+            rm -f "$TEMP_FILE"
+            echo -e "${GREEN}更新成功！脚本已替换为最新版本。${PLAIN}"
+            echo -e "${YELLOW}面板即将自动退出以应用新版本，请稍后重新执行 'nft' 启动。${PLAIN}"
+            sleep 3
+            exit 0
+        else
+            echo -e "${RED}更新失败: 下载的文件格式不正确 (未检测到脚本头)。这可能是代理失效或仓库地址有误。${PLAIN}"
+            rm -f "$TEMP_FILE"
+            sleep 3
+        fi
+    else
+        echo -e "${RED}更新失败: 网络连接超时或链接无效。${PLAIN}"
+        rm -f "$TEMP_FILE"
+        sleep 3
+    fi
+}
+
 # --- 主菜单 ---
 function main_menu() {
     clear
@@ -213,9 +256,10 @@ function main_menu() {
     echo "3. 查看 / 删除端口转发"
     echo "4. 清空所有转发规则"
     echo "5. 管理定时监控 (DDNS 同步)"
+    echo "6. 从 GitHub 更新当前脚本"
     echo "0. 退出"
     echo "--------------------------------"
-    read -p "请选择操作 [0-5]: " choice
+    read -p "请选择操作 [0-6]: " choice
 
     case $choice in
         1) optimize_system ;;
@@ -223,6 +267,7 @@ function main_menu() {
         3) view_and_del_forward ;;
         4) > $CONFIG_FILE ; apply_rules ; echo -e "${GREEN}所有转发规则已清空。${PLAIN}" ; sleep 2 ;;
         5) manage_cron ;;
+        6) update_script ;;
         0) exit 0 ;;
         *) echo "无效选项" ; sleep 1 ;;
     esac
