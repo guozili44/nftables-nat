@@ -20,7 +20,6 @@ function get_ip() {
     if [[ $addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo "$addr"
     else
-        # 增加超时控制，防止解析导致的卡死
         timeout 2 dig +short "$addr" | grep -E '^[0-9.]+$' | tail -n1
     fi
 }
@@ -37,118 +36,110 @@ function apply_rules() {
             [ -z "$lp" ] && continue
             current_ip=$(get_ip "$addr")
             [ -z "$current_ip" ] && current_ip="$last_ip"
-            if [ ! -z "$current_ip" ]; then
-                nft add rule ip nat prerouting tcp dport $lp dnat to $current_ip:$tp
-                nft add rule ip nat prerouting udp dport $lp dnat to $current_ip:$tp
-                nft add rule ip nat postrouting ip daddr $current_ip masquerade
+            if [ ! -z "$current_ip" ] && [ "$current_ip" != "0.0.0.0" ]; then
+                nft add rule ip nat prerouting tcp dport "$lp" dnat to "$current_ip:$tp"
+                nft add rule ip nat prerouting udp dport "$lp" dnat to "$current_ip:$tp"
+                nft add rule ip nat postrouting ip daddr "$current_ip" masquerade
             fi
         done < "$CONFIG_FILE"
     fi
-    nft list ruleset > "$NFT_CONF" 2>/dev/null
+}
+
+# --- 强力卸载选项 (修复清理无效问题) ---
+function uninstall_all() {
+    echo -e "${RED}正在进行深度清理...${PLAIN}"
+    
+    # 1. 停止相关服务以释放文件锁
+    systemctl stop cron 2>/dev/null || systemctl stop crond 2>/dev/null
+    
+    # 2. 清理定时任务
+    crontab -r 2>/dev/null
+    echo -e "${GREEN}√ 定时任务已完全清空${PLAIN}"
+    
+    # 3. 强制重置防火墙规则
+    nft flush ruleset 2>/dev/null
+    systemctl restart nftables 2>/dev/null
+    echo -e "${GREEN}√ 防火墙规则已排空${PLAIN}"
+    
+    # 4. 彻底删除物理文件
+    rm -rf "$CONFIG_FILE" "$NFT_CONF" "$SYS_OPT_CONF" "$SHORTCUT_PATH"
+    echo -e "${GREEN}√ 配置文件及快捷命令已移除${PLAIN}"
+
+    # 5. 重启 Cron 以恢复系统正常环境
+    systemctl start cron 2>/dev/null || systemctl start crond 2>/dev/null
+    
+    echo -e "${GREEN}卸载彻底完成！已回到纯净 Root 环境。${PLAIN}"
+    rm -f "$0"
+    exit 0
 }
 
 # --- 菜单功能 ---
-function optimize_system() {
-    echo -e "${YELLOW}正在配置 BBR 和内核转发...${PLAIN}"
-    echo "net.core.default_qdisc=fq" > $SYS_OPT_CONF
-    echo "net.ipv4.tcp_congestion_control=bbr" >> $SYS_OPT_CONF
-    echo "net.ipv4.ip_forward=1" >> $SYS_OPT_CONF
-    sysctl --system >/dev/null 2>&1
-    echo -e "${GREEN}系统优化完成。${PLAIN}"
-}
-
-function add_forward() {
-    read -p "本地监听端口: " lp
-    read -p "目标地址: " ad
-    read -p "目标端口: " tp
-    tip=$(get_ip "$ad")
-    [[ -z "$tip" ]] && tip="0.0.0.0"
-    echo "$lp|$ad|$tp|$tip" >> "$CONFIG_FILE"
-    apply_rules
-    echo -e "${GREEN}添加成功。${PLAIN}"
-}
-
-# --- 修正后的 DDNS 监控逻辑 ---
 function manage_cron() {
-    # 确保快捷命令存在，以便 cron 调用
+    # 每次开启监控前确保快捷路径存在
     local script_path=$(realpath "$0")
     cp "$script_path" "$SHORTCUT_PATH" && chmod +x "$SHORTCUT_PATH"
 
     if crontab -l 2>/dev/null | grep -q "$SHORTCUT_PATH"; then
-        echo -e "${GREEN}当前状态：定时监控 [已开启]${PLAIN}"
-        read -p "是否关闭定时监控？(y/n): " oc
-        if [[ "$oc" == [yY] ]]; then
-            crontab -l | grep -v "$SHORTCUT_PATH" | crontab -
-            echo -e "${YELLOW}监控已关闭。${PLAIN}"
-        fi
+        echo -e "${GREEN}监控运行中${PLAIN}"
+        read -p "是否关闭？(y/n): " oc
+        [[ "$oc" == [yY] ]] && crontab -l | grep -v "$SHORTCUT_PATH" | crontab -
     else
-        echo -e "${RED}当前状态：定时监控 [已关闭]${PLAIN}"
-        read -p "是否开启每 5 分钟自动同步域名 IP？(y/n): " oc
+        echo -e "${RED}监控已关闭${PLAIN}"
+        read -p "是否开启 (每5分钟同步)？(y/n): " oc
         if [[ "$oc" == [yY] ]]; then
-            # 修正写入逻辑，避免重复写入
+            # 采用覆盖式写入，防止 crontab 堆叠导致卡死
             (crontab -l 2>/dev/null | grep -v "$SHORTCUT_PATH"; echo "*/5 * * * * $SHORTCUT_PATH --cron > /dev/null 2>&1") | crontab -
-            echo -e "${GREEN}监控已开启。${PLAIN}"
+            echo -e "${GREEN}开启成功${PLAIN}"
         fi
     fi
 }
 
-function uninstall_all() {
-    echo -e "${RED}警告：此操作将清理所有规则、任务并删除脚本自身！${PLAIN}"
-    read -p "确定卸载？(y/n): " confirm
-    if [[ "$confirm" == [yY] ]]; then
-        crontab -l 2>/dev/null | grep -v "$SHORTCUT_PATH" | crontab -
-        nft flush ruleset 2>/dev/null
-        rm -f "$CONFIG_FILE" "$NFT_CONF" "$SYS_OPT_CONF" "$SHORTCUT_PATH"
-        echo -e "${GREEN}卸载完成。${PLAIN}"
-        rm -f "$0"
-        exit 0
-    fi
-}
-
-# --- 主交互面板 ---
+# --- 菜单循环 ---
 function main_menu() {
     while true; do
-        echo -e "\n${GREEN}--- nftables 端口转发管理面板 ---${PLAIN}"
-        echo "1. 开启 BBR + 系统转发优化"
-        echo "2. 新增端口转发 (支持域名/IP)"
-        echo "3. 查看当前转发列表"
+        echo -e "\n${GREEN}--- nftables 管理面板 (深度修复版) ---${PLAIN}"
+        echo "1. 开启 BBR + 系统优化"
+        echo "2. 新增转发"
+        echo "3. 查看列表"
         echo "4. 删除指定端口转发"
-        echo "5. 清空所有转发规则"
-        echo "6. 管理定时监控 (DDNS 修复版)"
-        echo -e "${RED}7. 一键卸载脚本及任务${PLAIN}"
+        echo "5. 清空转发规则"
+        echo "6. 管理 DDNS 监控"
+        echo -e "${RED}7. 一键强力卸载 (彻底回归 Root)${PLAIN}"
         echo "0. 退出"
-        echo "--------------------------------"
-        read -p "请选择操作 [0-7]: " choice
+        read -p "选择 [0-7]: " choice
         case $choice in
-            1) optimize_system ;;
-            2) add_forward ;;
+            1) 
+                echo "net.core.default_qdisc=fq" > $SYS_OPT_CONF
+                echo "net.ipv4.tcp_congestion_control=bbr" >> $SYS_OPT_CONF
+                echo "net.ipv4.ip_forward=1" >> $SYS_OPT_CONF
+                sysctl --system >/dev/null 2>&1
+                echo "优化完成" ;;
+            2) 
+                read -p "本地端口: " lp
+                read -p "目标地址: " ad
+                read -p "目标端口: " tp
+                tip=$(get_ip "$ad")
+                [[ -z "$tip" ]] && tip="0.0.0.0"
+                echo "$lp|$ad|$tp|$tip" >> "$CONFIG_FILE"
+                apply_rules ; echo "已添加" ;;
             3) 
-                echo -e "\n本地端口 | 目标地址 | 目标端口 | 解析IP"
-                [ -s "$CONFIG_FILE" ] && while IFS='|' read -r lp ad tp li; do printf "%-8s | %-15s | %-8s | %-15s\n" "$lp" "$ad" "$tp" "$(get_ip $ad)"; done < "$CONFIG_FILE"
+                [ -s "$CONFIG_FILE" ] && cat "$CONFIG_FILE" | column -t -s "|"
                 read -p "按回车返回..." ;;
-            4) 
-                read -p "输入要删除的端口: " dp
-                sed -i "/^$dp|/d" "$CONFIG_FILE"
-                apply_rules ;;
-            5) > "$CONFIG_FILE" ; apply_rules ; echo "已清空。" ;;
+            4) read -p "输入删除端口: " dp ; sed -i "/^$dp|/d" "$CONFIG_FILE" ; apply_rules ;;
+            5) > "$CONFIG_FILE" ; apply_rules ;;
             6) manage_cron ;;
             7) uninstall_all ;;
             0) exit 0 ;;
-            *) echo "无效选项" ;;
         esac
     done
 }
 
-# 初始化
-if ! command -v dig &> /dev/null || ! command -v nft &> /dev/null; then
-    apt-get update && apt-get install -y dnsutils nftables cron || yum install -y bind-utils nftables cronie
-fi
+# 依赖检查与定时入口
+if ! command -v dig &> /dev/null; then apt-get update && apt-get install -y dnsutils nftables cron || yum install -y bind-utils nftables cronie; fi
 systemctl enable nftables && systemctl start nftables > /dev/null 2>&1
 
-# 定时任务入口
 if [ "$1" == "--cron" ]; then
-    apply_rules
-    exit 0
+    apply_rules ; exit 0
 fi
 
 main_menu
