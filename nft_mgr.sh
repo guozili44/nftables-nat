@@ -226,7 +226,6 @@ function update_script() {
     TEMP_FILE=$(mktemp)
 
     if curl -sL "$target_url" -o "$TEMP_FILE"; then
-        # 严格校验下载内容是否为 bash 脚本
         if grep -q "#!/bin/bash" "$TEMP_FILE"; then
             cat "$TEMP_FILE" > "$SCRIPT_PATH"
             chmod +x "$SCRIPT_PATH"
@@ -247,6 +246,41 @@ function update_script() {
     fi
 }
 
+# --- 完全卸载脚本 ---
+function uninstall_script() {
+    clear
+    echo -e "${RED}--- 卸载 nftables 端口转发面板 ---${PLAIN}"
+    read -p "警告: 此操作将清空所有转发规则，删除定时任务、配置文件，并彻底销毁本脚本自身！是否确认卸载？[y/N]: " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}已取消卸载操作，返回主菜单。${PLAIN}"
+        sleep 2
+        return
+    fi
+
+    echo -e "${YELLOW}正在清空内核转发规则...${PLAIN}"
+    nft flush ruleset 2>/dev/null
+    > $NFT_CONF 2>/dev/null
+
+    echo -e "${YELLOW}正在清除定时监控任务...${PLAIN}"
+    SCRIPT_PATH=$(realpath "$0")
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --cron" | crontab -
+
+    echo -e "${YELLOW}正在删除配置文件...${PLAIN}"
+    rm -f $CONFIG_FILE
+
+    echo -e "${YELLOW}正在删除快捷别名配置...${PLAIN}"
+    sed -i '/alias nft=/d' "$HOME/.bashrc"
+
+    echo -e "${YELLOW}正在删除脚本文件自身...${PLAIN}"
+    rm -f "$SCRIPT_PATH"
+
+    echo -e "${GREEN}卸载彻底完成！所有痕迹已被抹除。${PLAIN}"
+    echo -e "${YELLOW}注意: 当前 SSH 会话中的 'nft' 快捷命令缓存依然存在，你可以输入 'unalias nft' 或重新连接 SSH 即可完全失效。${PLAIN}"
+    
+    # 彻底退出脚本，打破循环直接返回命令行
+    exit 0
+}
+
 # --- 主菜单 ---
 function main_menu() {
     clear
@@ -257,9 +291,10 @@ function main_menu() {
     echo "4. 清空所有转发规则"
     echo "5. 管理定时监控 (DDNS 同步)"
     echo "6. 从 GitHub 更新当前脚本"
-    echo "0. 退出"
+    echo "7. 一键完全卸载此脚本"
+    echo "0. 退出面板"
     echo "--------------------------------"
-    read -p "请选择操作 [0-6]: " choice
+    read -p "请选择操作 [0-7]: " choice
 
     case $choice in
         1) optimize_system ;;
@@ -268,6 +303,7 @@ function main_menu() {
         4) > $CONFIG_FILE ; apply_rules ; echo -e "${GREEN}所有转发规则已清空。${PLAIN}" ; sleep 2 ;;
         5) manage_cron ;;
         6) update_script ;;
+        7) uninstall_script ;;
         0) exit 0 ;;
         *) echo "无效选项" ; sleep 1 ;;
     esac
