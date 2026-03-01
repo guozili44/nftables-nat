@@ -7,8 +7,7 @@
 # 配置文件路径
 CONFIG_FILE="/etc/nft_forward_list.conf"
 NFT_CONF="/etc/nftables.conf"
-DDNS_LOG="/var/log/nft_ddns.log"
-LOG_ROTATE_CONF="/etc/logrotate.d/nft_ddns"
+LOG_DIR="/var/log/nft_ddns"
 
 # Github 脚本更新链接
 RAW_URL="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
@@ -204,18 +203,23 @@ function view_and_del_forward() {
     sleep 2
 }
 
-# --- 监控脚本 (DDNS 追踪更新与日志) ---
+# --- 监控脚本 (DDNS 追踪更新与日志切割清理) ---
 function ddns_update() {
     local changed=0
     local temp_file=$(mktemp)
+    
+    # 确保日志存储目录存在
+    [ ! -d "$LOG_DIR" ] && mkdir -p "$LOG_DIR"
+    # 当天的日志文件名，例如: /var/log/nft_ddns/2026-03-01.log
+    local today_log="$LOG_DIR/$(date '+%Y-%m-%d').log"
     
     while IFS='|' read -r lp addr tp last_ip; do
         local current_ip=$(get_ip "$addr")
         if [ "$current_ip" != "$last_ip" ] && [ -n "$current_ip" ]; then
             echo "$lp|$addr|$tp|$current_ip" >> "$temp_file"
             changed=1
-            # 记录 IP 变动日志
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 端口 $lp: $addr 变动 ($last_ip -> $current_ip)" >> "$DDNS_LOG"
+            # 记录变动到当天的日志文件
+            echo "[$(date '+%H:%M:%S')] 端口 $lp: $addr 变动 ($last_ip -> $current_ip)" >> "$today_log"
         else
             echo "$lp|$addr|$tp|$last_ip" >> "$temp_file"
         fi
@@ -223,15 +227,18 @@ function ddns_update() {
     mv "$temp_file" "$CONFIG_FILE"
     
     if [ $changed -eq 1 ]; then apply_rules; fi
+
+    # 核心优化：每次巡检时，静默清理 7 天前生成的过期日志文件
+    find "$LOG_DIR" -type f -name "*.log" -mtime +7 -exec rm -f {} \; 2>/dev/null
 }
 
 # --- 管理定时监控 (DDNS 同步) ---
 function manage_cron() {
     clear
     echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) ---${PLAIN}"
-    echo "1. 自动添加定时任务 (每分钟检测，保留7天日志)"
+    echo "1. 自动添加定时任务 (每分钟检测)"
     echo "2. 一键删除定时任务"
-    echo "3. 查看 DDNS 变动历史日志"
+    echo "3. 查看 DDNS 变动历史日志 (仅保留最近7天)"
     echo "0. 返回主菜单"
     echo "--------------------------------"
     local cron_choice
@@ -241,30 +248,136 @@ function manage_cron() {
     case $cron_choice in
         1)
             (crontab -l 2>/dev/null | grep -q "$SCRIPT_PATH --cron") && echo -e "${YELLOW}定时任务已存在。${PLAIN}" && sleep 2 && return
-            
-            # 写入 crontab
             (crontab -l 2>/dev/null; echo "* * * * * $SCRIPT_PATH --cron > /dev/null 2>&1") | crontab -
-            
-            # 配置 logrotate 7天日志轮转策略
-            cat <<EOF > "$LOG_ROTATE_CONF"
-$DDNS_LOG {
-    daily
-    rotate 7
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
-            echo -e "${GREEN}定时任务已添加！日志将自动清理，仅保留近 7 天记录。${PLAIN}"
+            echo -e "${GREEN}定时任务已添加！将自动检查 IP 并生成日志。${PLAIN}"
             sleep 2 ;;
         2)
-            # 清理 crontab
             crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --cron" | crontab -
-            # 清理 logrotate 策略
-            rm -f "$LOG_ROTATE_CONF"
-            echo -e "${YELLOW}定时任务已清除，日志自动清理策略已移除。${PLAIN}"
+            echo -e "${YELLOW}定时任务已清除。${PLAIN}"
             sleep 2 ;;
         3)
             clear
-            if [ -f "$DDNS_LOG" ]; then
-                echo -e "${GREEN}--- DDNS 变动日志 (近7天) ---${PLAIN}"
+            # 检查是否有日志文件存在
+            if [ -d "$LOG_DIR" ] && ls "$LOG_DIR"/*.log >/dev/null 2>&1; then
+                echo -e "${GREEN}--- 近 7 天 DDNS 变动日志 ---${PLAIN}"
+                # 按照文件名升序(即时间顺序)读取所有日志，并输出最后20行
+                cat "$LOG_DIR"/*.log | tail -n 20
+            else
+                echo -e "${YELLOW}暂无 IP 变动记录。${PLAIN}"
+            fi
+            echo ""
+            read -p "按回车键返回..." ;;
+        0) return ;;
+        *) echo "无效选项" ; sleep 1 ;;
+    esac
+}
+
+# --- 手动跟随 GitHub 更新脚本 (热重启) ---
+function update_script() {
+    clear
+    echo -e "${GREEN}--- 脚本更新 ---${PLAIN}"
+    echo "1. 从 GitHub 官方直连更新 (推荐海外机)"
+    echo "2. 从 GHProxy 代理更新 (推荐国内机)"
+    echo "0. 取消并返回主菜单"
+    echo "--------------------------------"
+    local up_choice target_url
+    read -p "请选择更新线路 [0-2]: " up_choice
+
+    case $up_choice in
+        1) target_url="$RAW_URL" ;;
+        2) target_url="$PROXY_URL" ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项。${PLAIN}" ; sleep 1 ; return ;;
+    esac
+
+    echo -e "${YELLOW}正在拉取最新代码...${PLAIN}"
+    local SCRIPT_PATH=$(realpath "$0")
+    local TEMP_FILE=$(mktemp)
+
+    if curl -sL "$target_url" -o "$TEMP_FILE"; then
+        if grep -q "#!/bin/bash" "$TEMP_FILE"; then
+            cat "$TEMP_FILE" > "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+            rm -f "$TEMP_FILE"
+            echo -e "${GREEN}代码更新成功！面板正在热重启...${PLAIN}"
+            sleep 1
+            # 使用 exec 替换当前进程，实现无缝重启
+            exec bash "$SCRIPT_PATH"
+        else
+            echo -e "${RED}失败: 文件内容非法。可能是代理或网络错误。${PLAIN}"
+            rm -f "$TEMP_FILE"; sleep 3
+        fi
+    else
+        echo -e "${RED}失败: 无法连接服务器。${PLAIN}"
+        rm -f "$TEMP_FILE"; sleep 3
+    fi
+}
+
+# --- 完全卸载脚本 ---
+function uninstall_script() {
+    clear
+    echo -e "${RED}--- 卸载 nftables 端口转发面板 ---${PLAIN}"
+    local confirm
+    read -p "警告: 此操作将抹除所有转发规则及本脚本！确认？[y/N]: " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then return; fi
+
+    echo -e "${YELLOW}清理中...${PLAIN}"
+    nft flush ruleset 2>/dev/null
+    > "$NFT_CONF" 2>/dev/null
+
+    local SCRIPT_PATH=$(realpath "$0")
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH --cron" | crontab -
+
+    # 同步清理日志文件夹
+    rm -rf "$CONFIG_FILE" "$LOG_DIR"
+    sed -i '/alias nft=/d' "$HOME/.bashrc"
+    rm -f "$SCRIPT_PATH"
+
+    echo -e "${GREEN}彻底卸载完成，干干净净。${PLAIN}"
+    exit 0
+}
+
+# --- 主菜单 ---
+function main_menu() {
+    clear
+    echo -e "${GREEN}==========================================${PLAIN}"
+    echo -e "${GREEN}      nftables 端口转发管理面板 (Pro)     ${PLAIN}"
+    echo -e "${GREEN}==========================================${PLAIN}"
+    echo "1. 开启 BBR + 系统优化及开机自启"
+    echo "2. 新增端口转发 (支持域名/IP)"
+    echo "3. 查看 / 删除端口转发"
+    echo "4. 清空所有转发规则"
+    echo "5. 管理 DDNS 定时监控与日志"
+    echo "6. 从 GitHub 更新当前脚本"
+    echo "7. 一键完全卸载本脚本"
+    echo "0. 退出面板"
+    echo "------------------------------------------"
+    local choice
+    read -p "请选择操作 [0-7]: " choice
+
+    case $choice in
+        1) optimize_system ;;
+        2) add_forward ;;
+        3) view_and_del_forward ;;
+        4) > "$CONFIG_FILE" ; apply_rules ; echo -e "${GREEN}已清空。${PLAIN}" ; sleep 2 ;;
+        5) manage_cron ;;
+        6) update_script ;;
+        7) uninstall_script ;;
+        0) exit 0 ;;
+        *) echo "无效选项" ; sleep 1 ;;
+    esac
+}
+
+# 检查依赖
+if ! command -v dig &> /dev/null; then
+    apt-get update && apt-get install -y dnsutils || yum install -y bind-utils
+fi
+
+# 隐藏运行模式 (Crontab触发)
+if [ "$1" == "--cron" ]; then
+    ddns_update
+    exit 0
+fi
+
+# 保持交互菜单循环
+while true; do main_menu; done
