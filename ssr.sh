@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# 脚本名称: SSR 综合管理脚本 (防火墙全能版)
-# 核心功能: CLI双模、无Snell、保留ShadowTLS、SS-Rust旧配置保护、防爆破、BBRv3、防火墙管控
+# 脚本名称: SSR 综合管理脚本 (终极版)
+# 核心功能: CLI双模、无Snell、保留ShadowTLS、SS-Rust旧配置保护、防爆破、极限BBR调参、防火墙管控
 # 全局命令: ssr [可选参数: bbr | swap | clean | update]
 # ==============================================================================
 
@@ -10,7 +10,7 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
-readonly SCRIPT_VERSION="15.0-Firewall-Edition"
+readonly SCRIPT_VERSION="16.0-Final-Master"
 readonly CONF_FILE="/etc/sysctl.d/99-bbr.conf"
 
 trap 'echo -e "\n${GREEN}已安全退出脚本。${RESET}"; exit 0' SIGINT
@@ -103,28 +103,66 @@ auto_clean() {
 }
 
 smart_optimization() {
+    echo -e "${CYAN}>>> 正在分析系统并配置极致网络优化...${RESET}"
     local total_mem=$(free -m | awk '/^Mem:/{print $2}' | tr -d '\r')
-    local rmem_max somaxconn conntrack_max
-    if [ "$total_mem" -le 512 ]; then rmem_max="16777216"; somaxconn="4096"; conntrack_max="65536"
-    elif [ "$total_mem" -le 1024 ]; then rmem_max="33554432"; somaxconn="16384"; conntrack_max="262144"
-    elif [ "$total_mem" -le 4096 ]; then rmem_max="67108864"; somaxconn="32768"; conntrack_max="524288"
-    else rmem_max="134217728"; somaxconn="65535"; conntrack_max="1048576"; fi
+    local rmem_max somaxconn conntrack_max file_max
+    
+    # 根据内存动态计算极限参数
+    if [ "$total_mem" -le 512 ]; then 
+        [span_0](start_span)rmem_max="16777216"; somaxconn="4096"; conntrack_max="65536"; file_max="65535"[span_0](end_span)
+    elif [ "$total_mem" -le 1024 ]; then 
+        [span_1](start_span)rmem_max="33554432"; somaxconn="16384"; conntrack_max="262144"; file_max="524288"[span_1](end_span)
+    elif [ "$total_mem" -le 4096 ]; then 
+        [span_2](start_span)rmem_max="67108864"; somaxconn="32768"; conntrack_max="524288"; file_max="1048576"[span_2](end_span)
+    else 
+        [span_3](start_span)rmem_max="134217728"; somaxconn="65535"; conntrack_max="1048576"; file_max="2097152"[span_3](end_span)
+    fi
 
     cat > "$CONF_FILE" << EOF
+# 1. [span_4](start_span)核心 BBR 与 FQ 队列[span_4](end_span)
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+
+# 2. [span_5](start_span)全局与 TCP/UDP 缓冲区优化 (代理吞吐量核心)[span_5](end_span)
 net.core.rmem_max = $rmem_max
 net.core.wmem_max = $rmem_max
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
 net.ipv4.tcp_rmem = 8192 262144 $rmem_max
 net.ipv4.tcp_wmem = 8192 262144 $rmem_max
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+
+# 3. [span_6](start_span)连接与网卡队列极限提升 (防断流丢包)[span_6](end_span)
 net.core.somaxconn = $somaxconn
+net.core.netdev_max_backlog = $somaxconn
+net.ipv4.tcp_max_syn_backlog = $somaxconn
+
+# 4. [span_7](start_span)TIME_WAIT 与端口复用 (高并发必备)[span_7](end_span)
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.ip_local_port_range = 10000 65535
+net.ipv4.tcp_max_tw_buckets = 500000
 net.ipv4.tcp_notsent_lowat = 16384
+
+# 5. [span_8](start_span)TCP Keepalive 保活探测 (快速剔除死连接)[span_8](end_span)
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+
+# 6. [span_9](start_span)安全、MTU 探测与文件句柄[span_9](end_span)
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_syncookies = 1
 net.netfilter.nf_conntrack_max = $conntrack_max
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 120
+fs.file-max = $file_max
+vm.swappiness = 10
 EOF
+
     sysctl --system >/dev/null 2>&1 || true
-    echo -e "${GREEN}✅ 智能调参完成！默认 BBR 已应用。${RESET}"
+    echo -e "${GREEN}✅ 极致网速调参完成！BBR、端口复用、TCP保活及防断流优化已全面应用。${RESET}"
 }
 
 change_ssh_port() {
@@ -286,7 +324,7 @@ opt_menu() {
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${CYAN}             网络与系统优化菜单${RESET}"
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${YELLOW} 1.${RESET} 智能一键配置 BBR 网络调参"
+    echo -e "${YELLOW} 1.${RESET} 极致配置 BBR 网络调参 (防断流推荐)"
     echo -e "${YELLOW} 2.${RESET} 开启 BBRv3 魔改内核"
     echo -e "${YELLOW} 3.${RESET} 智能配置 Swap 虚拟内存"
     echo -e "${YELLOW} 4.${RESET} 自动清理系统垃圾与冗余日志"
