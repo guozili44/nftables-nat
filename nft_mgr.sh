@@ -41,7 +41,7 @@ function setup_alias() {
 }
 setup_alias
 
-# --- 系统优化与 BBR (已改为 echo 模式防缩进错误) ---
+# --- 系统优化与 BBR ---
 function optimize_system() {
     echo -e "${YELLOW}正在配置 BBR 和内核转发...${PLAIN}"
     echo "net.core.default_qdisc=fq" > /etc/sysctl.d/99-sys-opt.conf
@@ -58,7 +58,7 @@ function optimize_system() {
     sleep 2
 }
 
-# --- 域名解析函数 (强化版) ---
+# --- 域名解析函数 ---
 function get_ip() {
     local addr=$1
     if [[ $addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -68,17 +68,52 @@ function get_ip() {
     fi
 }
 
-# --- 原子化应用规则到内核 (已改为纯 echo 模式防缩进报错) ---
+# --- 本地防火墙智能放行 (Firewall Auto-Pass) ---
+function manage_firewall() {
+    local action=$1
+    local port=$2
+    
+    # 检测并管理 UFW
+    if command -v ufw &> /dev/null && ufw status | grep -qw active; then
+        if [ "$action" == "add" ]; then
+            ufw allow "$port"/tcp >/dev/null 2>&1
+            ufw allow "$port"/udp >/dev/null 2>&1
+        else
+            ufw delete allow "$port"/tcp >/dev/null 2>&1
+            ufw delete allow "$port"/udp >/dev/null 2>&1
+        fi
+    # 检测并管理 Firewalld
+    elif command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
+        if [ "$action" == "add" ]; then
+            firewall-cmd --add-port="${port}/tcp" --permanent >/dev/null 2>&1
+            firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1
+            firewall-cmd --reload >/dev/null 2>&1
+        else
+            firewall-cmd --remove-port="${port}/tcp" --permanent >/dev/null 2>&1
+            firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1
+            firewall-cmd --reload >/dev/null 2>&1
+        fi
+    # 检测并管理 iptables (底层兜底)
+    elif command -v iptables &> /dev/null; then
+        if [ "$action" == "add" ]; then
+            iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1
+            iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1
+        else
+            while iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do :; done
+            while iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; do :; done
+        fi
+    fi
+}
+
+# --- 原子化应用规则到内核 ---
 function apply_rules() {
     local temp_nft=$(mktemp)
     
-    # 构建基础表结构
     echo "flush ruleset" > "$temp_nft"
     echo "table ip nat {" >> "$temp_nft"
     echo "    chain prerouting {" >> "$temp_nft"
     echo "        type nat hook prerouting priority -100; policy accept;" >> "$temp_nft"
 
-    # 批量注入目标转发规则
     while IFS='|' read -r lp addr tp last_ip; do
         local current_ip=$(get_ip "$addr")
         if [ -n "$current_ip" ]; then
@@ -87,7 +122,6 @@ function apply_rules() {
         fi
     done < "$CONFIG_FILE"
 
-    # 构建回程 SNAT (Masquerade)
     echo "    }" >> "$temp_nft"
     echo "    chain postrouting {" >> "$temp_nft"
     echo "        type nat hook postrouting priority 100; policy accept;" >> "$temp_nft"
@@ -99,14 +133,10 @@ function apply_rules() {
         fi
     done < "$CONFIG_FILE"
 
-    # 闭合表结构
     echo "    }" >> "$temp_nft"
     echo "}" >> "$temp_nft"
 
-    # 一次性原子化加载，0丢包断流
     nft -f "$temp_nft"
-    
-    # 固化到系统配置，确保开机生效
     cat "$temp_nft" > "$NFT_CONF"
     rm -f "$temp_nft"
 }
@@ -147,7 +177,9 @@ function add_forward() {
 
     echo "$lport|$taddr|$tport|$tip" >> "$CONFIG_FILE"
     apply_rules
+    manage_firewall "add" "$lport"
     echo -e "${GREEN}添加成功！映射路径: [本机] $lport -> [目标] $taddr:$tport (${tip})。${PLAIN}"
+    echo -e "${GREEN}系统防火墙已智能放行端口 $lport。${PLAIN}"
     sleep 2
 }
 
@@ -191,7 +223,8 @@ function view_and_del_forward() {
     local del_port=$(sed -n "${action}p" "$CONFIG_FILE" | cut -d'|' -f1)
     sed -i "${action}d" "$CONFIG_FILE"
     apply_rules
-    echo -e "${GREEN}已成功删除本地端口为 $del_port 的转发规则。${PLAIN}"
+    manage_firewall "del" "$del_port"
+    echo -e "${GREEN}已成功删除本地端口为 $del_port 的转发规则及防火墙放行。${PLAIN}"
     sleep 2
 }
 
@@ -306,7 +339,12 @@ function uninstall_script() {
     read -p "警告: 此操作将抹除所有转发规则及本脚本！确认？[y/N]: " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then return; fi
 
-    echo -e "${YELLOW}清理中...${PLAIN}"
+    echo -e "${YELLOW}正在清理系统防火墙放行规则...${PLAIN}"
+    while IFS='|' read -r lp addr tp last_ip; do
+        manage_firewall "del" "$lp"
+    done < "$CONFIG_FILE"
+
+    echo -e "${YELLOW}正在清空内核转发规则及关联组件...${PLAIN}"
     nft flush ruleset 2>/dev/null
     > "$NFT_CONF" 2>/dev/null
 
@@ -343,7 +381,16 @@ function main_menu() {
         1) optimize_system ;;
         2) add_forward ;;
         3) view_and_del_forward ;;
-        4) > "$CONFIG_FILE" ; apply_rules ; echo -e "${GREEN}已清空。${PLAIN}" ; sleep 2 ;;
+        4) 
+            # 清空前先遍历删除防火墙放行
+            while IFS='|' read -r lp addr tp last_ip; do
+                manage_firewall "del" "$lp"
+            done < "$CONFIG_FILE"
+            > "$CONFIG_FILE" 
+            apply_rules 
+            echo -e "${GREEN}所有转发规则及防火墙放行已清空。${PLAIN}" 
+            sleep 2 
+            ;;
         5) manage_cron ;;
         6) update_script ;;
         7) uninstall_script ;;
