@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# 脚本名称: SSR 综合管理脚本 (终极 NAT 与无痕版)
-# 核心功能: 无痕全量卸载(含DNS解锁)、NAT极限优化(Swap/日志/SSH防断)、全原生部署
+# 脚本名称: SSR 综合管理脚本 (全局随机防呆版)
+# 核心功能: 全局空输入防呆(随机端口+Apple伪装)、无痕卸载、NAT优化、每日全自动热更
 # 全局命令: ssr [可选参数: bbr | nat | clean | update | daemon | hot_upgrade]
 # ==============================================================================
 
@@ -10,7 +10,7 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
-readonly SCRIPT_VERSION="20.4-Ultimate-NAT"
+readonly SCRIPT_VERSION="20.6-Foolproof-Random"
 readonly CONF_FILE="/etc/sysctl.d/99-bbr.conf"
 readonly NAT_CONF_FILE="/etc/sysctl.d/99-nat.conf"
 
@@ -56,7 +56,6 @@ remove_firewall_rule() {
 hot_update_components() {
     local is_silent=$1
     [[ "$is_silent" != "silent" ]] && echo -e "${CYAN}>>> 正在安全检查官方二进制核心版本...${RESET}"
-
     local arch=$(uname -m); local ss_arch="x86_64-unknown-linux-gnu"; local st_arch="x86_64-unknown-linux-musl"; local xray_arch="64"
     if [[ "$arch" == "aarch64" ]]; then ss_arch="aarch64-unknown-linux-gnu"; st_arch="aarch64-unknown-linux-musl"; xray_arch="arm64-v8a"; fi
 
@@ -94,20 +93,22 @@ hot_update_components() {
 }
 
 # ==========================================================
-# 原生交互安装模块与节点中心
+# 原生安装模块 (全局防呆：空输入即随机端口/默认域名)
 # ==========================================================
 install_ss_rust_native() {
     clear; echo -e "${CYAN}========= 原生交互安装 SS-Rust =========${RESET}"
-    read -rp "自定义端口 (1-65535) [留空随机]: " custom_port
-    local port=$custom_port; if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then port=$((RANDOM % 55535 + 10000)); fi
-    echo -e "\n${CYAN}加密协议:${RESET}\n 1) 2022-blake3-aes-128-gcm\n 2) 2022-blake3-aes-256-gcm\n 3) 2022-blake3-chacha20-poly1305\n 4) aes-256-gcm"
+    read -rp "请输入自定义连接端口 (1-65535) [留空自动随机]: " custom_port
+    local port=$custom_port
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then port=$((RANDOM % 55535 + 10000)); fi
+    echo -e "\n${CYAN}请选择加密协议 (推荐使用 2022 系列):${RESET}"
+    echo -e " 1) 2022-blake3-aes-128-gcm\n 2) 2022-blake3-aes-256-gcm\n 3) 2022-blake3-chacha20-poly1305\n 4) aes-256-gcm"
     read -rp "请选择 [1-4] (默认1): " method_choice
     local method="2022-blake3-aes-128-gcm"; local pwd_len=16
     case "$method_choice" in 2) method="2022-blake3-aes-256-gcm"; pwd_len=32 ;; 3) method="2022-blake3-chacha20-poly1305"; pwd_len=32 ;; 4) method="aes-256-gcm"; pwd_len=0 ;; esac
     local pwd=""; if [[ "$pwd_len" -ne 0 ]]; then
-        read -rp "密码 (留空生成 Base64): " input_pwd; [[ -z "$input_pwd" ]] && pwd=$(openssl rand -base64 $pwd_len) || pwd=$(echo -n "$input_pwd" | base64 -w 0 | cut -c 1-$(($pwd_len * 4 / 3 + 4)))
+        read -rp "请输入密码 (留空系统生成合规 Base64 密钥): " input_pwd; [[ -z "$input_pwd" ]] && pwd=$(openssl rand -base64 $pwd_len) || pwd=$(echo -n "$input_pwd" | base64 -w 0 | cut -c 1-$(($pwd_len * 4 / 3 + 4)))
     else
-        read -rp "传统密码 (留空随机): " input_pwd; [[ -z "$input_pwd" ]] && pwd=$(openssl rand -hex 12) || pwd="$input_pwd"
+        read -rp "请输入传统密码 (留空随机生成): " input_pwd; [[ -z "$input_pwd" ]] && pwd=$(openssl rand -hex 12) || pwd="$input_pwd"
     fi
     local arch=$(uname -m); local ss_arch="x86_64-unknown-linux-gnu"
     [[ "$arch" == "aarch64" ]] && ss_arch="aarch64-unknown-linux-gnu"
@@ -128,8 +129,10 @@ EOF
 
 install_vless_native() {
     clear; echo -e "${CYAN}========= 原生交互安装 VLESS Reality =========${RESET}"
-    read -rp "Reality 伪装域名 [默认 www.microsoft.com]: " sni_domain; [[ -z "$sni_domain" ]] && sni_domain="www.microsoft.com"
-    read -rp "监听端口 [默认 443]: " port; if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then port=443; fi
+    read -rp "请输入 Reality 伪装域名 [留空默认 updates.cdn-apple.com]: " sni_domain
+    [[ -z "$sni_domain" ]] && sni_domain="updates.cdn-apple.com"
+    read -rp "请输入监听端口 (1-65535) [建议443, 留空自动随机]: " port
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then port=$((RANDOM % 55535 + 10000)); fi
     local arch=$(uname -m); local xray_arch="64"; [[ "$arch" == "aarch64" ]] && xray_arch="arm64-v8a"
     local xray_latest=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
     wget -qO /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/Xray-linux-${xray_arch}.zip"
@@ -161,29 +164,36 @@ install_shadowtls_native() {
     local ss_port=""; [[ -f "/etc/ss-rust/config.json" ]] && ss_port=$(jq -r '.server_port' /etc/ss-rust/config.json 2>/dev/null)
     if [[ -n "$ss_port" && "$ss_port" != "null" ]]; then
         echo -e "${YELLOW}检测到本地 SS-Rust 节点，推荐进行保护：${RESET}\n${CYAN} 1) 保护本地 SS-Rust (端口: $ss_port)${RESET}\n${CYAN} 2) 手动输入其他自定义端口${RESET}"
-        read -rp "选择 [1-2]: " protect_choice; if [[ "$protect_choice" == "1" ]]; then up_port=$ss_port; else read -rp "保护的上游端口: " up_port; fi
+        read -rp "选择 [1-2]: " protect_choice; if [[ "$protect_choice" == "1" ]]; then up_port=$ss_port; else read -rp "需要保护的上游端口: " up_port; fi
     else
-        read -rp "需要保护的上游端口: " up_port
+        read -rp "请输入需要保护的上游端口: " up_port
     fi
-    [[ -z "$up_port" ]] && echo -e "${RED}端口无效！${RESET}" && sleep 2 && return
-    read -rp "ShadowTLS 伪装端口 (如443/8443): " listen_port; read -rp "伪装域名 (如 gateway.icloud.com): " sni_domain
+    [[ -z "$up_port" ]] && echo -e "${RED}上游端口无效！${RESET}" && sleep 2 && return
+
+    read -rp "请输入 ShadowTLS 伪装端口 (1-65535) [留空自动随机]: " listen_port
+    if ! [[ "$listen_port" =~ ^[0-9]+$ ]] || [ "$listen_port" -lt 1 ] || [ "$listen_port" -gt 65535 ]; then listen_port=$((RANDOM % 55535 + 10000)); fi
+    
+    read -rp "请输入伪装域名 (SNI) [留空默认 updates.cdn-apple.com]: " sni_domain
+    [[ -z "$sni_domain" ]] && sni_domain="updates.cdn-apple.com"
+
     local pwd=$(openssl rand -base64 8); local arch=$(uname -m); local st_arch="x86_64-unknown-linux-musl"
     [[ "$arch" == "aarch64" ]] && st_arch="aarch64-unknown-linux-musl"
     local st_latest=$(curl -s https://api.github.com/repos/ihciah/shadow-tls/releases/latest | jq -r .tag_name)
     wget -qO /tmp/shadow-tls "https://github.com/ihciah/shadow-tls/releases/download/${st_latest}/shadow-tls-${st_arch}"
     mv -f /tmp/shadow-tls /usr/local/bin/shadow-tls && chmod +x /usr/local/bin/shadow-tls
+    
     cat > /etc/systemd/system/shadowtls-${listen_port}.service << EOF
 [Unit]\nDescription=ShadowTLS Service on port ${listen_port}\nAfter=network.target\n[Service]\nExecStart=/usr/local/bin/shadow-tls --v3 --strict server --listen 0.0.0.0:${listen_port} --server 127.0.0.1:${up_port} --tls ${sni_domain}:443 --password ${pwd}\nRestart=always\nLimitNOFILE=1048576\n[Install]\nWantedBy=multi-user.target
 EOF
     systemctl daemon-reload && systemctl enable --now shadowtls-${listen_port}
     if command -v ufw >/dev/null 2>&1; then ufw allow "$listen_port"/tcp >/dev/null 2>&1; fi
     if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$listen_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
-    echo -e "${GREEN}✅ ShadowTLS 已挂载在 ${up_port} 上层。${RESET}"; sleep 2
+    echo -e "${GREEN}✅ ShadowTLS 安装成功！已挂载在 ${up_port} 上层，对外端口为 ${listen_port}。${RESET}"; sleep 2
 }
 
 unified_node_manager() {
     while true; do
-        clear; echo -e "${CYAN}========= 🔰 统一节点管控中心 =========${RESET}"
+        clear; echo -e "${CYAN}========= 🔰 统一节点生命周期管控中心 =========${RESET}"
         local has_ss=0; local has_vless=0; local has_stls=0
         if [[ -f "/etc/ss-rust/config.json" ]]; then echo -e "${GREEN} 1) ⚡ SS-Rust 节点${RESET}"; has_ss=1; else echo -e "${RED} 1) ❌ 未部署 SS-Rust${RESET}"; fi
         if [[ -f "/usr/local/etc/xray/config.json" ]]; then echo -e "${GREEN} 2) 🔮 VLESS Reality 节点${RESET}"; has_vless=1; else echo -e "${RED} 2) ❌ 未部署 VLESS Reality${RESET}"; fi
@@ -331,7 +341,6 @@ update_script() {
 total_uninstall() {
     echo -e "${RED}⚠️ 正在进行无痕毁灭性全量卸载...${RESET}"
     
-    # 1. 擦除所有节点服务与防火墙规则
     if [[ -f "/etc/ss-rust/config.json" ]]; then local sp=$(jq -r '.server_port' /etc/ss-rust/config.json); remove_firewall_rule "$sp" "both"; fi
     if [[ -f "/usr/local/etc/xray/config.json" ]]; then local xp=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json); remove_firewall_rule "$xp" "tcp"; fi
     for s in /etc/systemd/system/shadowtls-*.service; do [[ -f "$s" ]] && remove_firewall_rule "$(basename "$s" | sed 's/shadowtls-//g' | sed 's/.service//g')" "tcp"; done
@@ -341,15 +350,12 @@ total_uninstall() {
     rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service
     for s in $(systemctl list-units --type=service --all --no-legend | grep "shadowtls-" | awk '{print $1}'); do systemctl stop "$s" 2>/dev/null; rm -f "/etc/systemd/system/$s"; done
     
-    # 2. 清理系统参数、内核与垃圾
     rm -f /usr/local/bin/shadow-tls "$CONF_FILE" "$NAT_CONF_FILE" /usr/local/bin/ssr /usr/local/bin/ssr.sh
     crontab -l 2>/dev/null | grep -vE "ssr hot_upgrade|ssr daemon_check|ssr clean" | crontab -
     
-    # 3. 终极无痕退水：解除 DNS 锁并还原默认 DNS
     if command -v chattr >/dev/null 2>&1; then chattr -i /etc/resolv.conf 2>/dev/null; fi
     echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
 
-    # 4. 终极无痕退水：抹除 Swap 虚拟内存
     if grep -q "/var/swap" /etc/fstab; then
         swapoff /var/swap 2>/dev/null; rm -f /var/swap
         sed -i 's|/var/swap swap swap defaults 0 0||g' /etc/fstab
