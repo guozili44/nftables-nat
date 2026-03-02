@@ -1,8 +1,8 @@
 #!/bin/bash
 # ==============================================================================
-# 脚本名称: SSR 综合管理脚本 (终极大满配版)
-# 核心功能: 原生防呆部署/NAT极限压榨/每日热更/统一管控/无痕卸载/系统全套管理
-# 全局命令: ssr [可选参数: bbr | nat | clean | update | daemon | hot_upgrade]
+# 脚本名称: SSR 综合管理脚本 (极限精简版)
+# 核心功能: 剔除臃肿检测、每日凌晨流水线维护、全局防呆、NAT极限压榨、无痕卸载
+# 全局命令: ssr [可选参数: bbr | nat | clean | update | daemon | hot_upgrade | daily_task]
 # ==============================================================================
 
 readonly RED='\033[0;31m'
@@ -10,7 +10,7 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
-readonly SCRIPT_VERSION="20.7-Ultimate-Full"
+readonly SCRIPT_VERSION="20.10-Ultra-Lite"
 readonly CONF_FILE="/etc/sysctl.d/99-bbr.conf"
 readonly NAT_CONF_FILE="/etc/sysctl.d/99-nat.conf"
 
@@ -34,9 +34,13 @@ install_global_command() {
         cp -f "$0" /usr/local/bin/ssr
         chmod +x /usr/local/bin/ssr
     fi
-    crontab -l 2>/dev/null | grep -vE "ssr auto_update|ssr auto_task|ssr daemon_check|ssr hot_upgrade|ssr clean" | crontab -
-    if ! crontab -l 2>/dev/null | grep -q "ssr hot_upgrade"; then (crontab -l 2>/dev/null; echo "0 3 * * * /usr/local/bin/ssr hot_upgrade > /dev/null 2>&1") | crontab -; fi
-    if ! crontab -l 2>/dev/null | grep -q "ssr clean"; then (crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/ssr clean > /dev/null 2>&1") | crontab -; fi
+    # 清理所有旧版零散的定时任务
+    crontab -l 2>/dev/null | grep -vE "ssr auto_update|ssr auto_task|ssr daemon_check|ssr hot_upgrade|ssr clean|ssr daily_task" | crontab -
+    
+    # 注入统一流水线任务：每天凌晨 3 点执行热更新与垃圾清理
+    if ! crontab -l 2>/dev/null | grep -q "ssr daily_task"; then (crontab -l 2>/dev/null; echo "0 3 * * * /usr/local/bin/ssr daily_task > /dev/null 2>&1") | crontab -; fi
+    
+    # 保留高优级别的防崩溃守护进程
     if ! crontab -l 2>/dev/null | grep -q "ssr daemon_check"; then (crontab -l 2>/dev/null; echo "* * * * * /usr/local/bin/ssr daemon_check > /dev/null 2>&1") | crontab -; fi
 }
 
@@ -54,7 +58,7 @@ remove_firewall_rule() {
 }
 
 # ==========================================================
-# 基础系统管理与极客工具 (完整恢复)
+# 基础系统管理与极客工具
 # ==========================================================
 change_ssh_port() {
     read -rp "请输入新的 SSH 端口号 (1-65535): " new_port
@@ -90,14 +94,6 @@ sync_server_time() {
     fi
     echo -e "${GREEN}✅ 时间防偏移自动同步服务已启动！${RESET}"
     sleep 2
-}
-
-media_unlock_check() {
-    clear
-    echo -e "${CYAN}>>> 正在拉取纯净版流媒体与 AI 解锁检测脚本...${RESET}"
-    bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh)
-    echo -e "\n${GREEN}✅ 检测完毕！${RESET}"
-    read -n 1 -s -r -p "按任意键返回..."
 }
 
 # [SSH 密钥中心]
@@ -144,7 +140,7 @@ ssh_key_menu() {
 }
 
 # ==========================================================
-# 核心组件热替换与配置热进化 (每天自动跟随官方源)
+# 核心组件热替换与配置热进化
 # ==========================================================
 hot_update_components() {
     local is_silent=$1
@@ -327,7 +323,7 @@ unified_node_manager() {
 }
 
 # ==========================================================
-# NAT 小鸡终极调参中心 (集成Swap/日志割权/SSH防断)
+# NAT 小鸡终极调参中心 (智能捕获配额与动态降级)
 # ==========================================================
 nat_vps_optimization() {
     clear; echo -e "${CYAN}========= NAT 小鸡全方位极限优化 =========${RESET}"
@@ -337,11 +333,23 @@ nat_vps_optimization() {
     echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 2606:4700:4700::1111" > /etc/resolv.conf
     if command -v chattr >/dev/null 2>&1; then chattr +i /etc/resolv.conf 2>/dev/null; fi
 
-    echo -e "${CYAN}>>> 2. 划分 512MB Swap 虚拟内存 (防 OOM 杀进程)...${RESET}"
+    echo -e "${CYAN}>>> 2. 尝试划分 Swap 虚拟内存 (防 OOM 杀进程)...${RESET}"
     if ! grep -q "swap" /etc/fstab; then
-        dd if=/dev/zero of=/var/swap bs=1M count=512 status=none
-        chmod 600 /var/swap; mkswap /var/swap >/dev/null 2>&1; swapon /var/swap >/dev/null 2>&1
-        echo "/var/swap swap swap defaults 0 0" >> /etc/fstab
+        rm -f /var/swap
+        if dd if=/dev/zero of=/var/swap bs=1M count=512 status=none 2>/dev/null; then
+            chmod 600 /var/swap; mkswap /var/swap >/dev/null 2>&1; swapon /var/swap >/dev/null 2>&1
+            echo "/var/swap swap swap defaults 0 0" >> /etc/fstab
+            echo -e "${GREEN}✅ 512MB Swap 创建成功！${RESET}"
+        elif dd if=/dev/zero of=/var/swap bs=1M count=256 status=none 2>/dev/null; then
+            chmod 600 /var/swap; mkswap /var/swap >/dev/null 2>&1; swapon /var/swap >/dev/null 2>&1
+            echo "/var/swap swap swap defaults 0 0" >> /etc/fstab
+            echo -e "${YELLOW}✅ 磁盘空间吃紧，已自动降级为您创建 256MB Swap！${RESET}"
+        else
+            rm -f /var/swap
+            echo -e "${YELLOW}⚠️ 磁盘配额已满 (Disk quota exceeded)，自动跳过 Swap 创建以防系统卡死。${RESET}"
+        fi
+    else
+        echo -e "${GREEN}✅ Swap 已存在，跳过创建。${RESET}"
     fi
 
     echo -e "${CYAN}>>> 3. 防爆磁盘：收缩系统日志上限至 50MB...${RESET}"
@@ -370,7 +378,7 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
     sysctl -p "$NAT_CONF_FILE" >/dev/null 2>&1 || true
-    echo -e "${GREEN}✅ 优化完毕！断流率已压至最低，各项底层瓶颈已解除。${RESET}"; sleep 3
+    echo -e "${GREEN}✅ NAT 专属优化完毕！各项底层瓶颈已解除。${RESET}"; sleep 3
 }
 
 smart_optimization() {
@@ -414,6 +422,9 @@ run_daemon_check() {
     for s in $(systemctl list-units --type=service --all --no-legend | grep "shadowtls-" | awk '{print $1}'); do systemctl is-active --quiet "$s" || systemctl restart "$s" 2>/dev/null; done
 }
 
+# ==========================================================
+# 全量清理与自我更新
+# ==========================================================
 auto_clean() {
     local is_silent=$1
     if command -v apt-get >/dev/null 2>&1; then apt-get autoremove -yqq >/dev/null 2>&1; apt-get clean -qq >/dev/null 2>&1; fi
@@ -429,7 +440,7 @@ update_script() {
 }
 
 # ==========================================================
-# 无痕退水：全量毁灭性卸载中心 (加入DNS解锁、Swap清理)
+# 无痕退水：全量毁灭性卸载中心
 # ==========================================================
 total_uninstall() {
     echo -e "${RED}⚠️ 正在进行无痕毁灭性全量卸载...${RESET}"
@@ -444,7 +455,7 @@ total_uninstall() {
     for s in $(systemctl list-units --type=service --all --no-legend | grep "shadowtls-" | awk '{print $1}'); do systemctl stop "$s" 2>/dev/null; rm -f "/etc/systemd/system/$s"; done
     
     rm -f /usr/local/bin/shadow-tls "$CONF_FILE" "$NAT_CONF_FILE" /usr/local/bin/ssr /usr/local/bin/ssr.sh
-    crontab -l 2>/dev/null | grep -vE "ssr hot_upgrade|ssr daemon_check|ssr clean" | crontab -
+    crontab -l 2>/dev/null | grep -vE "ssr auto_update|ssr auto_task|ssr daemon_check|ssr hot_upgrade|ssr clean|ssr daily_task" | crontab -
     
     if command -v chattr >/dev/null 2>&1; then chattr -i /etc/resolv.conf 2>/dev/null; fi
     echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
@@ -464,10 +475,10 @@ total_uninstall() {
 opt_menu() {
     clear; echo -e "${CYAN}========= 网络优化与监视中心 =========${RESET}"
     echo -e "${YELLOW} 1.${RESET} 常规机器极致 BBR 网络调参"
-    echo -e "${GREEN} 2. NAT 小鸡专属极限优化 (防断流 / 防爆内存 / 锁DNS / 防磁盘撑爆)${RESET}"
+    echo -e "${GREEN} 2. NAT 小鸡专属极限优化 (防断流 / 智能Swap / 锁DNS / 防磁盘撑爆)${RESET}"
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${YELLOW} 3.${RESET} 启动实时网卡流量监视器 (Traffic Monitor)"
-    echo -e "${YELLOW} 4.${RESET} 自动清理系统垃圾与冗余日志"
+    echo -e "${YELLOW} 4.${RESET} 手动清理系统垃圾与冗余日志"
     echo -e " 0. 返回主菜单"
     read -rp "输入数字 [0-4]: " opt_num
     case "$opt_num" in 1) smart_optimization ;; 2) nat_vps_optimization ;; 3) real_time_traffic_monitor ;; 4) auto_clean ;; 0) return ;; esac
@@ -479,20 +490,18 @@ sys_menu() {
     echo -e "${YELLOW} 2.${RESET} 一键修改 Root 密码"
     echo -e "${YELLOW} 3.${RESET} 服务器时间防偏移同步"
     echo -e "${YELLOW} 4.${RESET} SSH 密钥登录管理中心 (防爆破神器)"
-    echo -e "${YELLOW} 5.${RESET} 流媒体与 AI 纯净解锁检测"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${YELLOW} 6.${RESET} 手动热替换升级所有核心组件 (系统已设为每日自动更新)"
-    echo -e "${YELLOW} 7.${RESET} 手动更新 SSR 管理脚本本身"
+    echo -e "${YELLOW} 5.${RESET} 手动热替换升级所有核心组件 (系统已设为每日凌晨3点自动维护: 热更+清理)"
+    echo -e "${YELLOW} 6.${RESET} 手动更新 SSR 管理脚本本身"
     echo -e " 0. 返回主菜单"
-    read -rp "输入数字 [0-7]: " sys_num
+    read -rp "输入数字 [0-6]: " sys_num
     case "$sys_num" in 
         1) change_ssh_port ;; 
         2) change_root_password ;; 
         3) sync_server_time ;; 
         4) ssh_key_menu ;; 
-        5) media_unlock_check ;; 
-        6) hot_update_components ;; 
-        7) update_script ;; 
+        5) hot_update_components ;; 
+        6) update_script ;; 
         0) return ;; 
     esac
 }
@@ -510,7 +519,7 @@ main_menu() {
     echo -e "${GREEN} 4. 🔰 统一节点管控中心 (节点查看 / 靶向卸载)${RESET}"
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${YELLOW} 5.${RESET} 网络优化与流量监视 (NAT专属压榨 / 流量嗅探)"
-    echo -e "${YELLOW} 6.${RESET} 极客系统底层管控 (端口/密码/解锁检测/每日热更)"
+    echo -e "${YELLOW} 6.${RESET} 极客系统底层管控 (系统管理 / 节点热更)"
     echo -e "${RED} 7. 完美无痕毁灭性卸载中心 (退水清扫)${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 退出脚本"
@@ -535,6 +544,7 @@ main_menu() {
 check_env
 install_global_command
 
+# 底层智能调度器 (响应外部 Cron 传参)
 if [[ -n "${1:-}" ]]; then
     case "$1" in
         bbr)          smart_optimization ;;
@@ -542,6 +552,7 @@ if [[ -n "${1:-}" ]]; then
         clean)        auto_clean "silent" ;;
         update)       update_script ;;
         hot_upgrade)  hot_update_components "silent" ;;
+        daily_task)   hot_update_components "silent"; auto_clean "silent" ;;
         daemon_check) run_daemon_check ;;
         *) echo -e "${RED}未知指令: $1${RESET}"; exit 1 ;;
     esac
