@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# 脚本名称: SSR 综合管理脚本 (全局随机防呆版)
-# 核心功能: 全局空输入防呆(随机端口+Apple伪装)、无痕卸载、NAT优化、每日全自动热更
+# 脚本名称: SSR 综合管理脚本 (终极大满配版)
+# 核心功能: 原生防呆部署/NAT极限压榨/每日热更/统一管控/无痕卸载/系统全套管理
 # 全局命令: ssr [可选参数: bbr | nat | clean | update | daemon | hot_upgrade]
 # ==============================================================================
 
@@ -10,7 +10,7 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
-readonly SCRIPT_VERSION="20.6-Foolproof-Random"
+readonly SCRIPT_VERSION="20.7-Ultimate-Full"
 readonly CONF_FILE="/etc/sysctl.d/99-bbr.conf"
 readonly NAT_CONF_FILE="/etc/sysctl.d/99-nat.conf"
 
@@ -53,6 +53,99 @@ remove_firewall_rule() {
     fi
 }
 
+# ==========================================================
+# 基础系统管理与极客工具 (完整恢复)
+# ==========================================================
+change_ssh_port() {
+    read -rp "请输入新的 SSH 端口号 (1-65535): " new_port
+    if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
+        if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then ufw allow "$new_port"/tcp >/dev/null 2>&1; fi
+        if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$new_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+        sed -i "s/^#\?Port [0-9]*/Port $new_port/g" /etc/ssh/sshd_config
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+        echo -e "${GREEN}✅ SSH 端口已成功修改为 $new_port (防火墙已自动放行)。${RESET}"
+    else
+        echo -e "${RED}输入无效，端口未修改。${RESET}"
+    fi
+    sleep 2
+}
+
+change_root_password() {
+    read -rp "请输入新的 root 密码: " new_pass
+    [[ -z "$new_pass" ]] && return
+    read -rp "请再次输入确认: " new_pass_confirm
+    [[ "$new_pass" != "$new_pass_confirm" ]] && echo -e "${RED}两次密码不一致！${RESET}" && sleep 2 && return
+    echo "root:$new_pass" | chpasswd && echo -e "${GREEN}✅ 密码修改成功！请牢记您的新密码。${RESET}"
+    sleep 2
+}
+
+sync_server_time() {
+    echo -e "${CYAN}>>> 正在同步服务器时间...${RESET}"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -yqq systemd-timesyncd
+        systemctl enable --now systemd-timesyncd 2>/dev/null
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -yq chrony
+        systemctl enable --now chronyd 2>/dev/null
+    fi
+    echo -e "${GREEN}✅ 时间防偏移自动同步服务已启动！${RESET}"
+    sleep 2
+}
+
+media_unlock_check() {
+    clear
+    echo -e "${CYAN}>>> 正在拉取纯净版流媒体与 AI 解锁检测脚本...${RESET}"
+    bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh)
+    echo -e "\n${GREEN}✅ 检测完毕！${RESET}"
+    read -n 1 -s -r -p "按任意键返回..."
+}
+
+# [SSH 密钥中心]
+apply_ssh_key_sec() {
+    sed -i 's/^#\?PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config
+    sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication no/g' /etc/ssh/sshd_config
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+    echo -e "${GREEN}✅ 已彻底封锁密码登录通道！仅允许密钥验证。${RESET}"
+    sleep 2
+}
+ssh_key_github() {
+    read -rp "请输入你的 GitHub 用户名: " gh_user; [[ -z "$gh_user" ]] && return
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    local keys=$(curl -s --max-time 10 "https://github.com/${gh_user}.keys")
+    if [[ -z "$keys" || "$keys" == "Not Found" ]]; then echo -e "${RED}❌ 未找到公钥。${RESET}"; sleep 2; return; fi
+    echo "$keys" >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
+    echo -e "${GREEN}✅ 已成功从 GitHub 拉取配置公钥！${RESET}"; apply_ssh_key_sec
+}
+ssh_key_manual() {
+    read -rp "请粘贴你的 SSH 公钥: " manual_key; [[ -z "$manual_key" ]] && return
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh; echo "$manual_key" >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
+    echo -e "${GREEN}✅ 手动配置公钥成功！${RESET}"; apply_ssh_key_sec
+}
+ssh_key_generate() {
+    echo -e "${CYAN}>>> 正在生成密钥对...${RESET}"; mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    rm -f ~/.ssh/id_ed25519*; ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+    cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
+    echo -e "\n${YELLOW}======================================================${RESET}"
+    echo -e "${RED}⚠️ 请保存以下私钥内容，否则无法登录！⚠️${RESET}"
+    echo -e "${YELLOW}======================================================${RESET}"
+    cat ~/.ssh/id_ed25519; echo -e "${YELLOW}======================================================${RESET}"
+    read -rp "确认关闭密码登录 (y/N): " confirm; [[ "$confirm" == "y" || "$confirm" == "Y" ]] && apply_ssh_key_sec
+}
+ssh_key_restore() {
+    sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; echo -e "${GREEN}✅ 已恢复密码登录通道。${RESET}"; sleep 2
+}
+ssh_key_menu() {
+    clear; echo -e "${CYAN}========= SSH 密钥登录管理中心 =========${RESET}"
+    echo -e "${YELLOW} 1.${RESET} 自动拉取公钥 (GitHub)\n${YELLOW} 2.${RESET} 手动填写公钥\n${YELLOW} 3.${RESET} 一键生成密钥对"
+    echo -e "${RED} 4. 恢复密码登录通道${RESET}\n 0. 返回"
+    read -rp "输入数字 [0-4]: " skm_num
+    case "$skm_num" in 1) ssh_key_github ;; 2) ssh_key_manual ;; 3) ssh_key_generate ;; 4) ssh_key_restore ;; 0) return ;; esac
+}
+
+# ==========================================================
+# 核心组件热替换与配置热进化 (每天自动跟随官方源)
+# ==========================================================
 hot_update_components() {
     local is_silent=$1
     [[ "$is_silent" != "silent" ]] && echo -e "${CYAN}>>> 正在安全检查官方二进制核心版本...${RESET}"
@@ -89,7 +182,7 @@ hot_update_components() {
             unzip -qo /tmp/xray.zip xray -d /tmp/; mv -f /tmp/xray /usr/local/bin/xray && chmod +x /usr/local/bin/xray; systemctl restart xray 2>/dev/null
         fi
     fi
-    [[ "$is_silent" != "silent" ]] && echo -e "${GREEN}✅ 官方同步完毕！本地核心热更新已完成。${RESET}"
+    [[ "$is_silent" != "silent" ]] && echo -e "${GREEN}✅ 官方同步完毕！本地核心热更新已完成。${RESET}" && sleep 2
 }
 
 # ==========================================================
@@ -381,12 +474,27 @@ opt_menu() {
 }
 
 sys_menu() {
-    clear; echo -e "${CYAN}========= 系统与极客管理 =========${RESET}"
-    echo -e "${YELLOW} 1.${RESET} 手动热替换升级所有核心组件 (系统已设为每日自动更新)"
-    echo -e "${YELLOW} 2.${RESET} 手动更新 SSR 管理脚本本身"
+    clear; echo -e "${CYAN}========= 系统基础与极客管理 =========${RESET}"
+    echo -e "${YELLOW} 1.${RESET} 一键修改 SSH 安全端口"
+    echo -e "${YELLOW} 2.${RESET} 一键修改 Root 密码"
+    echo -e "${YELLOW} 3.${RESET} 服务器时间防偏移同步"
+    echo -e "${YELLOW} 4.${RESET} SSH 密钥登录管理中心 (防爆破神器)"
+    echo -e "${YELLOW} 5.${RESET} 流媒体与 AI 纯净解锁检测"
+    echo -e "${CYAN}--------------------------------------------${RESET}"
+    echo -e "${YELLOW} 6.${RESET} 手动热替换升级所有核心组件 (系统已设为每日自动更新)"
+    echo -e "${YELLOW} 7.${RESET} 手动更新 SSR 管理脚本本身"
     echo -e " 0. 返回主菜单"
-    read -rp "输入数字 [0-2]: " sys_num
-    case "$sys_num" in 1) hot_update_components ;; 2) update_script ;; 0) return ;; esac
+    read -rp "输入数字 [0-7]: " sys_num
+    case "$sys_num" in 
+        1) change_ssh_port ;; 
+        2) change_root_password ;; 
+        3) sync_server_time ;; 
+        4) ssh_key_menu ;; 
+        5) media_unlock_check ;; 
+        6) hot_update_components ;; 
+        7) update_script ;; 
+        0) return ;; 
+    esac
 }
 
 main_menu() {
@@ -402,7 +510,7 @@ main_menu() {
     echo -e "${GREEN} 4. 🔰 统一节点管控中心 (节点查看 / 靶向卸载)${RESET}"
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${YELLOW} 5.${RESET} 网络优化与流量监视 (NAT专属压榨 / 流量嗅探)"
-    echo -e "${YELLOW} 6.${RESET} 极客系统底层管理 (日更核心守护 / 脚本更新)"
+    echo -e "${YELLOW} 6.${RESET} 极客系统底层管控 (端口/密码/解锁检测/每日热更)"
     echo -e "${RED} 7. 完美无痕毁灭性卸载中心 (退水清扫)${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 退出脚本"
