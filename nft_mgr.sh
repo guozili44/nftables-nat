@@ -156,6 +156,63 @@ with_lock() {
 # --------------------------
 # 参数/输入校验
 # --------------------------
+# DDNS 定时任务联动（当新增规则目标为域名时，自动启用每分钟检测）
+# --------------------------
+ensure_ddns_cron_enabled() {
+    local script_path="/usr/local/bin/${CMD_NAME}"
+    [[ -x "$script_path" ]] || script_path="$(script_realpath)"
+
+    # 已存在则不重复添加
+    if crontab -l 2>/dev/null | grep -Fq "${script_path} --cron"; then
+        return 0
+    fi
+
+    # 追加定时任务：每分钟运行一次 DDNS 更新
+    (crontab -l 2>/dev/null; echo "* * * * * ${script_path} --cron > /dev/null 2>&1") | crontab - 2>/dev/null || true
+    return 0
+}
+
+
+has_domain_rules() {
+    # 如果配置中仍存在“目标为域名（非纯 IPv4）”的规则，则返回 0，否则返回 1
+    while IFS='|' read -r lp addr tp last_ip proto; do
+        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
+        [[ -z "$addr" ]] && continue
+        if ! is_ipv4 "$addr"; then
+            return 0
+        fi
+    done < "$CONFIG_FILE"
+    return 1
+}
+
+remove_ddns_cron_task() {
+    # 删除所有 nftmgr --cron 的 crontab 行（避免路径差异导致残留）
+    local cur
+    cur="$(crontab -l 2>/dev/null || true)"
+    [[ -z "$cur" ]] && return 0
+    echo "$cur" | grep -vE '(^|\s)(/usr/local/bin/nftmgr|nftmgr)\s+--cron(\s|$)' | crontab - 2>/dev/null || true
+    return 0
+}
+
+ensure_ddns_cron_disabled_if_unused() {
+    # 当已无域名转发规则时，自动清理 DDNS 定时任务，避免 crontab 冗余
+    if has_domain_rules; then
+        return 0
+    fi
+
+    # 已无域名规则 -> 清理任务
+    local script_path="/usr/local/bin/${CMD_NAME}"
+    [[ -x "$script_path" ]] || script_path="$(script_realpath)"
+
+    if crontab -l 2>/dev/null | grep -Fq "${script_path} --cron" || crontab -l 2>/dev/null | grep -Eq '(^|\s)(/usr/local/bin/nftmgr|nftmgr)\s+--cron(\s|$)'; then
+        remove_ddns_cron_task
+        msg_info "已无域名转发规则：已自动移除 DDNS 每分钟检测任务（crontab）。"
+    fi
+    return 0
+}
+
+
+# --------------------------
 is_port() {
     local p="$1"
     [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
@@ -711,6 +768,12 @@ add_forward_impl() {
 
     manage_firewall "add" "$lport" "$proto" || true
 
+    # 目标为域名：自动启用 DDNS 每分钟检测（联动）
+    if ! is_ipv4 "$taddr"; then
+        ensure_ddns_cron_enabled
+        msg_info "已检测到目标为域名：已自动启用 DDNS 每分钟检测（crontab）。"
+    fi
+
     msg_ok "添加成功！映射路径: [本机] ${lport}/${proto} -> [目标] ${taddr}:${tport} (${tip})"
     sleep 2
     return 0
@@ -857,6 +920,9 @@ view_and_del_forward_impl() {
 
     manage_firewall "del" "$del_port" "$del_proto" || true
 
+    # 联动：若已无域名规则，则自动清理 DDNS 定时任务
+    ensure_ddns_cron_disabled_if_unused
+
     msg_ok "已成功删除本地端口为 ${del_port}/${del_proto} 的转发规则。"
     sleep 2
     return 0
@@ -934,7 +1000,13 @@ ddns_update() { with_lock ddns_update_impl; }
 # --------------------------
 manage_cron() {
     clear
-    echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) ---${PLAIN}"
+    local script_path="/usr/local/bin/${CMD_NAME}"
+    [[ -x "$script_path" ]] || script_path="$(script_realpath)"
+    if crontab -l 2>/dev/null | grep -Fq "${script_path} --cron"; then
+        echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) --- [已启用]${PLAIN}"
+    else
+        echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) --- [未启用]${PLAIN}"
+    fi
     echo "1. 自动添加定时任务 (每分钟检测，默认非严格)"
     echo "2. 一键删除定时任务"
     echo "3. 查看 DDNS 变动历史日志 (仅保留最近7天)"
@@ -1101,7 +1173,9 @@ clear_all_rules_impl() {
         return 1
     fi
     rm -f "$conf_bak" 2>/dev/null || true
-    msg_ok "✅ 所有规则已清空。"
+    ensure_ddns_cron_disabled_if_unused
+
+msg_ok "✅ 所有规则已清空。"
     sleep 2
 }
 
@@ -1127,6 +1201,7 @@ uninstall_script_impl() {
 
     local SCRIPT_PATH="/usr/local/bin/${CMD_NAME}"
     crontab -l 2>/dev/null | grep -v "${SCRIPT_PATH} --cron" | crontab - 2>/dev/null || true
+    remove_ddns_cron_task
 
     if have_cmd systemctl; then
         systemctl disable --now nft-mgr >/dev/null 2>&1 || true
