@@ -1,9 +1,16 @@
 #!/bin/bash
 
+# ==========================================
 # nftables 端口转发管理面板 (Pro 稳定优化版)
 # ==========================================
 
 set -o pipefail
+
+# 脚本签名（用于安全自更新，防止误更新到其它脚本）
+SCRIPT_ID="nftmgr-pro"
+SCRIPT_FINGERPRINT_1="CMD_NAME=\"nftmgr\""
+SCRIPT_FINGERPRINT_2="nft_mgr_nat"
+SCRIPT_FINGERPRINT_3="update_script()"
 
 # 兼容 cron/systemd 的精简 PATH
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
@@ -31,8 +38,13 @@ LOCK_FILE="/var/lock/nft_mgr.lock"
 
 CMD_NAME="nftmgr"
 
-RAW_URL="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
+RAW_URL="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/ssr.sh"
 PROXY_URL="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
+RAW_URL_FALLBACK="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
+PROXY_URL_FALLBACK="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/ssr.sh"
+# 可选：自定义更新地址（写入 SETTINGS_FILE：/etc/nft_forward_settings.conf）
+# UPDATE_URL_DIRECT="https://raw.githubusercontent.com/<you>/<repo>/main/nftmgr.sh"
+# UPDATE_URL_PROXY="https://ghproxy.net/https://raw.githubusercontent.com/<you>/<repo>/main/nftmgr.sh"
 
 
 # --------------------------
@@ -68,6 +80,9 @@ PLAIN='\033[0m'
 msg_ok()   { echo -e "${GREEN}$*${PLAIN}"; }
 msg_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
 msg_err()  { echo -e "${RED}$*${PLAIN}"; }
+
+# 基础工具
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 
 # --------------------------
@@ -1081,17 +1096,29 @@ download_to() {
 
 update_script() {
     clear
-    echo -e "${GREEN}--- 脚本更新（安全模式） ---${PLAIN}"
+    echo -e "${GREEN}--- 脚本更新（无感安全模式） ---${PLAIN}"
     echo "1. GitHub 官方直连更新 (推荐海外机)"
     echo "2. GHProxy 代理更新 (推荐国内机)"
     echo "0. 取消并返回主菜单"
     echo "--------------------------------"
-    local up_choice target_url
+    local up_choice
     read -rp "请选择更新线路 [0-2]: " up_choice
 
+    # 允许在 SETTINGS_FILE 覆盖更新 URL
+    local u_direct u_proxy
+    u_direct="$(settings_get "UPDATE_URL_DIRECT" 2>/dev/null || true)"
+    u_proxy="$(settings_get "UPDATE_URL_PROXY" 2>/dev/null || true)"
+
+    local primary_url fallback_url
     case "$up_choice" in
-        1) target_url="$RAW_URL" ;;
-        2) target_url="$PROXY_URL" ;;
+        1)
+            primary_url="${u_direct:-$RAW_URL}"
+            fallback_url="$RAW_URL_FALLBACK"
+            ;;
+        2)
+            primary_url="${u_proxy:-$PROXY_URL}"
+            fallback_url="$PROXY_URL_FALLBACK"
+            ;;
         0) return ;;
         *) msg_err "无效选项。"; sleep 1; return ;;
     esac
@@ -1100,13 +1127,18 @@ update_script() {
     local tmp
     tmp="$(mktemp /tmp/nftmgr-update.XXXXXX)"
 
-    if ! download_to "$target_url" "$tmp" || [[ ! -s "$tmp" ]]; then
-        msg_err "失败: 无法连接服务器或下载为空。"
+    if ! download_to "$primary_url" "$tmp" || [[ ! -s "$tmp" ]]; then
         rm -f "$tmp"
-        sleep 2
-        return
+        tmp="$(mktemp /tmp/nftmgr-update.XXXXXX)"
+        if ! download_to "$fallback_url" "$tmp" || [[ ! -s "$tmp" ]]; then
+            msg_err "失败: 无法连接服务器或下载为空。"
+            rm -f "$tmp"
+            sleep 2
+            return
+        fi
     fi
 
+    # 基本合法性校验
     if ! head -n 1 "$tmp" | grep -q "^#!/bin/bash"; then
         msg_err "失败: 文件内容非法（缺少 shebang）。"
         rm -f "$tmp"
@@ -1119,6 +1151,27 @@ update_script() {
         rm -f "$tmp"
         sleep 2
         return
+    fi
+
+    # 防误更新：避免把“更新”更新成别的脚本（出现‘更新变卸载’的根因就是更新源不对）
+    if ! grep -Fq "$SCRIPT_FINGERPRINT_1" "$tmp" || ! grep -Fq "$SCRIPT_FINGERPRINT_2" "$tmp" || ! grep -Fq "$SCRIPT_FINGERPRINT_3" "$tmp"; then
+        # 发现不匹配：再尝试一次 fallback 源（可能主源指向了别的脚本）
+        rm -f "$tmp"
+        tmp="$(mktemp /tmp/nftmgr-update.XXXXXX)"
+        if download_to "$fallback_url" "$tmp" && [[ -s "$tmp" ]] && bash -n "$tmp" >/dev/null 2>&1; then
+            if ! grep -Fq "$SCRIPT_FINGERPRINT_1" "$tmp" || ! grep -Fq "$SCRIPT_FINGERPRINT_2" "$tmp" || ! grep -Fq "$SCRIPT_FINGERPRINT_3" "$tmp"; then
+                msg_err "失败: 主源与备用源下载内容均与当前 nftmgr 不匹配（已阻止误更新）。"
+                msg_err "如你确实要更新成其它脚本，请改用你自己的 UPDATE_URL_DIRECT/UPDATE_URL_PROXY。"
+                rm -f "$tmp"
+                sleep 3
+                return
+            fi
+        else
+            msg_err "失败: 下载到的脚本与当前 nftmgr 不匹配，且备用源获取失败（已阻止误更新）。"
+            rm -f "$tmp"
+            sleep 3
+            return
+        fi
     fi
 
     local dest="/usr/local/bin/${CMD_NAME}"
