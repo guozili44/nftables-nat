@@ -1,25 +1,36 @@
 #!/bin/bash
 
 # ==========================================
-# nftables 端口转发管理面板 (Pro 稳定优化版)
+# nftables 端口转发管理面板 (Pro 稳定优化版 + 失效通知)
 # ==========================================
-# 主要改进（相对旧版）：
-# 1) 不再 flush ruleset / 不再覆写 /etc/nftables.conf（避免清空系统已有 nft 规则）
-# 2) 仅管理自己的表：table ip nft_mgr_nat（低冲突）
-# 3) 原子化应用：nft -c 校验 -> 应用 -> 再写入持久化配置
-# 4) 并发互斥：所有写配置/应用规则/DDNS 更新均加锁（避免 cron 与交互并发踩踏）
-# 5) 安全自更新：下载到临时文件 -> bash -n 校验 -> 原子替换（失败不覆盖）
-# 6) 修复关键错误：去掉 sudo、修复潜在冲突 alias、修复高风险覆写/清空行为
+# ✅ 新增：失效通知（优先使用 GitHub Actions 自带的“工作流失败邮件通知”）
+# ------------------------------------------------------------------
+# 思路：
+#   - GitHub Actions 可以对“你触发的工作流运行”发送通知邮件，并可设置“仅失败时通知”。
+#   - 因此：让脚本在检测到“转发失效/解析失败/规则未生效”时在“严格模式”退出非 0，
+#     工作流即失败 -> GitHub 按你的通知设置发邮件。
+#
+# 使用方式（推荐）：
+#   1) 在 VPS 上开启本地 cron（脚本内置菜单可添加）——用于自动更新域名解析（默认不严格）。
+#   2) 另外用 GitHub Actions 定时 SSH 到 VPS 执行：
+#        sudo /usr/local/bin/nftmgr --cron-strict
+#        sudo /usr/local/bin/nftmgr --healthcheck
+#      只要任一步失败，GitHub 会按你的设置发送“失败通知邮件”。
+#
+# 本脚本的“失效”定义（严格模式下触发失败）：
+#   - 规则目标域名解析失败（连续/瞬时都算本次失败）
+#   - 规则中记录的 last_ip 与当前域名解析 IP 不一致（说明转发可能已漂移/失效）
+#   - nft 规则语法校验失败 / 应用失败 / 表缺失
+#   - IPv4 转发未开启（net.ipv4.ip_forward != 1）
+#
+# 严格模式启用方式：
+#   - 运行参数：--cron-strict 或 --healthcheck（健康检查默认严格）
+#   - 或环境变量：NFTMGR_STRICT=1
 #
 # 配置文件格式（向下兼容）：
 #   lport|target_addr|target_port|last_ip|proto
 #   proto: tcp / udp / both
 #   旧版没有 proto 字段时，默认 both。
-#
-# 运行命令（脚本会自安装为 /usr/local/bin/nftmgr）：
-#   nftmgr
-#   nftmgr --cron
-#
 # ==========================================
 
 set -o pipefail
@@ -34,6 +45,11 @@ CONFIG_FILE="/etc/nft_forward_list.conf"
 SETTINGS_FILE="/etc/nft_forward_settings.conf"
 
 NFT_MGR_DIR="/etc/nftables.d"
+# 持久化兼容模式（解决部分“节点管理/面板”只认 /etc/nftables.conf 的问题）
+#  - service: 使用 nft-mgr oneshot service 加载 /etc/nftables.d/nft_mgr.conf（默认，最不干扰系统）
+#  - system : 向 /etc/nftables.conf 注入 include "/etc/nftables.d/nft_mgr.conf" 并用 nftables.service 持久化（兼容性更好）
+NFTABLES_CONF="/etc/nftables.conf"
+PERSIST_MODE_DEFAULT="service"
 NFT_MGR_CONF="${NFT_MGR_DIR}/nft_mgr.conf"
 NFT_MGR_SERVICE="/etc/systemd/system/nft-mgr.service"
 
@@ -48,6 +64,46 @@ RAW_URL="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/mai
 PROXY_URL="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
 
 # --------------------------
+# 运行模式 & 通知
+# --------------------------
+IN_GITHUB_ACTIONS=0
+[[ "${GITHUB_ACTIONS:-}" == "true" ]] && IN_GITHUB_ACTIONS=1
+
+STRICT_MODE=0
+if [[ "${NFTMGR_STRICT:-}" == "1" || "${NFTMGR_STRICT:-}" == "true" ]]; then
+    STRICT_MODE=1
+fi
+
+# --------------------------
+# 设置读写（用于持久化模式开关）
+# --------------------------
+settings_get() {
+    local key="$1"
+    [[ -f "$SETTINGS_FILE" ]] || return 1
+    grep -E "^${key}=" "$SETTINGS_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//; s/"$//'
+}
+settings_set() {
+    local key="$1"; local value="$2"
+    touch "$SETTINGS_FILE" 2>/dev/null || true
+    chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
+    if grep -qE "^${key}=" "$SETTINGS_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}="${value}"|g" "$SETTINGS_FILE"
+    else
+        echo "${key}="${value}"" >> "$SETTINGS_FILE"
+    fi
+}
+PERSIST_MODE="$(settings_get "PERSIST_MODE" || true)"
+if [[ -z "$PERSIST_MODE" ]]; then
+    # 首次运行自动兼容：若系统启用了 nftables.service，则默认采用 system 模式（旧面板/节点管理更认可）
+    if have_cmd systemctl && systemctl is-enabled nftables >/dev/null 2>&1; then
+        PERSIST_MODE="system"
+    else
+        PERSIST_MODE="$PERSIST_MODE_DEFAULT"
+    fi
+    settings_set "PERSIST_MODE" "$PERSIST_MODE"
+fi
+
+# --------------------------
 # 颜色
 # --------------------------
 RED='\033[0;31m'
@@ -55,6 +111,13 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
+
+# --------------------------
+# GitHub Actions 注释（可选）
+# --------------------------
+gha_notice() { [[ $IN_GITHUB_ACTIONS -eq 1 ]] && echo "::notice::${*}"; }
+gha_warn()   { [[ $IN_GITHUB_ACTIONS -eq 1 ]] && echo "::warning::${*}"; }
+gha_error()  { [[ $IN_GITHUB_ACTIONS -eq 1 ]] && echo "::error::${*}"; }
 
 # --------------------------
 # 基础工具
@@ -68,7 +131,15 @@ script_realpath() {
 msg_ok()   { echo -e "${GREEN}$*${PLAIN}"; }
 msg_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
 msg_err()  { echo -e "${RED}$*${PLAIN}"; }
-msg_info() { echo -e "${CYAN}$*${PLAIN}"; }
+
+die_strict() {
+    # die_strict "message" [exit_code]
+    local m="$1"
+    local code="${2:-1}"
+    gha_error "$m"
+    msg_err "$m"
+    return "$code"
+}
 
 # --------------------------
 # 环境与依赖
@@ -107,19 +178,21 @@ install_deps() {
 check_env() {
     # 自动装依赖（尽量温和）
     local need=0
-    for c in nft dig curl flock ss; do
+    for c in nft dig curl flock ss sysctl; do
         have_cmd "$c" || need=1
     done
     [[ $need -eq 1 ]] && install_deps
 
     # 再次检查
-    for c in nft dig curl flock ss; do
+    for c in nft dig curl flock ss sysctl; do
         have_cmd "$c" || msg_warn "⚠️ 未找到依赖命令: $c（部分功能可能不可用）"
     done
 
     mkdir -p "$(dirname "$CONFIG_FILE")" "$LOG_DIR" "$NFT_MGR_DIR" 2>/dev/null || true
     [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+    [[ -f "$SETTINGS_FILE" ]] || touch "$SETTINGS_FILE"
+    chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
 }
 
 install_global_command() {
@@ -186,7 +259,7 @@ get_ip() {
 }
 
 # --------------------------
-# 防火墙放行（尽量不混用 iptables；优先 ufw/firewalld）
+# 防火墙放行（优先 ufw/firewalld；避免强行改 nft 防火墙）
 # --------------------------
 manage_firewall() {
     local action="$1"  # add|del
@@ -217,12 +290,113 @@ manage_firewall() {
         return 0
     fi
 
-    # 无 ufw/firewalld：不强行改系统过滤策略，避免与用户自定义 nft 防火墙冲突
     return 0
 }
 
 # --------------------------
 # sysctl 写入（只写本脚本自己的文件）
+
+# --------------------------
+# 持久化兼容：/etc/nftables.conf include 注入/回滚
+# --------------------------
+nftables_conf_includes_mgr() {
+    # 已经包含 nft_mgr.conf 或通配包含 /etc/nftables.d/*.conf
+    [[ -f "$NFTABLES_CONF" ]] || return 1
+    grep -E '^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/\*\.conf"?[[:space:]]*$' "$NFTABLES_CONF" >/dev/null 2>&1 && return 0
+    grep -E '^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/nft_mgr\.conf"?[[:space:]]*$' "$NFTABLES_CONF" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+enable_persist_system() {
+    # 兼容模式：把 nft_mgr.conf 纳入 nftables.service 的持久化体系
+    mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
+    [[ -f "$NFT_MGR_CONF" ]] || generate_empty_conf "$NFT_MGR_CONF"
+
+    if [[ -e "$NFTABLES_CONF" && ! -f "$NFTABLES_CONF" ]]; then
+        msg_err "❌ ${NFTABLES_CONF} 存在但不是普通文件，无法注入 include。"
+        return 1
+    fi
+
+    if [[ ! -f "$NFTABLES_CONF" ]]; then
+        # 最小化创建（不 flush ruleset，避免破坏系统其它规则；如你本来就有系统防火墙规则，请手动合并）
+        cat > "$NFTABLES_CONF" << EOF
+#!/usr/sbin/nft -f
+# generated by nftmgr (compat mode)
+include "${NFT_MGR_CONF}"
+EOF
+        chmod 644 "$NFTABLES_CONF" 2>/dev/null || true
+    else
+        # 备份并注入 include
+        local bak="${NFTABLES_CONF}.bak.$(date +%s)"
+        cp -a "$NFTABLES_CONF" "$bak" 2>/dev/null || true
+
+        if ! nftables_conf_includes_mgr; then
+            printf "
+# nftmgr include (added %s)
+include "%s"
+" "$(date '+%F %T')" "$NFT_MGR_CONF" >> "$NFTABLES_CONF"
+        fi
+    fi
+
+    # 校验 & 启用 nftables 持久化
+    if have_cmd nft; then
+        if ! nft -c -f "$NFTABLES_CONF" >/dev/null 2>&1; then
+            msg_err "❌ 注入后 ${NFTABLES_CONF} 语法校验失败，已保留备份文件，请手动检查。"
+            return 1
+        fi
+    fi
+
+    if have_cmd systemctl; then
+        systemctl enable --now nftables >/dev/null 2>&1 || true
+        systemctl restart nftables >/dev/null 2>&1 || true
+        # 为避免双重加载导致困惑，兼容模式下默认停用 nft-mgr oneshot
+        systemctl disable --now nft-mgr >/dev/null 2>&1 || true
+    else
+        # 无 systemd：至少立即加载一次
+        nft -f "$NFTABLES_CONF" >/dev/null 2>&1 || true
+    fi
+
+    settings_set "PERSIST_MODE" "system"
+    PERSIST_MODE="system"
+    msg_ok "✅ 已启用【系统持久化兼容模式】：/etc/nftables.conf 已包含 nft_mgr.conf。"
+    return 0
+}
+
+enable_persist_service() {
+    # 回到默认：由 nft-mgr oneshot service 负责持久化加载
+    if have_cmd systemctl; then
+        ensure_nft_mgr_service
+        systemctl enable --now nft-mgr >/dev/null 2>&1 || true
+    fi
+    settings_set "PERSIST_MODE" "service"
+    PERSIST_MODE="service"
+    msg_ok "✅ 已启用【服务持久化模式】：由 nft-mgr.service 加载 nft_mgr.conf。"
+    return 0
+}
+
+persist_status() {
+    echo -e "${CYAN}========= 持久化状态 =========${PLAIN}"
+    echo -e "当前模式: ${YELLOW}${PERSIST_MODE}${PLAIN}"
+    if [[ -f "$NFT_MGR_CONF" ]]; then
+        echo -e "规则文件: ${GREEN}${NFT_MGR_CONF}${PLAIN}"
+    else
+        echo -e "规则文件: ${RED}${NFT_MGR_CONF} 不存在${PLAIN}"
+    fi
+    if [[ -f "$NFTABLES_CONF" ]]; then
+        if nftables_conf_includes_mgr; then
+            echo -e "/etc/nftables.conf: ${GREEN}已包含 nftmgr 规则（include）${PLAIN}"
+        else
+            echo -e "/etc/nftables.conf: ${YELLOW}未包含 nftmgr include${PLAIN}"
+        fi
+    else
+        echo -e "/etc/nftables.conf: ${YELLOW}不存在${PLAIN}"
+    fi
+    if have_cmd systemctl; then
+        systemctl is-enabled nftables >/dev/null 2>&1 && echo -e "nftables.service: ${GREEN}enabled${PLAIN}" || echo -e "nftables.service: ${YELLOW}disabled${PLAIN}"
+        systemctl is-enabled nft-mgr >/dev/null 2>&1 && echo -e "nft-mgr.service: ${GREEN}enabled${PLAIN}" || echo -e "nft-mgr.service: ${YELLOW}disabled${PLAIN}"
+    fi
+    echo -e "${CYAN}==============================${PLAIN}"
+}
 # --------------------------
 sysctl_set_kv() {
     local key="$1"; local value="$2"
@@ -264,7 +438,7 @@ optimize_system() {
         *) msg_err "无效选项"; sleep 1; return ;;
     esac
 
-    msg_info "正在写入 sysctl 配置..."
+    echo -e "${CYAN}正在写入 sysctl 配置...${PLAIN}"
     sysctl_set_kv "net.ipv4.ip_forward" "1"
 
     # BBR: 仅在内核支持时写入，避免误导
@@ -278,15 +452,13 @@ optimize_system() {
     if [[ "$pick" == "2" ]]; then
         sysctl_set_kv "net.core.somaxconn" "8192"
         sysctl_set_kv "net.core.netdev_max_backlog" "8192"
-        # 适度提升 file-max（保守值）
         sysctl_set_kv "fs.file-max" "524288"
     fi
 
     sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
 
-    # nftables + nft-mgr service
     if have_cmd systemctl; then
-        msg_info "正在设置 nftables 开机自启..."
+        echo -e "${CYAN}正在设置 nftables 开机自启...${PLAIN}"
         systemctl enable --now nftables >/dev/null 2>&1 || true
         ensure_nft_mgr_service
     fi
@@ -347,66 +519,105 @@ EOF
     chmod 600 "$out" 2>/dev/null || true
 }
 
+
 generate_nft_conf() {
     local out="$1"
     local any=0
+
+    emit_prerouting_rule() {
+        local proto="$1" lp="$2" ip="$3" tp="$4"
+        case "$proto" in
+            tcp)
+                echo "        tcp dport ${lp} counter comment \"in_${lp}_tcp\" dnat to ${ip}:${tp}"
+                ;;
+            udp)
+                echo "        udp dport ${lp} counter comment \"in_${lp}_udp\" dnat to ${ip}:${tp}"
+                ;;
+        esac
+    }
+
+    emit_postrouting_rules() {
+        local proto="$1" lp="$2" ip="$3" tp="$4"
+        case "$proto" in
+            tcp)
+                echo "        ct status dnat ct original dport ${lp} ct direction reply tcp counter comment \"out_${lp}_tcp\""
+                echo "        ct status dnat ct original dport ${lp} tcp dport ${tp} ip daddr ${ip} masquerade"
+                ;;
+            udp)
+                echo "        ct status dnat ct original dport ${lp} ct direction reply udp counter comment \"out_${lp}_udp\""
+                echo "        ct status dnat ct original dport ${lp} udp dport ${tp} ip daddr ${ip} masquerade"
+                ;;
+        esac
+    }
 
     {
         echo "# nft-mgr ruleset (generated at $(date '+%F %T'))"
         echo "table ip nft_mgr_nat {"
         echo "    chain prerouting {"
         echo "        type nat hook prerouting priority -100; policy accept;"
-        # DNAT + in counter
+
         while IFS='|' read -r lp addr tp last_ip proto; do
             [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
             proto="$(normalize_proto "$proto")"
             is_port "$lp" || continue
             is_port "$tp" || continue
+            [[ -z "$addr" ]] && continue
 
             local ip
             ip="$last_ip"
             [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
             is_ipv4 "$ip" || continue
 
-            local pexpr
             case "$proto" in
-                tcp)  pexpr="tcp" ;;
-                udp)  pexpr="udp" ;;
-                both) pexpr="{ tcp, udp }" ;;
+                tcp)
+                    emit_prerouting_rule tcp "$lp" "$ip" "$tp"
+                    any=1
+                    ;;
+                udp)
+                    emit_prerouting_rule udp "$lp" "$ip" "$tp"
+                    any=1
+                    ;;
+                both)
+                    emit_prerouting_rule tcp "$lp" "$ip" "$tp"
+                    emit_prerouting_rule udp "$lp" "$ip" "$tp"
+                    any=1
+                    ;;
             esac
-
-            echo "        meta l4proto ${pexpr} th dport ${lp} counter comment \"in_${lp}\" dnat to ${ip}:${tp}"
-            any=1
         done < "$CONFIG_FILE"
+
         echo "    }"
         echo "    chain postrouting {"
         echo "        type nat hook postrouting priority 100; policy accept;"
-        # out counter + masquerade
+
         while IFS='|' read -r lp addr tp last_ip proto; do
             [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
             proto="$(normalize_proto "$proto")"
             is_port "$lp" || continue
             is_port "$tp" || continue
+            [[ -z "$addr" ]] && continue
 
             local ip
             ip="$last_ip"
             [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
             is_ipv4 "$ip" || continue
 
-            local pexpr
             case "$proto" in
-                tcp)  pexpr="tcp" ;;
-                udp)  pexpr="udp" ;;
-                both) pexpr="{ tcp, udp }" ;;
+                tcp)
+                    emit_postrouting_rules tcp "$lp" "$ip" "$tp"
+                    any=1
+                    ;;
+                udp)
+                    emit_postrouting_rules udp "$lp" "$ip" "$tp"
+                    any=1
+                    ;;
+                both)
+                    emit_postrouting_rules tcp "$lp" "$ip" "$tp"
+                    emit_postrouting_rules udp "$lp" "$ip" "$tp"
+                    any=1
+                    ;;
             esac
-
-            # 统计回包（仅统计 DNAT 的连接，避免误计本机服务）
-            echo "        ct status dnat ct original dport ${lp} ct direction reply meta l4proto ${pexpr} counter comment \"out_${lp}\""
-
-            # 仅对该转发连接做 masquerade（使用 ct original dport 限定，避免影响本机主动访问）
-            echo "        ct status dnat ct original dport ${lp} meta l4proto ${pexpr} ip daddr ${ip} th dport ${tp} masquerade"
-            any=1
         done < "$CONFIG_FILE"
+
         echo "    }"
         echo "}"
     } > "$out"
@@ -415,6 +626,7 @@ generate_nft_conf() {
     [[ $any -eq 1 ]] || return 2
     return 0
 }
+
 
 # --------------------------
 # 原子化应用规则到内核 + 持久化
@@ -430,32 +642,43 @@ apply_rules_impl() {
     if generate_nft_conf "$tmp"; then
         has_rules=1
     else
-        # 没有有效规则：生成空表，保持一致性
         generate_empty_conf "$tmp"
         has_rules=0
     fi
 
-    # 语法检查
-    if have_cmd nft; then
-        nft -c -f "$tmp" >/dev/null 2>&1
-        if [[ $? -ne 0 ]]; then
-            msg_err "❌ nft 规则语法校验失败：未应用、未写入持久化文件。"
-            rm -f "$tmp"
-            return 1
-        fi
-
-        # 应用（只动自己的表）
-        nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
-        if ! nft -f "$tmp" >/dev/null 2>&1; then
-            msg_err "❌ nft 应用失败：未写入持久化文件。"
-            rm -f "$tmp"
-            return 1
-        fi
-    else
-        msg_err "❌ 未找到 nft 命令，无法应用规则。"
+    if ! have_cmd nft; then
         rm -f "$tmp"
         return 1
     fi
+
+    # 语法检查
+    local chk_err
+    chk_err="$(nft -c -f "$tmp" 2>&1)"
+    if [[ $? -ne 0 ]]; then
+        mkdir -p "$LOG_DIR" 2>/dev/null || true
+        echo "[$(date '+%F %T')] nft -c error:" > "${LOG_DIR}/last_nft_error.log"
+        echo "$chk_err" >> "${LOG_DIR}/last_nft_error.log"
+        msg_err "❌ nft 规则语法校验失败：未应用、未写入持久化文件。"
+        msg_err "   详情: ${LOG_DIR}/last_nft_error.log"
+        rm -f "$tmp"
+        return 1
+    fi
+
+
+    # 应用（只动自己的表）
+    nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
+    local apply_err
+    apply_err="$(nft -f "$tmp" 2>&1)"
+    if [[ $? -ne 0 ]]; then
+        mkdir -p "$LOG_DIR" 2>/dev/null || true
+        echo "[$(date '+%F %T')] nft apply error:" > "${LOG_DIR}/last_nft_error.log"
+        echo "$apply_err" >> "${LOG_DIR}/last_nft_error.log"
+        msg_err "❌ nft 规则应用失败：未写入持久化文件。"
+        msg_err "   详情: ${LOG_DIR}/last_nft_error.log"
+        rm -f "$tmp"
+        return 1
+    fi
+
 
     # 持久化写入（原子替换）
     mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
@@ -465,8 +688,16 @@ apply_rules_impl() {
     mv -f "$tmp" "$NFT_MGR_CONF"
     chmod 600 "$NFT_MGR_CONF" 2>/dev/null || true
 
-    if have_cmd systemctl; then
-        systemctl enable nft-mgr >/dev/null 2>&1 || true
+    # 持久化策略：
+    #  - service: 启用 nft-mgr oneshot（默认，最不干扰系统）
+    #  - system : 注入 /etc/nftables.conf include，并通过 nftables.service 持久化（兼容部分面板/节点管理）
+    if [[ "$PERSIST_MODE" == "system" ]]; then
+        # 仅确保 include 存在，不强行重写系统规则
+        enable_persist_system >/dev/null 2>&1 || true
+    else
+        if have_cmd systemctl; then
+            systemctl enable nft-mgr >/dev/null 2>&1 || true
+        fi
     fi
 
     if [[ $has_rules -eq 1 ]]; then
@@ -554,11 +785,10 @@ add_forward_impl() {
     read -rp "请输入目标端口 (1-65535): " tport
     is_port "$tport" || { msg_err "错误: 目标端口必须是 1-65535 的纯数字。"; sleep 2; return 1; }
 
-    msg_info "正在解析并验证目标地址..."
+    echo -e "${CYAN}正在解析并验证目标地址...${PLAIN}"
     tip="$(get_ip "$taddr")"
     [[ -z "$tip" ]] && { msg_err "错误: 解析失败，请检查域名或服务器网络/DNS。"; sleep 2; return 1; }
 
-    # 先备份配置，保证失败可回滚
     local conf_bak
     conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
     cp -a "$CONFIG_FILE" "$conf_bak" 2>/dev/null || true
@@ -566,7 +796,6 @@ add_forward_impl() {
     echo "${lport}|${taddr}|${tport}|${tip}|${proto}" >> "$CONFIG_FILE"
 
     if ! apply_rules_impl; then
-        # 回滚
         [[ -s "$conf_bak" ]] && mv -f "$conf_bak" "$CONFIG_FILE" || true
         msg_err "❌ 应用规则失败：已回滚本次新增配置。"
         sleep 2
@@ -581,21 +810,18 @@ add_forward_impl() {
     return 0
 }
 
-add_forward() {
-    with_lock add_forward_impl
-}
+add_forward() { with_lock add_forward_impl; }
 
 # --------------------------
 # 流量看板与规则管理（删除）
 # --------------------------
-get_traffic_snapshot() {
-    nft -a list table ip nft_mgr_nat 2>/dev/null || true
-}
+get_traffic_snapshot() { nft -a list table ip nft_mgr_nat 2>/dev/null || true; }
 
-extract_bytes_by_comment() {
+extract_sum_bytes_by_prefix() {
     local snapshot="$1"
-    local comment="$2"
-    echo "$snapshot" | grep -F "comment \"${comment}\"" | sed -n 's/.*bytes \([0-9]\+\).*/\1/p' | head -n 1
+    local prefix="$2"
+    # 匹配 comment "prefix..."
+    echo "$snapshot" | grep -F "comment \"${prefix}" | sed -n 's/.*bytes \([0-9]\+\).*/\1/p' | awk '{s+=$1} END{print s+0}'
 }
 
 view_and_del_forward_impl() {
@@ -624,8 +850,8 @@ view_and_del_forward_impl() {
         is_port "$tp" || continue
 
         local in_bytes out_bytes
-        in_bytes="$(extract_bytes_by_comment "$traffic_data" "in_${lp}")"
-        out_bytes="$(extract_bytes_by_comment "$traffic_data" "out_${lp}")"
+        in_bytes="$(extract_sum_bytes_by_prefix "$traffic_data" "in_${lp}_")"
+        out_bytes="$(extract_sum_bytes_by_prefix "$traffic_data" "out_${lp}_")"
         [[ -z "$in_bytes" ]] && in_bytes=0
         [[ -z "$out_bytes" ]] && out_bytes=0
 
@@ -666,7 +892,6 @@ view_and_del_forward_impl() {
         return 1
     fi
 
-    # 找到第 N 条【合法规则】所在行号（忽略空行/注释/非法行）
     local line_no
     line_no="$(awk -F'|' -v N="$action" 'BEGIN{c=0}
         $0!~/^\s*($|#)/{
@@ -682,7 +907,6 @@ view_and_del_forward_impl() {
     del_proto="$(echo "$del_line" | cut -d'|' -f5)"
     del_proto="$(normalize_proto "$del_proto")"
 
-    # 先备份配置，保证失败可回滚
     local conf_bak
     conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
     cp -a "$CONFIG_FILE" "$conf_bak" 2>/dev/null || true
@@ -704,29 +928,26 @@ view_and_del_forward_impl() {
     return 0
 }
 
-view_and_del_forward() {
-    with_lock view_and_del_forward_impl
-}
+view_and_del_forward() { with_lock view_and_del_forward_impl; }
 
 # --------------------------
-# DDNS 追踪更新（域名 -> IP 变化）
+# DDNS 追踪更新（域名 -> IP 变化） + 严格模式失败通知
 # --------------------------
 ddns_update_impl() {
     local changed=0
+    local had_error=0
     local temp_file
     temp_file="$(mktemp /tmp/nftmgr-ddns.XXXXXX)"
 
     [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR"
     local today_log="$LOG_DIR/$(date '+%Y-%m-%d').log"
+    local alert_log="$LOG_DIR/alerts-$(date '+%Y-%m-%d').log"
 
-    # 逐行读取，保留注释/空行；只更新合法规则行
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # 空行
         if [[ -z "$line" ]]; then
             echo "" >> "$temp_file"
             continue
         fi
-        # 注释
         if [[ "${line:0:1}" == "#" ]]; then
             echo "$line" >> "$temp_file"
             continue
@@ -737,7 +958,6 @@ ddns_update_impl() {
         proto="$(normalize_proto "$proto")"
 
         if ! is_port "$lp" || ! is_port "$tp" || [[ -z "$addr" ]]; then
-            # 非法行：原样保留，避免误删/误改
             echo "$line" >> "$temp_file"
             continue
         fi
@@ -745,12 +965,20 @@ ddns_update_impl() {
         local current_ip
         current_ip="$(get_ip "$addr")"
 
+        if [[ -z "$current_ip" ]] && ! is_ipv4 "$addr"; then
+            # 域名解析失败：记录并（严格模式）判定失败
+            echo "[$(date '+%H:%M:%S')] [ERROR] 端口 ${lp}: 域名 ${addr} 解析失败（保持 last_ip=${last_ip:-N/A}）" >> "$today_log"
+            echo "[$(date '+%H:%M:%S')] [ALERT] 端口 ${lp}: 域名 ${addr} 解析失败" >> "$alert_log"
+            had_error=1
+            echo "${lp}|${addr}|${tp}|${last_ip}|${proto}" >> "$temp_file"
+            continue
+        fi
+
         if [[ -n "$current_ip" && "$current_ip" != "$last_ip" ]]; then
             echo "${lp}|${addr}|${tp}|${current_ip}|${proto}" >> "$temp_file"
             changed=1
             echo "[$(date '+%H:%M:%S')] 端口 ${lp}: ${addr} 变动 (${last_ip:-N/A} -> ${current_ip})" >> "$today_log"
         else
-            # 统一写回规范格式（补齐 proto 字段）
             echo "${lp}|${addr}|${tp}|${last_ip}|${proto}" >> "$temp_file"
         fi
     done < "$CONFIG_FILE"
@@ -758,16 +986,129 @@ ddns_update_impl() {
     mv -f "$temp_file" "$CONFIG_FILE"
 
     if [[ $changed -eq 1 ]]; then
-        apply_rules_impl || true
+        if ! apply_rules_impl; then
+            echo "[$(date '+%H:%M:%S')] [ERROR] 应用 nft 规则失败（已保留配置，但规则未更新）" >> "$today_log"
+            echo "[$(date '+%H:%M:%S')] [ALERT] 应用 nft 规则失败" >> "$alert_log"
+            had_error=1
+        fi
     fi
 
-    # 只保留最近 7 天日志
+    # 日志保留
     find "$LOG_DIR" -type f -name "*.log" -mtime +7 -exec rm -f {} \; 2>/dev/null || true
+
+    if [[ $STRICT_MODE -eq 1 && $had_error -eq 1 ]]; then
+        die_strict "DDNS 更新过程中发现失效项（解析失败/规则应用失败）。详见 ${alert_log}" 2
+        return 2
+    fi
+    return 0
 }
 
-ddns_update() {
-    with_lock ddns_update_impl
+ddns_update() { with_lock ddns_update_impl; }
+
+# --------------------------
+# 健康检查（严格模式：用于 GitHub Actions 触发失败通知）
+# --------------------------
+healthcheck_impl() {
+    local had_error=0
+
+    if ! have_cmd nft; then
+        die_strict "未找到 nft 命令，无法检查规则是否生效。" 2
+        return 2
+    fi
+
+    local fwd
+    fwd="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
+    if [[ "$fwd" != "1" ]]; then
+        gha_error "IPv4 转发未开启: net.ipv4.ip_forward=${fwd}"
+        msg_err "IPv4 转发未开启: net.ipv4.ip_forward=${fwd}"
+        had_error=1
+    fi
+
+    # 表是否存在
+    if ! nft list table ip nft_mgr_nat >/dev/null 2>&1; then
+        gha_error "nft 表缺失: table ip nft_mgr_nat（规则可能未加载或已被其他规则覆盖）"
+        msg_err "nft 表缺失: table ip nft_mgr_nat（规则可能未加载或已被其他规则覆盖）"
+        had_error=1
+    fi
+
+    # 读取 prerouting 规则用于校验
+    local chain
+    chain="$(nft -a list chain ip nft_mgr_nat prerouting 2>/dev/null || true)"
+
+    # 检查每条规则：域名是否可解析；last_ip 是否与当前解析一致；nft 是否确实 dnat 到 last_ip
+    while IFS='|' read -r lp addr tp last_ip proto; do
+        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
+        proto="$(normalize_proto "$proto")"
+        is_port "$lp" || continue
+        is_port "$tp" || continue
+
+        local current_ip
+        current_ip="$(get_ip "$addr")"
+
+        if [[ -z "$current_ip" ]] && ! is_ipv4 "$addr"; then
+            gha_error "端口 ${lp}: 域名 ${addr} 解析失败"
+            msg_err "端口 ${lp}: 域名 ${addr} 解析失败"
+            had_error=1
+            continue
+        fi
+
+        # last_ip 为空/不合法
+        if [[ -z "$last_ip" ]] || ! is_ipv4 "$last_ip"; then
+            gha_error "端口 ${lp}: last_ip 缺失或非法（建议先运行 --cron 或重新添加规则）"
+            msg_err "端口 ${lp}: last_ip 缺失或非法（建议先运行 --cron 或重新添加规则）"
+            had_error=1
+        fi
+
+        # 域名 IP 已变化 -> 转发可能失效（期望由 --cron 更新）
+        if [[ -n "$current_ip" && -n "$last_ip" && "$current_ip" != "$last_ip" ]]; then
+            gha_error "端口 ${lp}: 域名当前IP=${current_ip} 与 last_ip=${last_ip} 不一致（转发可能已失效，需运行 --cron 更新）"
+            msg_err "端口 ${lp}: 域名当前IP=${current_ip} 与 last_ip=${last_ip} 不一致（转发可能已失效，需运行 --cron 更新）"
+            had_error=1
+        fi
+
+        # 校验 nft chain 中是否存在预期 DNAT 规则（按协议分裂生成）
+        if [[ -n "$last_ip" ]]; then
+            case "$proto" in
+                tcp)
+                    if ! echo "$chain" | grep -qE "tcp dport ${lp}.*dnat to ${last_ip}:${tp}"; then
+                        gha_error "端口 ${lp}: nft 规则中未找到预期 TCP DNAT (dnat to ${last_ip}:${tp})"
+                        msg_err "端口 ${lp}: nft 规则中未找到预期 TCP DNAT (dnat to ${last_ip}:${tp})"
+                        had_error=1
+                    fi
+                    ;;
+                udp)
+                    if ! echo "$chain" | grep -qE "udp dport ${lp}.*dnat to ${last_ip}:${tp}"; then
+                        gha_error "端口 ${lp}: nft 规则中未找到预期 UDP DNAT (dnat to ${last_ip}:${tp})"
+                        msg_err "端口 ${lp}: nft 规则中未找到预期 UDP DNAT (dnat to ${last_ip}:${tp})"
+                        had_error=1
+                    fi
+                    ;;
+                both)
+                    if ! echo "$chain" | grep -qE "tcp dport ${lp}.*dnat to ${last_ip}:${tp}"; then
+                        gha_error "端口 ${lp}: nft 规则中未找到预期 TCP DNAT (dnat to ${last_ip}:${tp})"
+                        msg_err "端口 ${lp}: nft 规则中未找到预期 TCP DNAT (dnat to ${last_ip}:${tp})"
+                        had_error=1
+                    fi
+                    if ! echo "$chain" | grep -qE "udp dport ${lp}.*dnat to ${last_ip}:${tp}"; then
+                        gha_error "端口 ${lp}: nft 规则中未找到预期 UDP DNAT (dnat to ${last_ip}:${tp})"
+                        msg_err "端口 ${lp}: nft 规则中未找到预期 UDP DNAT (dnat to ${last_ip}:${tp})"
+                        had_error=1
+                    fi
+                    ;;
+            esac
+        fi
+    done < "$CONFIG_FILE"
+
+    if [[ $had_error -eq 1 ]]; then
+        return 2
+    fi
+
+    gha_notice "健康检查通过：未发现转发失效项。"
+    msg_ok "✅ 健康检查通过：未发现转发失效项。"
+    return 0
 }
+
+healthcheck() { with_lock healthcheck_impl; }
 
 # --------------------------
 # 定时任务管理（DDNS）
@@ -775,7 +1116,7 @@ ddns_update() {
 manage_cron() {
     clear
     echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) ---${PLAIN}"
-    echo "1. 自动添加定时任务 (每分钟检测)"
+    echo "1. 自动添加定时任务 (每分钟检测，默认非严格)"
     echo "2. 一键删除定时任务"
     echo "3. 查看 DDNS 变动历史日志 (仅保留最近7天)"
     echo "0. 返回主菜单"
@@ -820,6 +1161,29 @@ manage_cron() {
 # --------------------------
 # 安全自更新
 # --------------------------
+# 持久化兼容菜单
+# --------------------------
+persist_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}========= 持久化兼容设置 =========${PLAIN}"
+        echo -e "${YELLOW}说明：部分旧面板/节点管理只认 /etc/nftables.conf，导致提示“未写入持久性规则”。${PLAIN}"
+        echo -e "当前模式: ${GREEN}${PERSIST_MODE}${PLAIN}"
+        echo -e "------------------------------------------"
+        echo -e "${YELLOW} 1.${PLAIN} 查看持久化状态"
+        echo -e "${YELLOW} 2.${PLAIN} 启用【系统持久化兼容模式】(注入 /etc/nftables.conf include)"
+        echo -e "${YELLOW} 3.${PLAIN} 启用【服务持久化模式】(nft-mgr.service)"
+        echo -e " 0. 返回"
+        read -rp "选择 [0-3]: " p
+        case "$p" in
+            1) clear; persist_status; echo ""; read -n 1 -s -r -p "按任意键返回..." ;;
+            2) enable_persist_system; sleep 2 ;;
+            3) enable_persist_service; sleep 2 ;;
+            0) return ;;
+        esac
+    done
+}
+# --------------------------
 download_to() {
     local url="$1"
     local out="$2"
@@ -849,7 +1213,7 @@ update_script() {
         *) msg_err "无效选项。"; sleep 1; return ;;
     esac
 
-    msg_info "正在拉取最新代码..."
+    echo -e "${CYAN}正在拉取最新代码...${PLAIN}"
     local tmp
     tmp="$(mktemp /tmp/nftmgr-update.XXXXXX)"
 
@@ -860,7 +1224,6 @@ update_script() {
         return
     fi
 
-    # 基本合法性校验
     if ! head -n 1 "$tmp" | grep -q "^#!/bin/bash"; then
         msg_err "失败: 文件内容非法（缺少 shebang）。"
         rm -f "$tmp"
@@ -875,7 +1238,6 @@ update_script() {
         return
     fi
 
-    # 原子替换
     local dest="/usr/local/bin/${CMD_NAME}"
     cp -a "$dest" "${dest}.bak.$(date +%s)" 2>/dev/null || true
     install -m 755 "$tmp" "${dest}.new" >/dev/null 2>&1 || { msg_err "失败: 写入失败。"; rm -f "$tmp"; return; }
@@ -908,7 +1270,6 @@ clear_all_rules_impl() {
         manage_firewall "del" "$lp" "$proto" || true
     done < "$CONFIG_FILE"
 
-    # 先备份配置，保证失败可回滚
     local conf_bak
     conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
     cp -a "$CONFIG_FILE" "$conf_bak" 2>/dev/null || true
@@ -925,9 +1286,7 @@ clear_all_rules_impl() {
     sleep 2
 }
 
-clear_all_rules() {
-    with_lock clear_all_rules_impl
-}
+clear_all_rules() { with_lock clear_all_rules_impl; }
 
 # --------------------------
 # 完全卸载
@@ -938,7 +1297,6 @@ uninstall_script_impl() {
     read -rp "警告: 此操作将删除本脚本、规则配置、定时任务、systemd 服务，并移除本脚本创建的 nft 表。确认？[y/N]: " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
 
-    # 删除防火墙放行
     while IFS='|' read -r lp addr tp last_ip proto; do
         [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
         is_port "$lp" || continue
@@ -946,33 +1304,26 @@ uninstall_script_impl() {
         manage_firewall "del" "$lp" "$proto" || true
     done < "$CONFIG_FILE"
 
-    # 删除 nft 表（仅本脚本的表）
     nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
 
-    # 删除 cron
     local SCRIPT_PATH="/usr/local/bin/${CMD_NAME}"
     crontab -l 2>/dev/null | grep -v "${SCRIPT_PATH} --cron" | crontab - 2>/dev/null || true
 
-    # 删除 systemd 服务
     if have_cmd systemctl; then
         systemctl disable --now nft-mgr >/dev/null 2>&1 || true
         rm -f "$NFT_MGR_SERVICE" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
-    # 删除持久化文件/日志/配置
     rm -f "$NFT_MGR_CONF" "$CONFIG_FILE" "$SETTINGS_FILE" "$SYSCTL_FILE" "$LOCK_FILE" 2>/dev/null || true
     rm -rf "$LOG_DIR" 2>/dev/null || true
 
     msg_ok "✅ 卸载完成。"
-    # 删除自身
     rm -f "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
     exit 0
 }
 
-uninstall_script() {
-    with_lock uninstall_script_impl
-}
+uninstall_script() { with_lock uninstall_script_impl; }
 
 # --------------------------
 # 主菜单
@@ -980,19 +1331,21 @@ uninstall_script() {
 main_menu() {
     clear
     echo -e "${GREEN}==========================================${PLAIN}"
-    echo -e "${GREEN}     nftables 端口转发管理面板 (Pro)      ${PLAIN}"
+    echo -e "${GREEN} nftables 端口转发管理面板 (Pro + 失效通知) ${PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
     echo "1. 开启 BBR + 转发 + 自启动 (稳定/性能)"
     echo "2. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
     echo "3. 流量看板与规则管理 (查看/删除)"
     echo "4. 清空所有转发规则"
     echo "5. 管理 DDNS 定时监控与日志"
-    echo "6. 从 GitHub 更新当前脚本 (安全更新)"
-    echo "7. 一键完全卸载本脚本"
+    echo "6. 健康检查（严格模式：用于失效通知）"
+    echo "7. 持久化兼容设置（解决提示：未写入持久性规则）"
+    echo "8. 从 GitHub 更新当前脚本 (安全更新)"
+    echo "9. 一键完全卸载本脚本"
     echo "0. 退出面板"
     echo "------------------------------------------"
     local choice
-    read -rp "请选择操作 [0-7]: " choice
+    read -rp "请选择操作 [0-9]: " choice
 
     case "$choice" in
         1) optimize_system ;;
@@ -1000,8 +1353,10 @@ main_menu() {
         3) view_and_del_forward ;;
         4) clear_all_rules ;;
         5) manage_cron ;;
-        6) update_script ;;
-        7) uninstall_script ;;
+        6) STRICT_MODE=1; healthcheck ;;
+        7) persist_menu ;;
+        8) update_script ;;
+        9) uninstall_script ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
@@ -1014,11 +1369,40 @@ require_root
 check_env
 install_global_command
 
-# cron 模式
-if [[ "${1:-}" == "--cron" ]]; then
-    ddns_update
-    exit 0
-fi
+# CLI 模式
+case "${1:-}" in
+    --persist-status)
+        persist_status
+        exit $?
+        ;;
+    --persist-system)
+        enable_persist_system
+        exit $?
+        ;;
+    --persist-service)
+        enable_persist_service
+        exit $?
+        ;;
+    --cron)
+        # 默认 cron：非严格（尽量不中断服务）
+        ddns_update
+        exit $?
+        ;;
+    --cron-strict)
+        STRICT_MODE=1
+        ddns_update
+        exit $?
+        ;;
+    --healthcheck|--check)
+        STRICT_MODE=1
+        healthcheck
+        exit $?
+        ;;
+    --strict)
+        STRICT_MODE=1
+        shift
+        ;;
+esac
 
 # 菜单循环
 while true; do
