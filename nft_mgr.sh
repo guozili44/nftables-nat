@@ -1,9 +1,5 @@
 #!/bin/bash
 
-# ==========================================
-# nftables 端口转发管理面板 (Pro 稳定优化版 + 失效通知)
-# ==========================================
-# ==========================================
 # nftables 端口转发管理面板 (Pro 稳定优化版)
 # ==========================================
 
@@ -23,6 +19,7 @@ NFT_MGR_DIR="/etc/nftables.d"
 #  - service: 使用 nft-mgr oneshot service 加载 /etc/nftables.d/nft_mgr.conf（默认，最不干扰系统）
 #  - system : 向 /etc/nftables.conf 注入 include "/etc/nftables.d/nft_mgr.conf" 并用 nftables.service 持久化（兼容性更好）
 NFTABLES_CONF="/etc/nftables.conf"
+NFTABLES_CREATED_MARK="/etc/nftables.conf.nftmgr_created"
 PERSIST_MODE_DEFAULT="service"
 NFT_MGR_CONF="${NFT_MGR_DIR}/nft_mgr.conf"
 NFT_MGR_SERVICE="/etc/systemd/system/nft-mgr.service"
@@ -314,9 +311,10 @@ enable_persist_system() {
 include "${NFT_MGR_CONF}"
 EOF
         chmod 644 "$NFTABLES_CONF" 2>/dev/null || true
+        echo "1" > "$NFTABLES_CREATED_MARK" 2>/dev/null || true
     else
         # 备份并注入 include
-        local bak="${NFTABLES_CONF}.bak.$(date +%s)"
+        local bak="${NFTABLES_CONF}.nftmgr.bak.$(date +%s)"
         cp -a "$NFTABLES_CONF" "$bak" 2>/dev/null || true
 
         if ! nftables_conf_includes_mgr; then
@@ -344,8 +342,6 @@ include "%s"
         # 无 systemd：至少立即加载一次
         nft -f "$NFTABLES_CONF" >/dev/null 2>&1 || true
     fi
-
-    settings_set "PERSIST_MODE" "system"
     PERSIST_MODE="system"
     msg_ok "✅ 已启用【系统持久化兼容模式】：/etc/nftables.conf 已包含 nft_mgr.conf。"
     return 0
@@ -357,7 +353,6 @@ enable_persist_service() {
         ensure_nft_mgr_service
         systemctl enable --now nft-mgr >/dev/null 2>&1 || true
     fi
-    settings_set "PERSIST_MODE" "service"
     PERSIST_MODE="service"
     msg_ok "✅ 已启用【服务持久化模式】：由 nft-mgr.service 加载 nft_mgr.conf。"
     return 0
@@ -385,6 +380,26 @@ persist_status() {
         systemctl is-enabled nft-mgr >/dev/null 2>&1 && echo -e "nft-mgr.service: ${GREEN}enabled${PLAIN}" || echo -e "nft-mgr.service: ${YELLOW}disabled${PLAIN}"
     fi
     echo -e "${CYAN}==============================${PLAIN}"
+}
+
+auto_persist_setup() {
+    # 自动检测并完成持久化设置（无需菜单项）
+    # 优先规则：
+    #  1) 若系统启用了 nftables.service 或 /etc/nftables.conf 已 include nft_mgr.conf -> system 模式
+    #  2) 否则使用 nft-mgr.service（service 模式）
+    PERSIST_MODE="$PERSIST_MODE_DEFAULT"
+
+    if [[ -f "$NFTABLES_CONF" ]] && nftables_conf_includes_mgr; then
+        PERSIST_MODE="system"
+    elif have_cmd systemctl && systemctl is-enabled nftables >/dev/null 2>&1; then
+        PERSIST_MODE="system"
+    fi
+
+    if [[ "$PERSIST_MODE" == "system" ]]; then
+        enable_persist_system >/dev/null 2>&1 || true
+    else
+        enable_persist_service >/dev/null 2>&1 || true
+    fi
 }
 # --------------------------
 sysctl_set_kv() {
@@ -1052,29 +1067,6 @@ manage_cron() {
 # --------------------------
 # 安全自更新
 # --------------------------
-# 持久化兼容菜单
-# --------------------------
-persist_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}========= 持久化兼容设置 =========${PLAIN}"
-        echo -e "${YELLOW}说明：部分旧面板/节点管理只认 /etc/nftables.conf，导致提示“未写入持久性规则”。${PLAIN}"
-        echo -e "当前模式: ${GREEN}${PERSIST_MODE}${PLAIN}"
-        echo -e "------------------------------------------"
-        echo -e "${YELLOW} 1.${PLAIN} 查看持久化状态"
-        echo -e "${YELLOW} 2.${PLAIN} 启用【系统持久化兼容模式】(注入 /etc/nftables.conf include)"
-        echo -e "${YELLOW} 3.${PLAIN} 启用【服务持久化模式】(nft-mgr.service)"
-        echo -e " 0. 返回"
-        read -rp "选择 [0-3]: " p
-        case "$p" in
-            1) clear; persist_status; echo ""; read -n 1 -s -r -p "按任意键返回..." ;;
-            2) enable_persist_system; sleep 2 ;;
-            3) enable_persist_service; sleep 2 ;;
-            0) return ;;
-        esac
-    done
-}
-# --------------------------
 download_to() {
     local url="$1"
     local out="$2"
@@ -1190,34 +1182,71 @@ uninstall_script_impl() {
     read -rp "警告: 此操作将删除本脚本、规则配置、定时任务、systemd 服务，并移除本脚本创建的 nft 表。确认？[y/N]: " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
 
+    # 1) 删除防火墙放行（尽量清理）
     while IFS='|' read -r lp addr tp last_ip proto; do
         [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
         is_port "$lp" || continue
         proto="$(normalize_proto "$proto")"
         manage_firewall "del" "$lp" "$proto" || true
-    done < "$CONFIG_FILE"
+    done < "$CONFIG_FILE" 2>/dev/null || true
 
-    nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
+    # 2) 删除 nft 表（仅本脚本的表）
+    have_cmd nft && nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
 
-    local SCRIPT_PATH="/usr/local/bin/${CMD_NAME}"
-    crontab -l 2>/dev/null | grep -v "${SCRIPT_PATH} --cron" | crontab - 2>/dev/null || true
-    remove_ddns_cron_task
+    # 3) 删除 DDNS cron（无论路径差异）
+    remove_ddns_cron_task || true
 
+    # 4) systemd：停用并删除 nft-mgr 服务
     if have_cmd systemctl; then
         systemctl disable --now nft-mgr >/dev/null 2>&1 || true
         rm -f "$NFT_MGR_SERVICE" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
+    # 5) 还原 /etc/nftables.conf 中的 include（只删我们添加的 include 行及标注）
+    if [[ -f "$NFTABLES_CONF" ]]; then
+        sed -i '/# nftmgr include (added .*$/d' "$NFTABLES_CONF" 2>/dev/null || true
+        sed -i '/# nftmgr persistent include$/d' "$NFTABLES_CONF" 2>/dev/null || true
+        sed -i '\|include "/etc/nftables.d/nft_mgr.conf"|d' "$NFTABLES_CONF" 2>/dev/null || true
+    fi
+
+    # 6) 如果 /etc/nftables.conf 是我们创建的（marker 存在），则尝试恢复备份，否则删除并关闭 nftables.service
+    if [[ -f "$NFTABLES_CREATED_MARK" ]]; then
+        rm -f "$NFTABLES_CREATED_MARK" 2>/dev/null || true
+        local latest_bak
+        latest_bak="$(ls -1t ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null | head -n 1)"
+        if [[ -n "$latest_bak" && -f "$latest_bak" ]]; then
+            cp -a "$latest_bak" "$NFTABLES_CONF" 2>/dev/null || true
+        else
+            rm -f "$NFTABLES_CONF" 2>/dev/null || true
+            if have_cmd systemctl; then
+                systemctl disable --now nftables >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+
+    # 7) 删除我们创建的备份（仅 nftmgr 命名的）
+    rm -f ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null || true
+
+    # 8) 删除脚本相关文件与目录（不留残留）
     rm -f "$NFT_MGR_CONF" "$CONFIG_FILE" "$SETTINGS_FILE" "$SYSCTL_FILE" "$LOCK_FILE" 2>/dev/null || true
     rm -rf "$LOG_DIR" 2>/dev/null || true
+    rmdir "$NFT_MGR_DIR" 2>/dev/null || true
 
-    msg_ok "✅ 卸载完成。"
+    # 9) 刷新 nftables（可选）
+    if have_cmd systemctl; then
+        systemctl restart nftables >/dev/null 2>&1 || true
+    fi
+
+    msg_ok "✅ 卸载完成（已清理脚本残留）。"
+
+    # 10) 删除自身
     rm -f "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
     exit 0
 }
 
 uninstall_script() { with_lock uninstall_script_impl; }
+ { with_lock uninstall_script_impl; }
 
 # --------------------------
 # 主菜单
@@ -1232,13 +1261,12 @@ main_menu() {
     echo "3. 流量看板与规则管理 (查看/删除)"
     echo "4. 清空所有转发规则"
     echo "5. 管理 DDNS 定时监控与日志"
-    echo "6. 持久化兼容设置（解决提示：未写入持久性规则）"
-    echo "7. 从 GitHub 更新当前脚本 (安全更新)"
-    echo "8. 一键完全卸载本脚本"
+    echo "6. 从 GitHub 更新当前脚本 (安全更新)"
+    echo "7. 一键完全卸载本脚本"
     echo "0. 退出面板"
     echo "------------------------------------------"
     local choice
-    read -rp "请选择操作 [0-8]: " choice
+    read -rp "请选择操作 [0-7]: " choice
 
     case "$choice" in
         1) optimize_system ;;
@@ -1246,9 +1274,8 @@ main_menu() {
         3) view_and_del_forward ;;
         4) clear_all_rules ;;
         5) manage_cron ;;
-        6) persist_menu ;;
-        7) update_script ;;
-        8) uninstall_script ;;
+        6) update_script ;;
+        7) uninstall_script ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
@@ -1261,20 +1288,11 @@ require_root
 check_env
 install_global_command
 
+# 自动检测并完成持久化设置（无单独菜单项）
+auto_persist_setup
+
 # CLI 模式
 case "${1:-}" in
-    --persist-status)
-        persist_status
-        exit $?
-        ;;
-    --persist-system)
-        enable_persist_system
-        exit $?
-        ;;
-    --persist-service)
-        enable_persist_service
-        exit $?
-        ;;
     --cron)
         # DDNS 更新（温和模式：失败只记录日志，不中断）
         ddns_update
