@@ -1,0 +1,222 @@
+# 极简意图分流版（全局不死兜底 + AI防封 + 游戏省流量）
+# 必读！！！
+# 注意规则在满足自己需求情况下，尽量做到精简，不要过度复杂，以免影响性能。
+# 跑裸核用户请自行去掉下方控制面板模块的注释。
+
+# 机场订阅
+proxy-providers:
+  MiSub:
+    url: "https://mi.0989898.xyz/a430623"
+    type: http
+    interval: 86400
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+    proxy: 直连
+  苏媚:
+    url: "https://www.19981124.xyz/share/sub/sjc?token=sijiache20240305"
+    type: http
+    interval: 86400
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+    proxy: 直连
+  转发:
+    url: "https://sub-store.lfy1680.icu/share/sub/Relay?token=dGyfUsWPkj3qQEQiI6ruG"
+    type: http
+    interval: 86400
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+    proxy: 直连
+
+# 节点信息
+proxies:
+  - {name: 直连, type: direct}
+
+# 全局配置 
+mixed-port: 7890
+allow-lan: true
+bind-address: "*"
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+log-level: warning
+keep-alive-idle: 600
+keep-alive-interval: 15
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+# 嗅探
+sniffer:
+  enable: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - "Mijia Cloud"
+    - "+.push.apple.com"
+
+# 入站
+tun:
+  enable: true
+  stack: mixed
+  dns-hijack: ["any:53", "tcp://any:53"]
+  auto-route: false
+  auto-redirect: false
+  auto-detect-interface: false
+
+# 🛡️ 终极极速DNS模块
+dns:
+  enable: true
+  cache-algorithm: arc
+  listen: 0.0.0.0:1053
+  ipv6: false
+  respect-rules: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter-mode: blacklist
+  fake-ip-filter:
+    - "rule-set:fakeipfilter_domain"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  proxy-server-nameserver:
+    - https://223.5.5.5/dns-query
+    - https://119.29.29.29/dns-query
+  nameserver:
+    - https://8.8.8.8/dns-query#🚀 默认代理
+    - https://1.1.1.1/dns-query#🚀 默认代理
+  nameserver-policy:
+    # 机场订阅域名精准直连解析
+    "+.0989898.xyz": https://223.5.5.5/dns-query
+    "+.19981124.xyz": https://223.5.5.5/dns-query
+    "+.lfy1680.icu": https://223.5.5.5/dns-query
+    # 国内域名直连纯净解析
+    "geosite:cn":
+      - https://223.5.5.5/dns-query
+      - https://119.29.29.29/dns-query
+    "geosite:private":
+      - https://223.5.5.5/dns-query
+      - https://119.29.29.29/dns-query
+ 
+# 出站策略 (UI极度清爽化，引入主备兜底)
+proxy-groups:
+  # 1. 核心上网通道 (首选全局不死，实现跨地区绝对高可用)
+  - {name: 🚀 默认代理, type: select, proxies: [🛡️ 全局不死, 🔯 香港故转, 🔯 日本故转, 🔯 台湾故转, 🔯 狮城故转, 🔯 美国故转, 🔯 其他故转, 🇭🇰 香港节点, 🇯🇵 日本节点, 🇹🇼 台湾节点, 🇸🇬 狮城节点, 🇺🇲 美国节点, 🌍 其他节点, 直连]}
+  
+  # 2. AI 刚需专用通道 (✨ 严格防止香港IP导致报错，未加入可能含香港的兜底组)
+  - {name: 🤖 AI 专属, type: select, proxies: [🔯 日本故转, 🔯 台湾故转, 🔯 美国故转, 🔯 狮城故转, 🇯🇵 日本节点, 🇹🇼 台湾节点, 🇺🇲 美国节点, 🇸🇬 狮城节点, 🚀 默认代理, 🔯 香港故转, 🇭🇰 香港节点]}
+  
+  # 3. TG 通讯专用
+  - {name: 📲 Telegram, type: select, proxies: [🔯 狮城故转, 🔯 香港故转, 🔯 日本故转, 🛡️ 全局不死, 🚀 默认代理, 🇸🇬 狮城节点, 🇭🇰 香港节点, 🇯🇵 日本节点]}
+  
+  # 4. 国内直连防流量消耗通道（苹果、微软、游戏）
+  - {name: 🍎 苹果服务, type: select, proxies: [直连, 🚀 默认代理, 🛡️ 全局不死, 🔯 台湾故转, 🔯 香港故转]}
+  - {name: 🪟 微软服务, type: select, proxies: [直连, 🚀 默认代理, 🛡️ 全局不死, 🔯 台湾故转, 🔯 日本故转, 🔯 香港故转]}
+  - {name: 🎮 游戏平台, type: select, proxies: [🚀 默认代理, 直连, 🛡️ 全局不死, 🔯 台湾故转, 🔯 日本故转]}
+  
+  # 5. 兜底规则
+  - {name: 🐟 漏网之鱼, type: select, proxies: [🚀 默认代理, 直连]}
+  
+  # ==================================
+  # 以下为底层逻辑：兜底组、故障转移与节点筛选（不在主面板首要展示）
+  # ==================================
+  
+  # 🛡️ 跨地区全局兜底策略（只要地球上还有一个节点，就不会断网）
+  - {name: 🛡️ 全局不死, type: fallback, proxies: [🔯 香港故转, 🔯 日本故转, 🔯 台湾故转, 🔯 狮城故转, 🔯 美国故转, 🔯 其他故转]}
+  
+  # 故障转移（已整体上移，方便优先调用与查看）
+  - {name: 🔯 香港故转, type: fallback, include-all: true, interval: 300, filter: "(?=.*(港|HK|(?i)Hong))^((?!(台|日|韩|新|深|美)).)*$"}
+  - {name: 🔯 日本故转, type: fallback, include-all: true, interval: 300, filter: "(?=.*(日|JP|(?i)Japan))^((?!(港|台|韩|新|美)).)*$"}
+  - {name: 🔯 狮城故转, type: fallback, include-all: true, interval: 300, filter: "(?=.*(新加坡|坡|狮城|SG|Singapore))^((?!(台|日|韩|深|美)).)*$"}
+  - {name: 🔯 台湾故转, type: fallback, include-all: true, interval: 300, filter: "(?=.*(台|TW|(?i)Taiwan))^((?!(港|日|韩|新|深|美)).)*$"}
+  - {name: 🔯 美国故转, type: fallback, include-all: true, interval: 300, filter: "(?=.*(美|US|(?i)States|America))^((?!(港|台|韩|新|日)).)*$"}
+  - {name: 🔯 其他故转, type: fallback, include-all: true, interval: 300, filter: "^((?!(台|TW|(?i)Taiwan|港|HK|(?i)Hong|日|JP|(?i)Japan|新加坡|坡|狮城|SG|Singapore|美|US|(?i)States|America)).)*$"}
+
+  # 节点筛选
+  - {name: 🇭🇰 香港节点, type: select, include-all: true, filter: "(?=.*(港|HK|(?i)Hong))^((?!(台|日|韩|新|深|美)).)*$"}
+  - {name: 🇯🇵 日本节点, type: select, include-all: true, filter: "(?=.*(日|JP|(?i)Japan))^((?!(港|台|韩|新|美)).)*$"}
+  - {name: 🇸🇬 狮城节点, type: select, include-all: true, filter: "(?=.*(新加坡|坡|狮城|SG|Singapore))^((?!(台|日|韩|深|美)).)*$"}
+  - {name: 🇹🇼 台湾节点, type: select, include-all: true, filter: "(?=.*(台|TW|(?i)Taiwan))^((?!(港|日|韩|新|深|美)).)*$"}
+  - {name: 🇺🇲 美国节点, type: select, include-all: true, filter: "(?=.*(美|US|(?i)States|America))^((?!(港|台|韩|新|日)).)*$"}
+  - {name: 🌍 其他节点, type: select, include-all: true, filter: "^((?!(台|TW|(?i)Taiwan|港|HK|(?i)Hong|日|JP|(?i)Japan|新加坡|坡|狮城|SG|Singapore|美|US|(?i)States|America)).)*$"}
+
+# 规则匹配
+rules:
+  # === 防封杀与省流量规则 ===
+  - RULE-SET,adblock_domain,REJECT
+  - DST-PORT,6881-6889,直连  # BT 常见端口拦截，防止走代理
+  - DOMAIN-KEYWORD,xunlei,直连 # 迅雷拦截
+  
+  - RULE-SET,private_ip,直连,no-resolve
+  - RULE-SET,private_domain,直连
+  
+  # === AI 刚需专线 ===
+  - RULE-SET,gemini_domain,🤖 AI 专属
+  - RULE-SET,ai,🤖 AI 专属
+  
+  # === 省流量应用区 ===
+  - RULE-SET,apple_domain,🍎 苹果服务
+  - RULE-SET,apple_ip,🍎 苹果服务,no-resolve
+  - RULE-SET,microsoft_domain,🪟 微软服务
+  - RULE-SET,onedrive_domain,🪟 微软服务
+  - RULE-SET,games_domain,🎮 游戏平台
+  
+  # === 电报专线 ===
+  - RULE-SET,telegram_domain,📲 Telegram
+  - RULE-SET,telegram_ip,📲 Telegram,no-resolve
+  
+  # === 核心代理区 ===
+  - DOMAIN-SUFFIX,qichiyu.com,🚀 默认代理
+  - RULE-SET,proxylite,🚀 默认代理
+  - RULE-SET,youtube_domain,🚀 默认代理
+  - RULE-SET,google_domain,🚀 默认代理
+  - RULE-SET,github_domain,🚀 默认代理
+  - RULE-SET,paypal_domain,🚀 默认代理
+  - RULE-SET,google_ip,🚀 默认代理,no-resolve
+  
+  # === 基础分流 ===
+  - RULE-SET,geolocation-!cn,🚀 默认代理
+  - RULE-SET,cn_domain,直连
+  - RULE-SET,cn_ip,直连,no-resolve
+  - MATCH,🐟 漏网之鱼
+
+# 规则集
+rule-anchor:
+  ip: &ip {type: http, interval: 86400, behavior: ipcidr, format: mrs}
+  domain: &domain {type: http, interval: 86400, behavior: domain, format: mrs}
+  class: &class {type: http, interval: 86400, behavior: classical, format: text}
+rule-providers: 
+  fakeipfilter_domain: {<<: *domain, url: "https://raw.githubusercontent.com/wwqgtxx/clash-rules/release/fakeip-filter.mrs"}
+  adblock_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads-all.mrs"}
+  private_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/private.mrs"}
+  proxylite: { <<: *class, url: "https://raw.githubusercontent.com/qichiyuhub/rule/refs/heads/main/proxy.list"}
+  gemini_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/gemini.mrs"}
+  ai: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ai-!cn.mrs" }
+  apple_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/apple.mrs"}
+  games_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-games.mrs"}
+  youtube_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/youtube.mrs"}
+  google_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/google.mrs"}
+  github_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/github.mrs"}
+  telegram_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/telegram.mrs"}
+  paypal_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/paypal.mrs"}
+  onedrive_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/onedrive.mrs"}
+  microsoft_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/microsoft.mrs"}
+  geolocation-!cn: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/geolocation-!cn.mrs"}
+  cn_domain: { <<: *domain, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.mrs"}
+  
+  private_ip: {<<: *ip, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/private.mrs"}
+  cn_ip: { <<: *ip, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs"}
+  google_ip: { <<: *ip, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/google.mrs"}
+  telegram_ip: { <<: *ip, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/telegram.mrs"}
+  apple_ip: {<<: *ip, url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo-lite/geoip/apple.mrs"}
