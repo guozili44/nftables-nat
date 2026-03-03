@@ -93,15 +93,7 @@ settings_set() {
     fi
 }
 PERSIST_MODE="$(settings_get "PERSIST_MODE" || true)"
-if [[ -z "$PERSIST_MODE" ]]; then
-    # 首次运行自动兼容：若系统启用了 nftables.service，则默认采用 system 模式（旧面板/节点管理更认可）
-    if have_cmd systemctl && systemctl is-enabled nftables >/dev/null 2>&1; then
-        PERSIST_MODE="system"
-    else
-        PERSIST_MODE="$PERSIST_MODE_DEFAULT"
-    fi
-    settings_set "PERSIST_MODE" "$PERSIST_MODE"
-fi
+[[ -z "$PERSIST_MODE" ]] && PERSIST_MODE="$PERSIST_MODE_DEFAULT"
 
 # --------------------------
 # 颜色
@@ -524,37 +516,11 @@ generate_nft_conf() {
     local out="$1"
     local any=0
 
-    emit_prerouting_rule() {
-        local proto="$1" lp="$2" ip="$3" tp="$4"
-        case "$proto" in
-            tcp)
-                echo "        tcp dport ${lp} counter comment \"in_${lp}_tcp\" dnat to ${ip}:${tp}"
-                ;;
-            udp)
-                echo "        udp dport ${lp} counter comment \"in_${lp}_udp\" dnat to ${ip}:${tp}"
-                ;;
-        esac
-    }
-
-    emit_postrouting_rules() {
-        local proto="$1" lp="$2" ip="$3" tp="$4"
-        case "$proto" in
-            tcp)
-                echo "        ct status dnat ct original dport ${lp} ct direction reply tcp counter comment \"out_${lp}_tcp\""
-                echo "        ct status dnat ct original dport ${lp} tcp dport ${tp} ip daddr ${ip} masquerade"
-                ;;
-            udp)
-                echo "        ct status dnat ct original dport ${lp} ct direction reply udp counter comment \"out_${lp}_udp\""
-                echo "        ct status dnat ct original dport ${lp} udp dport ${tp} ip daddr ${ip} masquerade"
-                ;;
-        esac
-    }
-
     {
         echo "# nft-mgr ruleset (generated at $(date '+%F %T'))"
         echo "table ip nft_mgr_nat {"
         echo "    chain prerouting {"
-        echo "        type nat hook prerouting priority -100; policy accept;"
+        echo "        type nat hook prerouting priority -100;"
 
         while IFS='|' read -r lp addr tp last_ip proto; do
             [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
@@ -570,16 +536,16 @@ generate_nft_conf() {
 
             case "$proto" in
                 tcp)
-                    emit_prerouting_rule tcp "$lp" "$ip" "$tp"
+                    echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"
                     any=1
                     ;;
                 udp)
-                    emit_prerouting_rule udp "$lp" "$ip" "$tp"
+                    echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"
                     any=1
                     ;;
                 both)
-                    emit_prerouting_rule tcp "$lp" "$ip" "$tp"
-                    emit_prerouting_rule udp "$lp" "$ip" "$tp"
+                    echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"
+                    echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"
                     any=1
                     ;;
             esac
@@ -587,7 +553,7 @@ generate_nft_conf() {
 
         echo "    }"
         echo "    chain postrouting {"
-        echo "        type nat hook postrouting priority 100; policy accept;"
+        echo "        type nat hook postrouting priority 100;"
 
         while IFS='|' read -r lp addr tp last_ip proto; do
             [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
@@ -603,16 +569,16 @@ generate_nft_conf() {
 
             case "$proto" in
                 tcp)
-                    emit_postrouting_rules tcp "$lp" "$ip" "$tp"
+                    echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"
                     any=1
                     ;;
                 udp)
-                    emit_postrouting_rules udp "$lp" "$ip" "$tp"
+                    echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"
                     any=1
                     ;;
                 both)
-                    emit_postrouting_rules tcp "$lp" "$ip" "$tp"
-                    emit_postrouting_rules udp "$lp" "$ip" "$tp"
+                    echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"
+                    echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"
                     any=1
                     ;;
             esac
@@ -817,11 +783,18 @@ add_forward() { with_lock add_forward_impl; }
 # --------------------------
 get_traffic_snapshot() { nft -a list table ip nft_mgr_nat 2>/dev/null || true; }
 
-extract_sum_bytes_by_prefix() {
-    local snapshot="$1"
-    local prefix="$2"
-    # 匹配 comment "prefix..."
-    echo "$snapshot" | grep -F "comment \"${prefix}" | sed -n 's/.*bytes \([0-9]\+\).*/\1/p' | awk '{s+=$1} END{print s+0}'
+extract_bytes_for_prerouting() {
+    # args: snapshot proto lp ip tp
+    local snapshot="$1" proto="$2" lp="$3" ip="$4" tp="$5"
+    # match: "<proto> dport <lp> ... dnat to <ip>:<tp>"
+    echo "$snapshot" | grep -E "${proto} dport ${lp}.*dnat to ${ip}:${tp}" | sed -n 's/.*bytes \([0-9]\+\).*/\1/p' | head -n 1
+}
+
+extract_bytes_for_postrouting() {
+    # args: snapshot proto ip tp
+    local snapshot="$1" proto="$2" ip="$3" tp="$4"
+    # match: "ip daddr <ip> <proto> dport <tp> ... masquerade"
+    echo "$snapshot" | grep -E "ip daddr ${ip} ${proto} dport ${tp}.*masquerade" | sed -n 's/.*bytes \([0-9]\+\).*/\1/p' | head -n 1
 }
 
 view_and_del_forward_impl() {
@@ -850,8 +823,29 @@ view_and_del_forward_impl() {
         is_port "$tp" || continue
 
         local in_bytes out_bytes
-        in_bytes="$(extract_sum_bytes_by_prefix "$traffic_data" "in_${lp}_")"
-        out_bytes="$(extract_sum_bytes_by_prefix "$traffic_data" "out_${lp}_")"
+        # 计算 RX/TX：按协议分别匹配并相加
+        local ip_now
+        ip_now="$last_ip"
+        [[ -z "$ip_now" ]] && ip_now="$(get_ip "$addr")"
+        [[ -z "$ip_now" ]] && ip_now="0.0.0.0"
+
+        in_bytes=0
+        out_bytes=0
+
+        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+            local ib ob
+            ib="$(extract_bytes_for_prerouting "$traffic_data" "tcp" "$lp" "$ip_now" "$tp")"; [[ -z "$ib" ]] && ib=0
+            ob="$(extract_bytes_for_postrouting "$traffic_data" "tcp" "$ip_now" "$tp")"; [[ -z "$ob" ]] && ob=0
+            in_bytes=$((in_bytes + ib))
+            out_bytes=$((out_bytes + ob))
+        fi
+        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+            local ib ob
+            ib="$(extract_bytes_for_prerouting "$traffic_data" "udp" "$lp" "$ip_now" "$tp")"; [[ -z "$ib" ]] && ib=0
+            ob="$(extract_bytes_for_postrouting "$traffic_data" "udp" "$ip_now" "$tp")"; [[ -z "$ob" ]] && ob=0
+            in_bytes=$((in_bytes + ib))
+            out_bytes=$((out_bytes + ob))
+        fi
         [[ -z "$in_bytes" ]] && in_bytes=0
         [[ -z "$out_bytes" ]] && out_bytes=0
 
@@ -1066,34 +1060,18 @@ healthcheck_impl() {
             had_error=1
         fi
 
-        # 校验 nft chain 中是否存在预期 DNAT 规则（按协议分裂生成）
+        # 校验 nft chain 中是否存在预期 DNAT 规则（新语法：tcp/udp dport ... dnat to ip:port）
         if [[ -n "$last_ip" ]]; then
             case "$proto" in
                 tcp)
-                    if ! echo "$chain" | grep -qE "tcp dport ${lp}.*dnat to ${last_ip}:${tp}"; then
-                        gha_error "端口 ${lp}: nft 规则中未找到预期 TCP DNAT (dnat to ${last_ip}:${tp})"
-                        msg_err "端口 ${lp}: nft 规则中未找到预期 TCP DNAT (dnat to ${last_ip}:${tp})"
-                        had_error=1
-                    fi
+                    echo "$chain" | grep -qE "tcp dport ${lp}.*dnat to ${last_ip}:${tp}" || { gha_error "端口 ${lp}: 未找到预期 TCP DNAT"; msg_err "端口 ${lp}: 未找到预期 TCP DNAT"; had_error=1; }
                     ;;
                 udp)
-                    if ! echo "$chain" | grep -qE "udp dport ${lp}.*dnat to ${last_ip}:${tp}"; then
-                        gha_error "端口 ${lp}: nft 规则中未找到预期 UDP DNAT (dnat to ${last_ip}:${tp})"
-                        msg_err "端口 ${lp}: nft 规则中未找到预期 UDP DNAT (dnat to ${last_ip}:${tp})"
-                        had_error=1
-                    fi
+                    echo "$chain" | grep -qE "udp dport ${lp}.*dnat to ${last_ip}:${tp}" || { gha_error "端口 ${lp}: 未找到预期 UDP DNAT"; msg_err "端口 ${lp}: 未找到预期 UDP DNAT"; had_error=1; }
                     ;;
                 both)
-                    if ! echo "$chain" | grep -qE "tcp dport ${lp}.*dnat to ${last_ip}:${tp}"; then
-                        gha_error "端口 ${lp}: nft 规则中未找到预期 TCP DNAT (dnat to ${last_ip}:${tp})"
-                        msg_err "端口 ${lp}: nft 规则中未找到预期 TCP DNAT (dnat to ${last_ip}:${tp})"
-                        had_error=1
-                    fi
-                    if ! echo "$chain" | grep -qE "udp dport ${lp}.*dnat to ${last_ip}:${tp}"; then
-                        gha_error "端口 ${lp}: nft 规则中未找到预期 UDP DNAT (dnat to ${last_ip}:${tp})"
-                        msg_err "端口 ${lp}: nft 规则中未找到预期 UDP DNAT (dnat to ${last_ip}:${tp})"
-                        had_error=1
-                    fi
+                    echo "$chain" | grep -qE "tcp dport ${lp}.*dnat to ${last_ip}:${tp}" || { gha_error "端口 ${lp}: 未找到预期 TCP DNAT"; msg_err "端口 ${lp}: 未找到预期 TCP DNAT"; had_error=1; }
+                    echo "$chain" | grep -qE "udp dport ${lp}.*dnat to ${last_ip}:${tp}" || { gha_error "端口 ${lp}: 未找到预期 UDP DNAT"; msg_err "端口 ${lp}: 未找到预期 UDP DNAT"; had_error=1; }
                     ;;
             esac
         fi
