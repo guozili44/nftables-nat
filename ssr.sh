@@ -1,8 +1,8 @@
 cat > /usr/local/bin/ssr << 'EOF_MAGIC_END'
 #!/bin/bash
 # ==============================================================================
-# 脚本名称: SSR 综合管理脚本 (极致内核版)
-# 核心功能: DDNS 云端+本地双向删除、剔除冗余流量监视、全局自愈防呆、NAT极限压榨
+# 脚本名称: SSR 综合管理脚本 (性能极限版)
+# 核心功能: 极限内核调优(MTU黑洞规避+Bufferbloat抑制)、全局防呆、DDNS核爆
 # 全局命令: ssr [bbr | nat | clean | update | nuke <名> | rmddns | daily_task]
 # ==============================================================================
 
@@ -11,7 +11,7 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
-readonly SCRIPT_VERSION="20.18-Lite-Core"
+readonly SCRIPT_VERSION="20.19-Performance-Max"
 readonly CONF_FILE="/etc/sysctl.d/99-bbr.conf"
 readonly NAT_CONF_FILE="/etc/sysctl.d/99-nat.conf"
 readonly DDNS_CONF="/usr/local/etc/ssr_ddns.conf"
@@ -81,9 +81,7 @@ setup_cf_ddns() {
     local zone_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$cf_zone" -H "Authorization: Bearer $cf_token" -H "Content-Type: application/json")
     local zone_id=$(echo "$zone_response" | jq -r '.result[0].id')
 
-    if [[ -z "$zone_id" || "$zone_id" == "null" ]]; then
-        echo -e "${RED}❌ 验证失败！请检查您的 Token 或根域名是否正确。${RESET}"; sleep 3; return
-    fi
+    if [[ -z "$zone_id" || "$zone_id" == "null" ]]; then echo -e "${RED}❌ 验证失败！请检查您的 Token 或根域名。${RESET}"; sleep 3; return; fi
 
     mkdir -p /usr/local/etc
     cat > "$DDNS_CONF" << EOF
@@ -93,12 +91,9 @@ CF_RECORD="${cf_record}"
 LAST_IP=""
 EOF
     
-    if ! crontab -l 2>/dev/null | grep -q "ssr ddns"; then 
-        (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/ssr ddns > /dev/null 2>&1") | crontab -
-    fi
+    if ! crontab -l 2>/dev/null | grep -q "ssr ddns"; then (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/ssr ddns > /dev/null 2>&1") | crontab -; fi
     echo -e "${GREEN}✅ DDNS 配置保存成功！${RESET}\n${CYAN}>>> 正在进行首次解析推送...${RESET}"
-    run_cf_ddns "manual"
-    sleep 3
+    run_cf_ddns "manual"; sleep 3
 }
 
 run_cf_ddns() {
@@ -106,15 +101,10 @@ run_cf_ddns() {
     if [[ ! -f "$DDNS_CONF" ]]; then [[ "$mode" == "manual" ]] && echo -e "${RED}❌ DDNS 未配置。${RESET}"; return; fi
     source "$DDNS_CONF"
     local current_ip=$(curl -s4m8 https://api.ipify.org || curl -s4m8 ifconfig.me)
-    if [[ -z "$current_ip" ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - [错误] 无法获取本机公网 IPv4" >> "$DDNS_LOG"
-        [[ "$mode" == "manual" ]] && echo -e "${RED}❌ 无法获取本机 IP！${RESET}"
-        return
-    fi
+    if [[ -z "$current_ip" ]]; then echo "$(date '+%Y-%m-%d %H:%M:%S') - [错误] 无法获取公网 IP" >> "$DDNS_LOG"; return; fi
     if [[ "$current_ip" == "$LAST_IP" && "$mode" != "manual" ]]; then return; fi
 
-    [[ "$mode" == "manual" ]] && echo -e "${YELLOW}获取到当前 IP: $current_ip ，正在与 Cloudflare 通信...${RESET}"
-
+    [[ "$mode" == "manual" ]] && echo -e "${YELLOW}获取到当前 IP: $current_ip ，正在通信...${RESET}"
     local record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=A" -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
     local record_id=$(echo "$record_response" | jq -r '.result[0].id')
     local api_result=""
@@ -129,39 +119,30 @@ run_cf_ddns() {
     if [[ "$success" == "true" ]]; then
         sed -i "s/^LAST_IP=.*/LAST_IP=\"${current_ip}\"/g" "$DDNS_CONF"
         echo "$(date '+%Y-%m-%d %H:%M:%S') - [成功] IP 更新为: $current_ip" >> "$DDNS_LOG"
-        [[ "$mode" == "manual" ]] && echo -e "${GREEN}✅ 解析已成功更新为: $current_ip${RESET}"
+        [[ "$mode" == "manual" ]] && echo -e "${GREEN}✅ 解析已更新为: $current_ip${RESET}"
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - [失败] 无法更新 API。响应: $api_result" >> "$DDNS_LOG"
-        [[ "$mode" == "manual" ]] && echo -e "${RED}❌ 更新失败！请查看日志。${RESET}"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [失败] API响应: $api_result" >> "$DDNS_LOG"
+        [[ "$mode" == "manual" ]] && echo -e "${RED}❌ 更新失败！${RESET}"
     fi
 }
 
 remove_cf_ddns() {
     local cli_mode=$1
-    if [[ ! -f "$DDNS_CONF" ]]; then echo -e "${RED}❌ DDNS 未配置，无需删除。${RESET}"; [[ "$cli_mode" != "force" ]] && sleep 2; return; fi
+    if [[ ! -f "$DDNS_CONF" ]]; then echo -e "${RED}❌ DDNS 未配置。${RESET}"; [[ "$cli_mode" != "force" ]] && sleep 2; return; fi
     source "$DDNS_CONF"
-    
     if [[ "$cli_mode" != "force" ]]; then
         echo -e "${RED}⚠️ 警告：这将从本地和 Cloudflare 云端双向物理粉碎解析记录 [${CF_RECORD}]！${RESET}"
-        read -rp "确定要执行毁灭性删除吗？(y/N): " confirm
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { echo -e "${GREEN}操作已取消。${RESET}"; sleep 1; return; }
+        read -rp "确定要执行吗？(y/N): " confirm; [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
     fi
-    
-    echo -e "${CYAN}>>> 正在连接 Cloudflare API 销毁云端解析记录...${RESET}"
+    echo -e "${CYAN}>>> 正在销毁云端解析记录...${RESET}"
     local record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=A" -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
     local record_id=$(echo "$record_response" | jq -r '.result[0].id 2>/dev/null')
-    
     if [[ -n "$record_id" && "$record_id" != "null" ]]; then
         curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" > /dev/null
-        echo -e "${GREEN}✅ 云端 Cloudflare 解析记录已被物理粉碎！${RESET}"
-    else
-        echo -e "${YELLOW}⚠️ 云端未找到对应记录，可能已被手动删除。${RESET}"
+        echo -e "${GREEN}✅ 云端记录已被粉碎！${RESET}"
     fi
-    
-    rm -f "$DDNS_CONF" "$DDNS_LOG"
-    crontab -l 2>/dev/null | grep -v "ssr ddns" | crontab -
-    echo -e "${GREEN}✅ 本地 DDNS 巡检任务与配置已彻底撤销干净。${RESET}"
-    [[ "$cli_mode" != "force" ]] && sleep 2
+    rm -f "$DDNS_CONF" "$DDNS_LOG"; crontab -l 2>/dev/null | grep -v "ssr ddns" | crontab -
+    echo -e "${GREEN}✅ 本地 DDNS 任务已撤销。${RESET}"; [[ "$cli_mode" != "force" ]] && sleep 2
 }
 
 cf_ddns_menu() {
@@ -169,45 +150,28 @@ cf_ddns_menu() {
         clear; echo -e "${CYAN}========= 🌐 动态域名解析 (Cloudflare DDNS) =========${RESET}"
         if [[ -f "$DDNS_CONF" ]]; then
             source "$DDNS_CONF"
-            echo -e "${GREEN}当前状态: 已启用守护${RESET}\n绑定域名: ${YELLOW}$CF_RECORD${RESET}\n最近记录 IP: ${YELLOW}$LAST_IP${RESET}"
-            echo -e "---------------------------------"
-            echo -e "${YELLOW} 1.${RESET} 修改 DDNS 配置"
-            echo -e "${YELLOW} 2.${RESET} 手动强制推送更新"
-            echo -e "${YELLOW} 3.${RESET} 查看底层运行日志"
-            echo -e "${RED} 4. 彻底删除 DDNS (含云端记录与本地任务)${RESET}"
-            echo -e " 0. 返回上级菜单"
+            echo -e "${GREEN}当前状态: 已启用守护${RESET}\n绑定域名: ${YELLOW}$CF_RECORD${RESET}\n最近记录 IP: ${YELLOW}$LAST_IP${RESET}\n---------------------------------\n${YELLOW} 1.${RESET} 修改 DDNS 配置\n${YELLOW} 2.${RESET} 手动强制推送更新\n${YELLOW} 3.${RESET} 查看底层运行日志\n${RED} 4. 彻底删除 DDNS (含云端记录)${RESET}\n 0. 返回上级菜单"
             read -rp "请输入数字 [0-4]: " ddns_num
-            case "$ddns_num" in
-                1) setup_cf_ddns ;;
-                2) run_cf_ddns "manual"; sleep 2 ;;
-                3) if [[ -f "$DDNS_LOG" ]]; then clear; tail -n 15 "$DDNS_LOG"; echo ""; read -n 1 -s -r -p "按任意键返回..."; else echo -e "${YELLOW}暂无日志。${RESET}"; sleep 1; fi ;;
-                4) remove_cf_ddns "menu" ;;
-                0) return ;;
-            esac
+            case "$ddns_num" in 1) setup_cf_ddns ;; 2) run_cf_ddns "manual"; sleep 2 ;; 3) if [[ -f "$DDNS_LOG" ]]; then clear; tail -n 15 "$DDNS_LOG"; echo ""; read -n 1 -s -r -p "按任意键返回..."; fi ;; 4) remove_cf_ddns "menu" ;; 0) return ;; esac
         else
-            echo -e "${RED}当前状态: 未配置${RESET}\n---------------------------------"
-            echo -e "${YELLOW} 1.${RESET} 开启原生 Cloudflare DDNS 自动巡检"
-            echo -e " 0. 返回上级菜单"
+            echo -e "${RED}当前状态: 未配置${RESET}\n---------------------------------\n${YELLOW} 1.${RESET} 开启 Cloudflare DDNS\n 0. 返回上级菜单"
             read -rp "请输入数字 [0-1]: " ddns_num
-            case "$ddns_num" in
-                1) setup_cf_ddns ;;
-                0) return ;;
-            esac
+            case "$ddns_num" in 1) setup_cf_ddns ;; 0) return ;; esac
         fi
     done
 }
 
 # ==========================================================
-# 基础系统管理与 SSH 密钥
+# 基础系统管理
 # ==========================================================
-change_ssh_port() { read -rp "请输入新的 SSH 端口号 (1-65535): " new_port; if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then ufw allow "$new_port"/tcp >/dev/null 2>&1; fi; if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$new_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi; sed -i "s/^#\?Port [0-9]*/Port $new_port/g" /etc/ssh/sshd_config; systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; echo -e "${GREEN}✅ SSH 端口已修改为 $new_port 。${RESET}"; else echo -e "${RED}输入无效。${RESET}"; fi; sleep 2; }
-change_root_password() { read -rp "请输入新的 root 密码: " new_pass; [[ -z "$new_pass" ]] && return; read -rp "请再次输入确认: " new_pass_confirm; [[ "$new_pass" != "$new_pass_confirm" ]] && echo -e "${RED}两次密码不一致！${RESET}" && sleep 2 && return; echo "root:$new_pass" | chpasswd && echo -e "${GREEN}✅ 密码修改成功！${RESET}"; sleep 2; }
-sync_server_time() { echo -e "${CYAN}>>> 正在同步服务器时间...${RESET}"; if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -yqq systemd-timesyncd && systemctl enable --now systemd-timesyncd 2>/dev/null; elif command -v yum >/dev/null 2>&1; then yum install -yq chrony && systemctl enable --now chronyd 2>/dev/null; fi; echo -e "${GREEN}✅ 时间同步已启动！${RESET}"; sleep 2; }
+change_ssh_port() { read -rp "新的 SSH 端口号 (1-65535): " new_port; if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then ufw allow "$new_port"/tcp >/dev/null 2>&1; fi; if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$new_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi; sed -i "s/^#\?Port [0-9]*/Port $new_port/g" /etc/ssh/sshd_config; systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; echo -e "${GREEN}✅ SSH 端口已修改为 $new_port 。${RESET}"; fi; sleep 2; }
+change_root_password() { read -rp "新的 root 密码: " new_pass; [[ -z "$new_pass" ]] && return; read -rp "再次输入确认: " new_pass_confirm; [[ "$new_pass" != "$new_pass_confirm" ]] && echo -e "${RED}两次密码不一致！${RESET}" && sleep 2 && return; echo "root:$new_pass" | chpasswd && echo -e "${GREEN}✅ 密码修改成功！${RESET}"; sleep 2; }
+sync_server_time() { echo -e "${CYAN}>>> 正在同步时间...${RESET}"; if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -yqq systemd-timesyncd && systemctl enable --now systemd-timesyncd 2>/dev/null; elif command -v yum >/dev/null 2>&1; then yum install -yq chrony && systemctl enable --now chronyd 2>/dev/null; fi; echo -e "${GREEN}✅ 同步已启动！${RESET}"; sleep 2; }
 apply_ssh_key_sec() { sed -i 's/^#\?PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config; sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication no/g' /etc/ssh/sshd_config; systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; echo -e "${GREEN}✅ 密码登录已封锁。${RESET}"; sleep 2; }
 ssh_key_menu() { clear; echo -e "${CYAN}========= SSH 密钥登录管理 =========${RESET}\n${YELLOW} 1.${RESET} 自动拉取公钥 (GitHub)\n${YELLOW} 2.${RESET} 手动填写公钥\n${YELLOW} 3.${RESET} 一键生成密钥对\n${RED} 4. 恢复密码登录${RESET}\n 0. 返回"; read -rp "输入 [0-4]: " skm_num; case "$skm_num" in 1) read -rp "GitHub用户名: " gh_user; [[ -n "$gh_user" ]] && { mkdir -p ~/.ssh && chmod 700 ~/.ssh; keys=$(curl -s "https://github.com/${gh_user}.keys"); [[ -n "$keys" && "$keys" != "Not Found" ]] && { echo "$keys" >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; echo -e "${GREEN}✅ 拉取成功！${RESET}"; apply_ssh_key_sec; } || echo -e "${RED}❌ 未找到公钥。${RESET}"; sleep 2; } ;; 2) read -rp "粘贴公钥: " manual_key; [[ -n "$manual_key" ]] && { mkdir -p ~/.ssh && chmod 700 ~/.ssh; echo "$manual_key" >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; echo -e "${GREEN}✅ 成功！${RESET}"; apply_ssh_key_sec; } ;; 3) mkdir -p ~/.ssh && chmod 700 ~/.ssh; rm -f ~/.ssh/id_ed25519*; ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q; cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; echo -e "${RED}⚠️ 保存以下私钥！⚠️${RESET}\n"; cat ~/.ssh/id_ed25519; echo -e "\n${YELLOW}========================${RESET}"; read -rp "关闭密码登录 (y/N): " confirm; [[ "$confirm" == "y" || "$confirm" == "Y" ]] && apply_ssh_key_sec ;; 4) sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config; systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; echo -e "${GREEN}✅ 已恢复密码登录。${RESET}"; sleep 2 ;; 0) return ;; esac; }
 
 # ==========================================================
-# 原生安装模块 (防呆)
+# 节点原生部署模块 (全链路校验与防呆)
 # ==========================================================
 install_ss_rust_native() {
     clear; echo -e "${CYAN}========= 原生交互安装 SS-Rust =========${RESET}"
@@ -221,31 +185,21 @@ install_ss_rust_native() {
     local pwd=""; if [[ "$pwd_len" -ne 0 ]]; then read -rp "密码 (留空生成Base64): " input_pwd; [[ -z "$input_pwd" ]] && pwd=$(openssl rand -base64 $pwd_len) || pwd=$(echo -n "$input_pwd" | base64 -w 0 | cut -c 1-$(($pwd_len * 4 / 3 + 4)))
     else read -rp "传统密码 (留空随机): " input_pwd; [[ -z "$input_pwd" ]] && pwd=$(openssl rand -hex 12) || pwd="$input_pwd"; fi
     local arch=$(uname -m); local ss_arch="x86_64-unknown-linux-gnu"; [[ "$arch" == "aarch64" ]] && ss_arch="aarch64-unknown-linux-gnu"
+    
     echo -e "${CYAN}>>> 正在获取 SS-Rust 核心...${RESET}"
     local ss_latest=$(curl -s --max-time 10 https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest | grep '"tag_name":' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     [[ -z "$ss_latest" ]] && ss_latest="v1.22.0"
+    
     wget -qO /tmp/ss-rust.tar.xz "https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/shadowsocks-${ss_latest}.${ss_arch}.tar.xz"
-    if [[ ! -s /tmp/ss-rust.tar.xz ]] || ! tar -tf /tmp/ss-rust.tar.xz >/dev/null 2>&1; then echo -e "${RED}❌ 核心下载失败。${RESET}"; rm -f /tmp/ss-rust.tar.xz; sleep 3; return; fi
+    if [[ ! -s /tmp/ss-rust.tar.xz ]] || ! tar -tf /tmp/ss-rust.tar.xz >/dev/null 2>&1; then echo -e "${RED}❌ 核心下载失败，请重试。${RESET}"; rm -f /tmp/ss-rust.tar.xz; sleep 3; return; fi
     tar -xf /tmp/ss-rust.tar.xz -C /tmp/ ssserver; mv -f /tmp/ssserver /usr/local/bin/ss-rust && chmod +x /usr/local/bin/ss-rust
     mkdir -p /etc/ss-rust; cat > /etc/ss-rust/config.json << EOF
 { "server": "::", "server_port": $port, "password": "$pwd", "method": "$method", "mode": "tcp_and_udp", "fast_open": true }
 EOF
     cat > /etc/systemd/system/ss-rust.service << EOF
-[Unit]
-Description=Shadowsocks-Rust Server
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/ss-rust -c /etc/ss-rust/config.json
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
+[Unit]\nDescription=Shadowsocks-Rust Server\nAfter=network.target\n[Service]\nExecStart=/usr/local/bin/ss-rust -c /etc/ss-rust/config.json\nRestart=on-failure\nLimitNOFILE=1048576\n[Install]\nWantedBy=multi-user.target
 EOF
-    systemctl daemon-reload && systemctl enable --now ss-rust
-    if command -v ufw >/dev/null 2>&1; then ufw allow "$port"/tcp >/dev/null 2>&1; ufw allow "$port"/udp >/dev/null 2>&1; fi
-    if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --add-port="$port"/udp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+    systemctl daemon-reload && systemctl enable --now ss-rust; if command -v ufw >/dev/null 2>&1; then ufw allow "$port"/tcp >/dev/null 2>&1; ufw allow "$port"/udp >/dev/null 2>&1; fi; if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --add-port="$port"/udp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
     echo -e "${GREEN}✅ SS-Rust ($ss_latest) 安装完成！${RESET}"; sleep 2
 }
 
@@ -260,41 +214,24 @@ install_vless_native() {
     wget -qO /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/Xray-linux-${xray_arch}.zip"
     if [[ ! -s /tmp/xray.zip ]] || ! unzip -t /tmp/xray.zip >/dev/null 2>&1; then echo -e "${RED}❌ 核心下载失败。${RESET}"; rm -f /tmp/xray.zip; sleep 3; return; fi
     unzip -qo /tmp/xray.zip xray -d /tmp/; mv -f /tmp/xray /usr/local/bin/xray && chmod +x /usr/local/bin/xray
-    mkdir -p /usr/local/etc/xray
-    local uuid=$(/usr/local/bin/xray uuid); local keys=$(/usr/local/bin/xray x25519); local priv=$(echo "$keys" | grep "Private" | awk '{print $3}'); local pub=$(echo "$keys" | grep "Public" | awk '{print $3}'); local short_id=$(openssl rand -hex 8)
+    mkdir -p /usr/local/etc/xray; local uuid=$(/usr/local/bin/xray uuid); local keys=$(/usr/local/bin/xray x25519); local priv=$(echo "$keys" | grep "Private" | awk '{print $3}'); local pub=$(echo "$keys" | grep "Public" | awk '{print $3}'); local short_id=$(openssl rand -hex 8)
     cat > /usr/local/etc/xray/config.json << EOF
 { "inbounds": [{ "port": $port, "protocol": "vless", "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" }, "streamSettings": { "network": "tcp", "security": "reality", "realitySettings": { "dest": "${sni_domain}:443", "serverNames": ["${sni_domain}"], "privateKey": "$priv", "shortIds": ["$short_id"] } } }], "outbounds": [{"protocol": "freedom"}] }
 EOF
     cat > /etc/systemd/system/xray.service << EOF
-[Unit]
-Description=Xray Service
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/xray run -c /usr/local/etc/xray/config.json
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
+[Unit]\nDescription=Xray Service\nAfter=network.target\n[Service]\nExecStart=/usr/local/bin/xray run -c /usr/local/etc/xray/config.json\nRestart=on-failure\nLimitNOFILE=1048576\n[Install]\nWantedBy=multi-user.target
 EOF
-    systemctl daemon-reload && systemctl enable --now xray
-    if command -v ufw >/dev/null 2>&1; then ufw allow "$port"/tcp >/dev/null 2>&1; fi
-    if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+    systemctl daemon-reload && systemctl enable --now xray; if command -v ufw >/dev/null 2>&1; then ufw allow "$port"/tcp >/dev/null 2>&1; fi; if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
     echo -e "${GREEN}✅ VLESS Reality ($xray_latest) 安装成功！${RESET}"; sleep 2
 }
 
 install_shadowtls_native() {
     clear; echo -e "${CYAN}========= 原生安装 ShadowTLS =========${RESET}"
     local ss_port=""; [[ -f "/etc/ss-rust/config.json" ]] && ss_port=$(jq -r '.server_port' /etc/ss-rust/config.json 2>/dev/null)
-    if [[ -n "$ss_port" && "$ss_port" != "null" ]]; then
-        echo -e "${YELLOW}检测到本地 SS-Rust 节点，推荐进行保护：${RESET}\n${CYAN} 1) 保护本地 SS-Rust (端口: $ss_port)${RESET}\n${CYAN} 2) 手动输入其他自定义端口${RESET}"
-        read -rp "选择 [1-2]: " protect_choice; if [[ "$protect_choice" == "1" ]]; then up_port=$ss_port; else read -rp "需要保护的上游端口: " up_port; fi
+    if [[ -n "$ss_port" && "$ss_port" != "null" ]]; then echo -e "${YELLOW}检测到本地 SS-Rust，推荐保护：${RESET}\n${CYAN} 1) 保护 SS-Rust (端口: $ss_port)${RESET}\n${CYAN} 2) 手动输入自定义端口${RESET}"; read -rp "选择 [1-2]: " protect_choice; if [[ "$protect_choice" == "1" ]]; then up_port=$ss_port; else read -rp "需要保护的上游端口: " up_port; fi
     else read -rp "需要保护的上游端口: " up_port; fi
     [[ -z "$up_port" ]] && echo -e "${RED}端口无效！${RESET}" && sleep 2 && return
-
-    read -rp "ShadowTLS 伪装端口 [留空自动随机]: " listen_port
-    if ! [[ "$listen_port" =~ ^[0-9]+$ ]] || [ "$listen_port" -lt 1 ] || [ "$listen_port" -gt 65535 ]; then listen_port=$((RANDOM % 55535 + 10000)); fi
+    read -rp "ShadowTLS 伪装端口 [留空随机]: " listen_port; if ! [[ "$listen_port" =~ ^[0-9]+$ ]] || [ "$listen_port" -lt 1 ] || [ "$listen_port" -gt 65535 ]; then listen_port=$((RANDOM % 55535 + 10000)); fi
     read -rp "伪装域名 (SNI) [留空默认 updates.cdn-apple.com]: " sni_domain; [[ -z "$sni_domain" ]] && sni_domain="updates.cdn-apple.com"
     local pwd=$(openssl rand -base64 8); local arch=$(uname -m); local st_arch="x86_64-unknown-linux-musl"; [[ "$arch" == "aarch64" ]] && st_arch="aarch64-unknown-linux-musl"
     local st_latest=$(curl -s --max-time 10 https://api.github.com/repos/ihciah/shadow-tls/releases/latest | grep '"tag_name":' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
@@ -302,23 +239,10 @@ install_shadowtls_native() {
     wget -qO /tmp/shadow-tls "https://github.com/ihciah/shadow-tls/releases/download/${st_latest}/shadow-tls-${st_arch}"
     if [[ ! -s /tmp/shadow-tls ]]; then echo -e "${RED}❌ 下载失败。${RESET}"; rm -f /tmp/shadow-tls; sleep 3; return; fi
     mv -f /tmp/shadow-tls /usr/local/bin/shadow-tls && chmod +x /usr/local/bin/shadow-tls
-    
     cat > /etc/systemd/system/shadowtls-${listen_port}.service << EOF
-[Unit]
-Description=ShadowTLS Service on port ${listen_port}
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/shadow-tls --v3 --strict server --listen 0.0.0.0:${listen_port} --server 127.0.0.1:${up_port} --tls ${sni_domain}:443 --password ${pwd}
-Restart=always
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
+[Unit]\nDescription=ShadowTLS Service on port ${listen_port}\nAfter=network.target\n[Service]\nExecStart=/usr/local/bin/shadow-tls --v3 --strict server --listen 0.0.0.0:${listen_port} --server 127.0.0.1:${up_port} --tls ${sni_domain}:443 --password ${pwd}\nRestart=always\nLimitNOFILE=1048576\n[Install]\nWantedBy=multi-user.target
 EOF
-    systemctl daemon-reload && systemctl enable --now shadowtls-${listen_port}
-    if command -v ufw >/dev/null 2>&1; then ufw allow "$listen_port"/tcp >/dev/null 2>&1; fi
-    if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$listen_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+    systemctl daemon-reload && systemctl enable --now shadowtls-${listen_port}; if command -v ufw >/dev/null 2>&1; then ufw allow "$listen_port"/tcp >/dev/null 2>&1; fi; if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port="$listen_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
     echo -e "${GREEN}✅ ShadowTLS ($st_latest) 安装成功！已挂载在 ${up_port} 上层。${RESET}"; sleep 2
 }
 
@@ -341,7 +265,19 @@ unified_node_manager() {
     done
 }
 
-nat_vps_optimization() { clear; echo -e "${CYAN}========= NAT 小鸡全方位极限优化 =========${RESET}"; if command -v chattr >/dev/null 2>&1; then chattr -i /etc/resolv.conf 2>/dev/null; fi; echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 2606:4700:4700::1111" > /etc/resolv.conf; if command -v chattr >/dev/null 2>&1; then chattr +i /etc/resolv.conf 2>/dev/null; fi; if ! grep -q "swap" /etc/fstab; then rm -f /var/swap; if dd if=/dev/zero of=/var/swap bs=1M count=512 status=none 2>/dev/null; then chmod 600 /var/swap; mkswap /var/swap >/dev/null 2>&1; swapon /var/swap >/dev/null 2>&1; echo "/var/swap swap swap defaults 0 0" >> /etc/fstab; echo -e "${GREEN}✅ 512MB Swap 创建成功！${RESET}"; elif dd if=/dev/zero of=/var/swap bs=1M count=256 status=none 2>/dev/null; then chmod 600 /var/swap; mkswap /var/swap >/dev/null 2>&1; swapon /var/swap >/dev/null 2>&1; echo "/var/swap swap swap defaults 0 0" >> /etc/fstab; echo -e "${YELLOW}✅ 降级创建 256MB Swap！${RESET}"; else rm -f /var/swap; echo -e "${YELLOW}⚠️ 磁盘满跳过Swap。${RESET}"; fi; fi; sed -i 's/^#SystemMaxUse=.*/SystemMaxUse=50M/g' /etc/systemd/journald.conf; systemctl restart systemd-journald 2>/dev/null; sed -i 's/^#\?ClientAliveInterval.*/ClientAliveInterval 30/g' /etc/ssh/sshd_config; sed -i 's/^#\?ClientAliveCountMax.*/ClientAliveCountMax 3/g' /etc/ssh/sshd_config; systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; rm -f /etc/sysctl.d/99-bbr.conf /etc/sysctl.d/99-tfo.conf; cat > "$NAT_CONF_FILE" << EOF
+# ==========================================================
+# NAT 小鸡与常规内核调优 (引入终极发包控制与PMTU黑洞规避)
+# ==========================================================
+nat_vps_optimization() {
+    clear; echo -e "${CYAN}========= NAT 小鸡全方位极限优化 =========${RESET}"
+    if command -v chattr >/dev/null 2>&1; then chattr -i /etc/resolv.conf 2>/dev/null; fi
+    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 2606:4700:4700::1111" > /etc/resolv.conf
+    if command -v chattr >/dev/null 2>&1; then chattr +i /etc/resolv.conf 2>/dev/null; fi
+    if ! grep -q "swap" /etc/fstab; then rm -f /var/swap; if dd if=/dev/zero of=/var/swap bs=1M count=512 status=none 2>/dev/null; then chmod 600 /var/swap; mkswap /var/swap >/dev/null 2>&1; swapon /var/swap >/dev/null 2>&1; echo "/var/swap swap swap defaults 0 0" >> /etc/fstab; echo -e "${GREEN}✅ 512MB Swap 创建成功！${RESET}"; elif dd if=/dev/zero of=/var/swap bs=1M count=256 status=none 2>/dev/null; then chmod 600 /var/swap; mkswap /var/swap >/dev/null 2>&1; swapon /var/swap >/dev/null 2>&1; echo "/var/swap swap swap defaults 0 0" >> /etc/fstab; echo -e "${YELLOW}✅ 降级创建 256MB Swap！${RESET}"; else rm -f /var/swap; echo -e "${YELLOW}⚠️ 磁盘满跳过Swap。${RESET}"; fi; fi
+    sed -i 's/^#SystemMaxUse=.*/SystemMaxUse=50M/g' /etc/systemd/journald.conf; systemctl restart systemd-journald 2>/dev/null
+    sed -i 's/^#\?ClientAliveInterval.*/ClientAliveInterval 30/g' /etc/ssh/sshd_config; sed -i 's/^#\?ClientAliveCountMax.*/ClientAliveCountMax 3/g' /etc/ssh/sshd_config; systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+    rm -f /etc/sysctl.d/99-bbr.conf /etc/sysctl.d/99-tfo.conf
+    cat > "$NAT_CONF_FILE" << EOF
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 3
@@ -350,13 +286,20 @@ net.ipv4.tcp_wmem = 4096 16384 16777216
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_notsent_lowat = 16384
 net.core.somaxconn = 8192
 fs.file-max = 262144
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-sysctl -p "$NAT_CONF_FILE" >/dev/null 2>&1 || true; echo -e "${GREEN}✅ NAT 优化完毕！${RESET}"; sleep 2; }
-smart_optimization() { local rmem_max="67108864"; local somaxconn="32768"; local file_max="1048576"; rm -f /etc/sysctl.d/99-tfo.conf /etc/sysctl.d/99-nat.conf; cat > "$CONF_FILE" << EOF
+    sysctl -p "$NAT_CONF_FILE" >/dev/null 2>&1 || true; echo -e "${GREEN}✅ NAT 优化完毕！PMTU 黑洞拦截已启动。${RESET}"; sleep 2
+}
+
+smart_optimization() {
+    local rmem_max="67108864"; local somaxconn="32768"; local file_max="1048576"
+    rm -f /etc/sysctl.d/99-tfo.conf /etc/sysctl.d/99-nat.conf
+    cat > "$CONF_FILE" << EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = $rmem_max
@@ -370,9 +313,16 @@ net.core.netdev_max_backlog = $somaxconn
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_notsent_lowat = 16384
 fs.file-max = $file_max
 EOF
-sysctl --system >/dev/null 2>&1 || true; echo -e "${GREEN}✅ 常规调参完成！${RESET}"; }
+    sysctl --system >/dev/null 2>&1 || true; echo -e "${GREEN}✅ 常规极限网络调参完成！${RESET}"; sleep 2
+}
+
+# ==========================================================
+# 守护、清理与热更
+# ==========================================================
 run_daemon_check() { [[ $(systemctl list-units --all -t service | grep -q "ss-rust.service") ]] && { systemctl is-active --quiet ss-rust || systemctl restart ss-rust 2>/dev/null; }; [[ $(systemctl list-units --all -t service | grep -q "xray.service") ]] && { systemctl is-active --quiet xray || systemctl restart xray 2>/dev/null; }; for s in $(systemctl list-units --type=service --all --no-legend | grep "shadowtls-" | awk '{print $1}'); do systemctl is-active --quiet "$s" || systemctl restart "$s" 2>/dev/null; done; }
 auto_clean() { local is_silent=$1; if command -v apt-get >/dev/null 2>&1; then apt-get autoremove -yqq >/dev/null 2>&1; apt-get clean -qq >/dev/null 2>&1; fi; rm -rf /root/.cache/* /tmp/*.tar.xz /tmp/shadow-tls /tmp/ssserver /tmp/ssr_update.sh /tmp/xray* /tmp/tmp.json 2>/dev/null; [[ "$is_silent" != "silent" ]] && echo -e "${GREEN}✅ 垃圾清理完毕！${RESET}"; }
 hot_update_components() {
@@ -399,7 +349,7 @@ total_uninstall() {
     systemctl daemon-reload; echo -e "${GREEN}✅ 完美无痕卸载完成！系统已彻底洁净退水。${RESET}"; exit 0
 }
 
-opt_menu() { clear; echo -e "${CYAN}========= 网络优化与清理中心 =========${RESET}\n${YELLOW} 1.${RESET} 常规机器极致 BBR 网络调参\n${GREEN} 2. NAT 小鸡专属极限优化 (防断流 / 智能Swap / 锁DNS / 防爆盘)${RESET}\n${CYAN}--------------------------------------------${RESET}\n${YELLOW} 3.${RESET} 手动清理系统垃圾与冗余日志\n 0. 返回主菜单"; read -rp "输入数字 [0-3]: " opt_num; case "$opt_num" in 1) smart_optimization ;; 2) nat_vps_optimization ;; 3) auto_clean ;; 0) return ;; esac; }
+opt_menu() { clear; echo -e "${CYAN}========= 网络优化与清理中心 =========${RESET}\n${YELLOW} 1.${RESET} 常规机器极致内核调参 (含PMTU规避与防膨胀)\n${GREEN} 2. NAT 小鸡专属极限优化 (防断流 / 智能Swap / 锁DNS / 防爆盘)${RESET}\n${CYAN}--------------------------------------------${RESET}\n${YELLOW} 3.${RESET} 手动清理系统垃圾与冗余日志\n 0. 返回主菜单"; read -rp "输入数字 [0-3]: " opt_num; case "$opt_num" in 1) smart_optimization ;; 2) nat_vps_optimization ;; 3) auto_clean ;; 0) return ;; esac; }
 
 sys_menu() { clear; echo -e "${CYAN}========= 系统基础与极客管理 =========${RESET}\n${YELLOW} 1.${RESET} 一键修改 SSH 安全端口\n${YELLOW} 2.${RESET} 一键修改 Root 密码\n${YELLOW} 3.${RESET} 服务器时间防偏移同步\n${YELLOW} 4.${RESET} SSH 密钥登录管理中心 (防爆破神器)\n${GREEN} 5. 原生 Cloudflare DDNS 解析模块${RESET}\n${CYAN}--------------------------------------------${RESET}\n${YELLOW} 6.${RESET} 手动热替换升级核心组件\n${YELLOW} 7.${RESET} 手动更新 SSR 管理脚本本身\n 0. 返回主菜单"; read -rp "输入数字 [0-7]: " sys_num; case "$sys_num" in 1) change_ssh_port ;; 2) change_root_password ;; 3) sync_server_time ;; 4) ssh_key_menu ;; 5) cf_ddns_menu ;; 6) hot_update_components ;; 7) update_script ;; 0) return ;; esac; }
 
@@ -414,8 +364,8 @@ main_menu() {
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${GREEN} 4. 🔰 统一节点管控中心 (节点查看 / 靶向核爆)${RESET}"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (NAT专属压榨 / 垃圾清理)"
-    echo -e "${YELLOW} 6.${RESET} 极客系统底层管控 (DDNS解析 / 系统管理)"
+    echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (内核极限压榨 / 垃圾清理)"
+    echo -e "${YELLOW} 6.${RESET} 极客系统底层管控 (DDNS云解析 / 系统安全管理)"
     echo -e "${RED} 7. 完美无痕毁灭性卸载中心 (退水清扫)${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 退出脚本"
@@ -427,6 +377,7 @@ main_menu() {
 check_env
 install_global_command
 
+# 底层调度器与外部分发接口
 if [[ -n "${1:-}" ]]; then
     case "$1" in
         bbr)          smart_optimization ;;
