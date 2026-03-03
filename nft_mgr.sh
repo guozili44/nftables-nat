@@ -3,34 +3,8 @@
 # ==========================================
 # nftables 端口转发管理面板 (Pro 稳定优化版 + 失效通知)
 # ==========================================
-# ✅ 新增：失效通知（优先使用 GitHub Actions 自带的“工作流失败邮件通知”）
-# ------------------------------------------------------------------
-# 思路：
-#   - GitHub Actions 可以对“你触发的工作流运行”发送通知邮件，并可设置“仅失败时通知”。
-#   - 因此：让脚本在检测到“转发失效/解析失败/规则未生效”时在“严格模式”退出非 0，
-#     工作流即失败 -> GitHub 按你的通知设置发邮件。
-#
-# 使用方式（推荐）：
-#   1) 在 VPS 上开启本地 cron（脚本内置菜单可添加）——用于自动更新域名解析（默认不严格）。
-#   2) 另外用 GitHub Actions 定时 SSH 到 VPS 执行：
-#        sudo /usr/local/bin/nftmgr --cron-strict
-#        sudo /usr/local/bin/nftmgr --healthcheck
-#      只要任一步失败，GitHub 会按你的设置发送“失败通知邮件”。
-#
-# 本脚本的“失效”定义（严格模式下触发失败）：
-#   - 规则目标域名解析失败（连续/瞬时都算本次失败）
-#   - 规则中记录的 last_ip 与当前域名解析 IP 不一致（说明转发可能已漂移/失效）
-#   - nft 规则语法校验失败 / 应用失败 / 表缺失
-#   - IPv4 转发未开启（net.ipv4.ip_forward != 1）
-#
-# 严格模式启用方式：
-#   - 运行参数：--cron-strict 或 --healthcheck（健康检查默认严格）
-#   - 或环境变量：NFTMGR_STRICT=1
-#
-# 配置文件格式（向下兼容）：
-#   lport|target_addr|target_port|last_ip|proto
-#   proto: tcp / udp / both
-#   旧版没有 proto 字段时，默认 both。
+# ==========================================
+# nftables 端口转发管理面板 (Pro 稳定优化版)
 # ==========================================
 
 set -o pipefail
@@ -63,16 +37,6 @@ CMD_NAME="nftmgr"
 RAW_URL="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
 PROXY_URL="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
 
-# --------------------------
-# 运行模式 & 通知
-# --------------------------
-IN_GITHUB_ACTIONS=0
-[[ "${GITHUB_ACTIONS:-}" == "true" ]] && IN_GITHUB_ACTIONS=1
-
-STRICT_MODE=0
-if [[ "${NFTMGR_STRICT:-}" == "1" || "${NFTMGR_STRICT:-}" == "true" ]]; then
-    STRICT_MODE=1
-fi
 
 # --------------------------
 # 设置读写（用于持久化模式开关）
@@ -104,34 +68,10 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
-# --------------------------
-# GitHub Actions 注释（可选）
-# --------------------------
-gha_notice() { [[ $IN_GITHUB_ACTIONS -eq 1 ]] && echo "::notice::${*}"; }
-gha_warn()   { [[ $IN_GITHUB_ACTIONS -eq 1 ]] && echo "::warning::${*}"; }
-gha_error()  { [[ $IN_GITHUB_ACTIONS -eq 1 ]] && echo "::error::${*}"; }
-
-# --------------------------
-# 基础工具
-# --------------------------
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-script_realpath() {
-    realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0"
-}
-
 msg_ok()   { echo -e "${GREEN}$*${PLAIN}"; }
 msg_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
 msg_err()  { echo -e "${RED}$*${PLAIN}"; }
 
-die_strict() {
-    # die_strict "message" [exit_code]
-    local m="$1"
-    local code="${2:-1}"
-    gha_error "$m"
-    msg_err "$m"
-    return "$code"
-}
 
 # --------------------------
 # 环境与依赖
@@ -929,13 +869,11 @@ view_and_del_forward() { with_lock view_and_del_forward_impl; }
 # --------------------------
 ddns_update_impl() {
     local changed=0
-    local had_error=0
     local temp_file
     temp_file="$(mktemp /tmp/nftmgr-ddns.XXXXXX)"
 
     [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR"
     local today_log="$LOG_DIR/$(date '+%Y-%m-%d').log"
-    local alert_log="$LOG_DIR/alerts-$(date '+%Y-%m-%d').log"
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ -z "$line" ]]; then
@@ -962,8 +900,6 @@ ddns_update_impl() {
         if [[ -z "$current_ip" ]] && ! is_ipv4 "$addr"; then
             # 域名解析失败：记录并（严格模式）判定失败
             echo "[$(date '+%H:%M:%S')] [ERROR] 端口 ${lp}: 域名 ${addr} 解析失败（保持 last_ip=${last_ip:-N/A}）" >> "$today_log"
-            echo "[$(date '+%H:%M:%S')] [ALERT] 端口 ${lp}: 域名 ${addr} 解析失败" >> "$alert_log"
-            had_error=1
             echo "${lp}|${addr}|${tp}|${last_ip}|${proto}" >> "$temp_file"
             continue
         fi
@@ -982,111 +918,16 @@ ddns_update_impl() {
     if [[ $changed -eq 1 ]]; then
         if ! apply_rules_impl; then
             echo "[$(date '+%H:%M:%S')] [ERROR] 应用 nft 规则失败（已保留配置，但规则未更新）" >> "$today_log"
-            echo "[$(date '+%H:%M:%S')] [ALERT] 应用 nft 规则失败" >> "$alert_log"
-            had_error=1
         fi
     fi
 
     # 日志保留
     find "$LOG_DIR" -type f -name "*.log" -mtime +7 -exec rm -f {} \; 2>/dev/null || true
-
-    if [[ $STRICT_MODE -eq 1 && $had_error -eq 1 ]]; then
-        die_strict "DDNS 更新过程中发现失效项（解析失败/规则应用失败）。详见 ${alert_log}" 2
-        return 2
-    fi
     return 0
 }
 
 ddns_update() { with_lock ddns_update_impl; }
 
-# --------------------------
-# 健康检查（严格模式：用于 GitHub Actions 触发失败通知）
-# --------------------------
-healthcheck_impl() {
-    local had_error=0
-
-    if ! have_cmd nft; then
-        die_strict "未找到 nft 命令，无法检查规则是否生效。" 2
-        return 2
-    fi
-
-    local fwd
-    fwd="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
-    if [[ "$fwd" != "1" ]]; then
-        gha_error "IPv4 转发未开启: net.ipv4.ip_forward=${fwd}"
-        msg_err "IPv4 转发未开启: net.ipv4.ip_forward=${fwd}"
-        had_error=1
-    fi
-
-    # 表是否存在
-    if ! nft list table ip nft_mgr_nat >/dev/null 2>&1; then
-        gha_error "nft 表缺失: table ip nft_mgr_nat（规则可能未加载或已被其他规则覆盖）"
-        msg_err "nft 表缺失: table ip nft_mgr_nat（规则可能未加载或已被其他规则覆盖）"
-        had_error=1
-    fi
-
-    # 读取 prerouting 规则用于校验
-    local chain
-    chain="$(nft -a list chain ip nft_mgr_nat prerouting 2>/dev/null || true)"
-
-    # 检查每条规则：域名是否可解析；last_ip 是否与当前解析一致；nft 是否确实 dnat 到 last_ip
-    while IFS='|' read -r lp addr tp last_ip proto; do
-        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-        proto="$(normalize_proto "$proto")"
-        is_port "$lp" || continue
-        is_port "$tp" || continue
-
-        local current_ip
-        current_ip="$(get_ip "$addr")"
-
-        if [[ -z "$current_ip" ]] && ! is_ipv4 "$addr"; then
-            gha_error "端口 ${lp}: 域名 ${addr} 解析失败"
-            msg_err "端口 ${lp}: 域名 ${addr} 解析失败"
-            had_error=1
-            continue
-        fi
-
-        # last_ip 为空/不合法
-        if [[ -z "$last_ip" ]] || ! is_ipv4 "$last_ip"; then
-            gha_error "端口 ${lp}: last_ip 缺失或非法（建议先运行 --cron 或重新添加规则）"
-            msg_err "端口 ${lp}: last_ip 缺失或非法（建议先运行 --cron 或重新添加规则）"
-            had_error=1
-        fi
-
-        # 域名 IP 已变化 -> 转发可能失效（期望由 --cron 更新）
-        if [[ -n "$current_ip" && -n "$last_ip" && "$current_ip" != "$last_ip" ]]; then
-            gha_error "端口 ${lp}: 域名当前IP=${current_ip} 与 last_ip=${last_ip} 不一致（转发可能已失效，需运行 --cron 更新）"
-            msg_err "端口 ${lp}: 域名当前IP=${current_ip} 与 last_ip=${last_ip} 不一致（转发可能已失效，需运行 --cron 更新）"
-            had_error=1
-        fi
-
-        # 校验 nft chain 中是否存在预期 DNAT 规则（新语法：tcp/udp dport ... dnat to ip:port）
-        if [[ -n "$last_ip" ]]; then
-            case "$proto" in
-                tcp)
-                    echo "$chain" | grep -qE "tcp dport ${lp}.*dnat to ${last_ip}:${tp}" || { gha_error "端口 ${lp}: 未找到预期 TCP DNAT"; msg_err "端口 ${lp}: 未找到预期 TCP DNAT"; had_error=1; }
-                    ;;
-                udp)
-                    echo "$chain" | grep -qE "udp dport ${lp}.*dnat to ${last_ip}:${tp}" || { gha_error "端口 ${lp}: 未找到预期 UDP DNAT"; msg_err "端口 ${lp}: 未找到预期 UDP DNAT"; had_error=1; }
-                    ;;
-                both)
-                    echo "$chain" | grep -qE "tcp dport ${lp}.*dnat to ${last_ip}:${tp}" || { gha_error "端口 ${lp}: 未找到预期 TCP DNAT"; msg_err "端口 ${lp}: 未找到预期 TCP DNAT"; had_error=1; }
-                    echo "$chain" | grep -qE "udp dport ${lp}.*dnat to ${last_ip}:${tp}" || { gha_error "端口 ${lp}: 未找到预期 UDP DNAT"; msg_err "端口 ${lp}: 未找到预期 UDP DNAT"; had_error=1; }
-                    ;;
-            esac
-        fi
-    done < "$CONFIG_FILE"
-
-    if [[ $had_error -eq 1 ]]; then
-        return 2
-    fi
-
-    gha_notice "健康检查通过：未发现转发失效项。"
-    msg_ok "✅ 健康检查通过：未发现转发失效项。"
-    return 0
-}
-
-healthcheck() { with_lock healthcheck_impl; }
 
 # --------------------------
 # 定时任务管理（DDNS）
@@ -1309,21 +1150,20 @@ uninstall_script() { with_lock uninstall_script_impl; }
 main_menu() {
     clear
     echo -e "${GREEN}==========================================${PLAIN}"
-    echo -e "${GREEN} nftables 端口转发管理面板 (Pro + 失效通知) ${PLAIN}"
+    echo -e "${GREEN}     nftables 端口转发管理面板 (Pro)      ${PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
     echo "1. 开启 BBR + 转发 + 自启动 (稳定/性能)"
     echo "2. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
     echo "3. 流量看板与规则管理 (查看/删除)"
     echo "4. 清空所有转发规则"
     echo "5. 管理 DDNS 定时监控与日志"
-    echo "6. 健康检查（严格模式：用于失效通知）"
-    echo "7. 持久化兼容设置（解决提示：未写入持久性规则）"
-    echo "8. 从 GitHub 更新当前脚本 (安全更新)"
-    echo "9. 一键完全卸载本脚本"
+    echo "6. 持久化兼容设置（解决提示：未写入持久性规则）"
+    echo "7. 从 GitHub 更新当前脚本 (安全更新)"
+    echo "8. 一键完全卸载本脚本"
     echo "0. 退出面板"
     echo "------------------------------------------"
     local choice
-    read -rp "请选择操作 [0-9]: " choice
+    read -rp "请选择操作 [0-8]: " choice
 
     case "$choice" in
         1) optimize_system ;;
@@ -1331,10 +1171,9 @@ main_menu() {
         3) view_and_del_forward ;;
         4) clear_all_rules ;;
         5) manage_cron ;;
-        6) STRICT_MODE=1; healthcheck ;;
-        7) persist_menu ;;
-        8) update_script ;;
-        9) uninstall_script ;;
+        6) persist_menu ;;
+        7) update_script ;;
+        8) uninstall_script ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
@@ -1362,23 +1201,9 @@ case "${1:-}" in
         exit $?
         ;;
     --cron)
-        # 默认 cron：非严格（尽量不中断服务）
+        # DDNS 更新（温和模式：失败只记录日志，不中断）
         ddns_update
         exit $?
-        ;;
-    --cron-strict)
-        STRICT_MODE=1
-        ddns_update
-        exit $?
-        ;;
-    --healthcheck|--check)
-        STRICT_MODE=1
-        healthcheck
-        exit $?
-        ;;
-    --strict)
-        STRICT_MODE=1
-        shift
         ;;
 esac
 
