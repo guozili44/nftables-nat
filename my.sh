@@ -5,7 +5,7 @@
 # GitHub 更新地址：
 #   https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
 #
-# 版本：v1.0.0  (build 2026-03-04)
+# 版本：v1.0.0  (build 2026-03-04+dns-manual)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 # ============================================================
 
@@ -339,6 +339,84 @@ EOF
     systemctl restart systemd-resolved 2>/dev/null || true
 }
 
+
+dns_apply_resolvconf_custom() {
+    # dns_apply_resolvconf_custom set|lock <dns1> [dns2...]
+    local lock_mode="$1"; shift
+    # 解除不可变
+    if have_cmd chattr; then chattr -i /etc/resolv.conf 2>/dev/null || true; fi
+
+    : > /etc/resolv.conf
+    local ip
+    for ip in "$@"; do
+        [[ -n "$ip" ]] && echo "nameserver $ip" >> /etc/resolv.conf
+    done
+
+    if [[ "$lock_mode" == "lock" ]] && have_cmd chattr; then
+        chattr +i /etc/resolv.conf 2>/dev/null || true
+    fi
+}
+
+dns_apply_systemd_resolved_custom() {
+    # dns_apply_systemd_resolved_custom <dns1> [dns2...]
+    local dns_list="$*"
+    mkdir -p /etc/systemd/resolved.conf.d
+    cat > "$RESOLVED_DROPIN" << EOF
+[Resolve]
+DNS=${dns_list}
+FallbackDNS=9.9.9.9 149.112.112.112
+DNSSEC=no
+EOF
+    chmod 644 "$RESOLVED_DROPIN" 2>/dev/null || true
+    systemctl restart systemd-resolved 2>/dev/null || true
+}
+
+dns_manual_set() {
+    dns_backup
+    clear
+    echo -e "${CYAN}========= 手动设置 DNS =========${RESET}"
+    echo -e "请输入 DNS 服务器地址（空格/逗号分隔），例如：${YELLOW}1.1.1.1 8.8.8.8${RESET}"
+    echo -e "支持 IPv4/IPv6；留空回车取消。\n"
+    local dns_line
+    read -rp "DNS: " dns_line
+    dns_line="${dns_line//,/ }"
+    dns_line="$(echo "$dns_line" | xargs 2>/dev/null || echo "$dns_line")"
+    [[ -z "$dns_line" ]] && echo -e "${YELLOW}已取消。${RESET}" && return 1
+
+    local arr=()
+    local ip
+    for ip in $dns_line; do
+        if is_ipv4 "$ip" || [[ "$ip" == *:* ]]; then
+            arr+=("$ip")
+        else
+            echo -e "${RED}❌ 无效 DNS 地址: ${ip}${RESET}"
+            return 1
+        fi
+    done
+    [[ "${#arr[@]}" -eq 0 ]] && echo -e "${RED}❌ 未输入有效 DNS。${RESET}" && return 1
+
+    local lock_mode="set"
+    if [[ ! -L /etc/resolv.conf ]]; then
+        read -rp "是否锁定 /etc/resolv.conf（chattr +i，防止被覆盖）? [y/N]: " yn
+        [[ "$yn" =~ ^[Yy]$ ]] && lock_mode="lock"
+    fi
+
+    if [[ -L /etc/resolv.conf ]]; then
+        if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+            dns_apply_systemd_resolved_custom "${arr[@]}"
+        else
+            echo -e "${YELLOW}⚠️ 检测到 /etc/resolv.conf 为 symlink，但 systemd-resolved 未运行。"
+            echo -e "   建议：启用 systemd-resolved 或将 resolv.conf 变为普通文件后再设置。${RESET}"
+            return 1
+        fi
+    else
+        dns_apply_resolvconf_custom "$lock_mode" "${arr[@]}"
+    fi
+    return 0
+}
+
+
+
 dns_set_or_lock() {
     # dns_set_or_lock set|lock
     local mode="$1"
@@ -417,21 +495,24 @@ dns_status() {
     sed -n '1,30p' /etc/resolv.conf 2>/dev/null || true
 }
 
+
 dns_menu() {
     while true; do
         clear
         echo -e "${CYAN}========= DNS 管理中心 =========${RESET}"
         echo -e "${YELLOW} 1.${RESET} 查看 DNS 状态"
-        echo -e "${YELLOW} 2.${RESET} 设置 DNS（不锁）"
-        echo -e "${YELLOW} 3.${RESET} 锁定 DNS（尽可能稳健：symlink 则走 systemd-resolved）"
-        echo -e "${YELLOW} 4.${RESET} 一键解锁并恢复（回滚至备份）"
+        echo -e "${YELLOW} 2.${RESET} 设置 DNS（不锁，默认）"
+        echo -e "${YELLOW} 3.${RESET} 手动设置 DNS（自定义）"
+        echo -e "${YELLOW} 4.${RESET} 锁定 DNS（尽可能稳健：symlink 则走 systemd-resolved）"
+        echo -e "${YELLOW} 5.${RESET} 一键解锁并恢复（回滚至备份）"
         echo -e " 0. 返回"
-        read -rp "输入 [0-4]: " dn
+        read -rp "输入 [0-5]: " dn
         case "$dn" in
             1) clear; dns_status; echo ""; read -n 1 -s -r -p "按任意键返回..." ;;
             2) dns_set_or_lock "set"; echo -e "${GREEN}✅ DNS 已设置。${RESET}"; sleep 2 ;;
-            3) dns_set_or_lock "lock"; echo -e "${GREEN}✅ DNS 已锁定/固定。${RESET}"; sleep 2 ;;
-            4) dns_unlock_restore; echo -e "${GREEN}✅ 已解锁并恢复。${RESET}"; sleep 2 ;;
+            3) dns_manual_set && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"; sleep 2 ;;
+            4) dns_set_or_lock "lock"; echo -e "${GREEN}✅ DNS 已锁定/固定。${RESET}"; sleep 2 ;;
+            5) dns_unlock_restore; echo -e "${GREEN}✅ 已解锁并恢复。${RESET}"; sleep 2 ;;
             0) return ;;
         esac
     done
@@ -2561,24 +2642,8 @@ add_forward_impl() {
 add_forward() { with_lock add_forward_impl; }
 
 # --------------------------
-# 流量看板与规则管理（删除）
+# 规则管理（查看/删除）
 # --------------------------
-get_traffic_snapshot() { nft -a list table ip nft_mgr_nat 2>/dev/null || true; }
-
-extract_bytes_for_prerouting() {
-    # args: snapshot proto lp ip tp
-    local snapshot="$1" proto="$2" lp="$3" ip="$4" tp="$5"
-    # match: "<proto> dport <lp> ... dnat to <ip>:<tp>"
-    echo "$snapshot" | grep -E "${proto} dport ${lp}.*dnat to ${ip}:${tp}" | sed -n 's/.*bytes \([0-9]\+\).*/\1/p' | head -n 1
-}
-
-extract_bytes_for_postrouting() {
-    # args: snapshot proto ip tp
-    local snapshot="$1" proto="$2" ip="$3" tp="$4"
-    # match: "ip daddr <ip> <proto> dport <tp> ... masquerade"
-    echo "$snapshot" | grep -E "ip daddr ${ip} ${proto} dport ${tp}.*masquerade" | sed -n 's/.*bytes \([0-9]\+\).*/\1/p' | head -n 1
-}
-
 view_and_del_forward_impl() {
     clear
     if [[ ! -s "$CONFIG_FILE" ]]; then
@@ -2587,15 +2652,10 @@ view_and_del_forward_impl() {
         return 0
     fi
 
-    local traffic_data
-    traffic_data="$(get_traffic_snapshot)"
-
-    local total_in=0
-    local total_out=0
-
-    echo -e "${CYAN}=========================== 实时流量看板 ===========================${PLAIN}"
-    printf "%-4s | %-6s | %-5s | %-16s | %-6s | %-10s | %-10s\n" "序号" "本地" "协议" "目标地址" "目标" "接收(RX)" "发送(TX)"
-    echo "--------------------------------------------------------------------"
+    # 规则列表（已移除实时流量看板 / Traffic Counters）
+    echo -e "${CYAN}=========================== 规则管理 (查看/删除) ===========================${PLAIN}"
+    printf "%-4s | %-6s | %-5s | %-32s | %-6s\n" "序号" "本地" "协议" "目标地址" "目标"
+    echo "--------------------------------------------------------------------------"
 
     local i=1
     while IFS='|' read -r lp addr tp last_ip proto; do
@@ -2604,50 +2664,13 @@ view_and_del_forward_impl() {
         is_port "$lp" || continue
         is_port "$tp" || continue
 
-        local in_bytes out_bytes
-        # 计算 RX/TX：按协议分别匹配并相加
-        local ip_now
-        ip_now="$last_ip"
-        [[ -z "$ip_now" ]] && ip_now="$(get_ip "$addr")"
-        [[ -z "$ip_now" ]] && ip_now="0.0.0.0"
-
-        in_bytes=0
-        out_bytes=0
-
-        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
-            local ib ob
-            ib="$(extract_bytes_for_prerouting "$traffic_data" "tcp" "$lp" "$ip_now" "$tp")"; [[ -z "$ib" ]] && ib=0
-            ob="$(extract_bytes_for_postrouting "$traffic_data" "tcp" "$ip_now" "$tp")"; [[ -z "$ob" ]] && ob=0
-            in_bytes=$((in_bytes + ib))
-            out_bytes=$((out_bytes + ob))
-        fi
-        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
-            local ib ob
-            ib="$(extract_bytes_for_prerouting "$traffic_data" "udp" "$lp" "$ip_now" "$tp")"; [[ -z "$ib" ]] && ib=0
-            ob="$(extract_bytes_for_postrouting "$traffic_data" "udp" "$ip_now" "$tp")"; [[ -z "$ob" ]] && ob=0
-            in_bytes=$((in_bytes + ib))
-            out_bytes=$((out_bytes + ob))
-        fi
-        [[ -z "$in_bytes" ]] && in_bytes=0
-        [[ -z "$out_bytes" ]] && out_bytes=0
-
-        total_in=$((total_in + in_bytes))
-        total_out=$((total_out + out_bytes))
-
-        local in_str out_str
-        in_str="$(format_bytes "$in_bytes")"
-        out_str="$(format_bytes "$out_bytes")"
-
-        local short_addr="${addr:0:15}"
-        printf "%-4s | %-6s | %-5s | %-16s | %-6s | %-10s | %-10s\n" "$i" "$lp" "$proto" "$short_addr" "$tp" "$in_str" "$out_str"
+        local short_addr="${addr:0:31}"
+        printf "%-4s | %-6s | %-5s | %-32s | %-6s\n" "$i" "$lp" "$proto" "$short_addr" "$tp"
         ((i++))
     done < "$CONFIG_FILE"
 
-    echo "--------------------------------------------------------------------"
-    echo -e "${CYAN}[ 全局总流量 ]  接收(RX): ${GREEN}$(format_bytes "$total_in")${CYAN}  |  发送(TX): ${YELLOW}$(format_bytes "$total_out")${PLAIN}"
-    echo -e "${CYAN}====================================================================${PLAIN}"
-
-    echo -e "\n${YELLOW}提示: 输入规则前面的【序号】即可删除，输入【0】或直接按回车返回。${PLAIN}"
+    echo "--------------------------------------------------------------------------"
+echo -e "\n${YELLOW}提示: 输入规则前面的【序号】即可删除，输入【0】或直接按回车返回。${PLAIN}"
     local action
     read -rp "请选择操作: " action
 
@@ -2964,7 +2987,7 @@ main_menu() {
     echo -e "${GREEN}==========================================${PLAIN}"
     echo "1. 开启 BBR + 转发 + 自启动 (稳定/性能)"
     echo "2. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
-    echo "3. 流量看板与规则管理 (查看/删除)"
+    echo "3. 规则管理 (查看/删除)"
     echo "4. 清空所有转发规则"
     echo "5. 管理 DDNS 定时监控与日志"
     echo "0. 退出面板"
