@@ -18,9 +18,8 @@
   0. 退出管理脚本
 ==========================================
 
-(注：进入子模块后，将展示对应节点配置、系统调优或端口转发规则的详细操作菜单。)
-📥 一键安装指南
-支持全新的主流 Linux 发行版（Debian / Ubuntu / CentOS / AlmaLinux 等）。请使用 root 用户运行以下命令进行一键安装。若系统未自带 curl，请使用下方的 wget 备用命令。
+📥 综合脚本一键安装指南
+支持全新的主流 Linux 发行版（Debian / Ubuntu / CentOS / AlmaLinux 等）。请使用 root 用户运行以下命令进行一键安装。
 🌍 海外服务器 (推荐官方直连)
 curl -fsSL -o my.sh https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh && chmod +x my.sh && bash my.sh
 
@@ -35,9 +34,19 @@ curl -fsSL -o my.sh https://ghproxy.net/https://raw.githubusercontent.com/guozil
 > wget -O my.sh https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh && chmod +x my.sh && bash my.sh
 > 
 > 
-🛠️ 如何使用
-首次运行上述安装命令后，脚本会自动完成系统环境初始化，并将自身配置为全局快捷命令。
-以后在任何目录下的终端中，只需输入以下命令即可随时唤出综合管理主菜单：
-my
+🧩 独立模块安装 (可选)
+如果您不需要综合管理面板，也可以选择单独安装 SSR 节点脚本或 NFt 端口转发脚本：
+⚡ 单独使用 SSR 脚本
+安装后，调出面板的快捷命令为 ssr
+curl -Ls https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/ssr.sh -o /usr/local/bin/ssr.sh && chmod +x /usr/local/bin/ssr.sh && /usr/local/bin/ssr.sh
 
-这份介绍文档现在既有详细的安装防错指导（备用命令），又有非常直观的功能展示（菜单预览）。是否还需要我为你补充其他模块（例如 SSR 节点管理子菜单）的具体预览说明？
+🔄 单独使用 NFt 脚本
+安装后，调出面板的快捷命令为 nft
+curl -L https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh -o nft.sh && chmod +x nft.sh && ./nft.sh
+
+🛠️ 如何使用
+首次运行上述对应的安装命令后，脚本会自动完成系统环境初始化，并将自身配置为全局快捷命令。
+以后在任何目录下的终端中，只需输入对应的快捷命令即可随时唤出管理主菜单：
+ * 综合管理脚本快捷命令：my
+ * 独立 SSR 脚本快捷命令：ssr
+ * 独立 NFt 脚本快捷命令：nft
