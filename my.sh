@@ -1,11 +1,9 @@
 #!/bin/bash
 # ============================================================
-# 综合管理脚本：SSR 管理 + nftables 端口转发 (NFt)
+# 综合管理脚本：SSR + nftables
 # 快捷命令：my
-# GitHub 更新地址：
-#   https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-#
-# 版本：v1.0.0  (build 2026-03-04+dns-manual)
+# 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
+# 版本：v1.1.0  (build 2026-03-06+acd-smart)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 # ============================================================
 
@@ -19,7 +17,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # --------------------------
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="1.0.0"
+MY_VERSION="1.1.0"
 
 MY_INSTALL_DIR="/usr/local/lib/my"
 SSR_MODULE_FILE="${MY_INSTALL_DIR}/ssr_module.sh"
@@ -98,11 +96,7 @@ install_modules() {
 #   - 安全热更: 仅在有新版本时更新；下载到临时目录校验可运行后再原子替换
 #   - DNS 管理: 检测 /etc/resolv.conf 是否 symlink；提供一键解锁/恢复
 #
-# 全局命令:
-#   ssr [bbr|nat] [stable|perf]
-#   ssr clean | update | hot_upgrade | daily_task | daemon_check
-#   ssr ddns | rmddns | nuke <service>
-#   ssr dns [status|set|lock|unlock]
+# 命令：ssr auto|regular|nat [stable|extreme] / ssr dns ...
 # ==============================================================================
 
 set -o pipefail
@@ -113,7 +107,7 @@ readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
 
-readonly SCRIPT_VERSION="21.0-Stable-Perf-Profiles"
+readonly SCRIPT_VERSION="21.2-Auto-Tuned"
 
 # Sysctl profile files (互斥写入)
 readonly CONF_FILE="/etc/sysctl.d/99-ssr-net.conf"
@@ -123,14 +117,15 @@ readonly NAT_CONF_FILE="/etc/sysctl.d/99-ssr-nat.conf"
 readonly DDNS_CONF="/usr/local/etc/ssr_ddns.conf"
 readonly DDNS_LOG="/var/log/ssr_ddns.log"
 
-# Cron / Task Lock (7.3)
 readonly LOCK_FILE="/var/lock/ssr.lock"
 
 # Meta (用于判断是否有新版本)
 readonly META_DIR="/usr/local/etc/ssr_meta"
 readonly META_FILE="${META_DIR}/versions.conf"
+readonly SWAP_MARK_FILE="${META_DIR}/swap_created_by_ssr"
+readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
+readonly JOURNALD_BACKUP_FILE="${META_DIR}/journald.conf.bak"
 
-# DNS backup & systemd-resolved drop-in (2.1)
 readonly DNS_BACKUP_DIR="/usr/local/etc/ssr_dns_backup"
 readonly DNS_META="${DNS_BACKUP_DIR}/meta.conf"
 readonly DNS_FILE_BAK="${DNS_BACKUP_DIR}/resolv.conf.bak"
@@ -179,6 +174,266 @@ meta_set() {
     fi
 }
 
+backup_file_once() {
+    local src="$1"; local bak="$2"
+    [[ -f "$src" ]] || return 0
+    [[ -f "$bak" ]] && return 0
+    mkdir -p "$(dirname "$bak")" 2>/dev/null || true
+    cp -a "$src" "$bak" 2>/dev/null || true
+}
+
+restore_file_if_present() {
+    local bak="$1"; local dst="$2"
+    [[ -f "$bak" ]] || return 0
+    cp -a "$bak" "$dst" 2>/dev/null || true
+}
+
+replace_or_append_line() {
+    local file="$1"; local regex="$2"; local newline="$3"
+    touch "$file" 2>/dev/null || return 1
+    if grep -qE "$regex" "$file" 2>/dev/null; then
+        sed -i "s|${regex}.*|${newline}|g" "$file"
+    else
+        printf '%s\n' "$newline" >> "$file"
+    fi
+}
+
+restart_ssh_safe() {
+    local cfg="/etc/ssh/sshd_config"
+    if have_cmd sshd && ! sshd -t -f "$cfg" >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️ sshd_config 校验失败，未重启 SSH。${RESET}"
+        return 1
+    fi
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+}
+
+system_memory_mb() {
+    awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null
+}
+
+system_cpu_count() {
+    getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1
+}
+
+is_private_ipv4() {
+    case "$1" in
+        10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+current_ipv4_for_route() {
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
+}
+
+detect_network_topology() {
+    local ip
+    ip="$(current_ipv4_for_route)"
+    [[ -n "$ip" ]] && is_private_ipv4 "$ip" && { echo nat; return 0; }
+    echo regular
+}
+
+detect_machine_tier() {
+    local mem cpu
+    mem="$(system_memory_mb)"
+    cpu="$(system_cpu_count)"
+    [[ -z "$mem" ]] && mem=1024
+    if (( mem < 1024 || cpu <= 1 )); then
+        echo tiny
+    elif (( mem < 4096 )); then
+        echo small
+    elif (( mem < 8192 )); then
+        echo medium
+    else
+        echo large
+    fi
+}
+
+profile_alias() {
+    case "$1" in
+        perf|extreme) echo perf ;;
+        stable) echo stable ;;
+        *) echo stable ;;
+    esac
+}
+
+profile_title() {
+    [[ "$(profile_alias "$1")" == "perf" ]] && echo "极致优化" || echo "稳定优先"
+}
+
+best_congestion_control() {
+    local avail
+    avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+    for cc in bbr cubic reno; do
+        echo " $avail " | grep -q " ${cc} " && { echo "$cc"; return 0; }
+    done
+    echo bbr
+}
+
+measure_host_latency_ms() {
+    local host="$1"
+    have_cmd ping || return 1
+    ping -4 -n -c 1 -W 1 "$host" 2>/dev/null | awk -F'time=' '/time=/{print $2}' | awk '{print int($1+0.5)}' | head -n 1
+}
+
+select_best_dns_pair() {
+    local mode="$(profile_alias "${1:-stable}")"
+    local candidates=() pair primary secondary lat1 lat2 score
+    local best_pair="" best_score=999999
+
+    if [[ "$mode" == "perf" ]]; then
+        candidates=(
+            "1.1.1.1 1.0.0.1"
+            "223.5.5.5 223.6.6.6"
+            "119.29.29.29 182.254.116.116"
+            "9.9.9.9 149.112.112.112"
+            "8.8.8.8 8.8.4.4"
+        )
+    else
+        candidates=(
+            "223.5.5.5 223.6.6.6"
+            "119.29.29.29 182.254.116.116"
+            "1.1.1.1 1.0.0.1"
+            "9.9.9.9 149.112.112.112"
+            "8.8.8.8 8.8.4.4"
+        )
+    fi
+
+    for pair in "${candidates[@]}"; do
+        primary="${pair%% *}"
+        secondary="${pair##* }"
+        lat1="$(measure_host_latency_ms "$primary")"
+        [[ -z "$lat1" ]] && continue
+        lat2="$(measure_host_latency_ms "$secondary")"
+        [[ -z "$lat2" ]] && lat2=$lat1
+        score=$((lat1 + lat2))
+        if (( score < best_score )); then
+            best_score=$score
+            best_pair="$pair"
+        fi
+    done
+
+    [[ -n "$best_pair" ]] && echo "$best_pair" || echo "223.5.5.5 223.6.6.6"
+}
+
+smart_dns_apply() {
+    local mode="$(profile_alias "${1:-stable}")"
+    local dns_action="${2:-auto}"
+    local pair d1 d2 actual_action
+
+    pair="$(select_best_dns_pair "$mode")"
+    d1="${pair%% *}"
+    d2="${pair##* }"
+
+    if [[ "$dns_action" == "auto" ]]; then
+        [[ "$mode" == "perf" ]] && actual_action=lock || actual_action=set
+    else
+        actual_action="$dns_action"
+    fi
+
+    dns_backup
+    if [[ -L /etc/resolv.conf ]] && readlink -f /etc/resolv.conf 2>/dev/null | grep -q '/run/systemd/resolve/'; then
+        dns_apply_systemd_resolved_custom "$d1" "$d2"
+        [[ "$actual_action" == "lock" ]] && chattr +i /etc/resolv.conf 2>/dev/null || true
+    else
+        dns_apply_resolvconf_custom "$actual_action" "$d1" "$d2"
+    fi
+
+    meta_set "DNS_SELECTED" "${d1},${d2}"
+    echo -e "${GREEN}✅ 已自动选择 DNS: ${d1} ${d2} (${actual_action})${RESET}"
+}
+
+render_sysctl_profile() {
+    local target="$1" env="$2" mode="$(profile_alias "$3")" tier="${4:-medium}" cc
+    local rmax wmax rmem wmem somax backlog filemax fin_timeout keepalive_time keepalive_intvl keepalive_probes
+    cc="$(best_congestion_control)"
+    keepalive_time=60; keepalive_intvl=20; keepalive_probes=3
+
+    case "${env}:${mode}:${tier}" in
+        regular:stable:tiny|regular:stable:small)
+            rmax=8388608;  wmax=8388608;  rmem=8388608;  wmem=8388608;  somax=4096;  backlog=4096;  filemax=262144; fin_timeout=30 ;;
+        regular:stable:medium)
+            rmax=16777216; wmax=16777216; rmem=16777216; wmem=16777216; somax=8192;  backlog=8192;  filemax=524288; fin_timeout=30 ;;
+        regular:stable:large)
+            rmax=33554432; wmax=33554432; rmem=33554432; wmem=33554432; somax=16384; backlog=16384; filemax=524288; fin_timeout=30 ;;
+        regular:perf:tiny|regular:perf:small)
+            rmax=16777216; wmax=16777216; rmem=16777216; wmem=16777216; somax=16384; backlog=16384; filemax=524288; fin_timeout=20 ;;
+        regular:perf:medium)
+            rmax=33554432; wmax=33554432; rmem=33554432; wmem=33554432; somax=32768; backlog=32768; filemax=1048576; fin_timeout=20 ;;
+        regular:perf:large)
+            rmax=67108864; wmax=67108864; rmem=67108864; wmem=67108864; somax=65535; backlog=65535; filemax=1048576; fin_timeout=15 ;;
+        nat:stable:tiny|nat:stable:small)
+            rmax=8388608;  wmax=8388608;  rmem=8388608;  wmem=8388608;  somax=4096;  backlog=8192;  filemax=262144; fin_timeout=30 ;;
+        nat:stable:medium|nat:stable:large)
+            rmax=16777216; wmax=16777216; rmem=16777216; wmem=16777216; somax=8192;  backlog=16384; filemax=262144; fin_timeout=30 ;;
+        nat:perf:tiny|nat:perf:small)
+            rmax=16777216; wmax=16777216; rmem=16777216; wmem=16777216; somax=8192;  backlog=16384; filemax=262144; fin_timeout=15 ;;
+        nat:perf:medium)
+            rmax=33554432; wmax=33554432; rmem=33554432; wmem=33554432; somax=16384; backlog=32768; filemax=524288; fin_timeout=15 ;;
+        nat:perf:large)
+            rmax=33554432; wmax=33554432; rmem=33554432; wmem=33554432; somax=32768; backlog=32768; filemax=524288; fin_timeout=15 ;;
+        *)
+            rmax=16777216; wmax=16777216; rmem=16777216; wmem=16777216; somax=8192; backlog=8192; filemax=524288; fin_timeout=30 ;;
+    esac
+
+    cat > "$target" <<EOF
+# ssr ${env} $(profile_title "$mode")
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = ${cc}
+net.ipv4.tcp_mtu_probing = 1
+net.core.rmem_max = ${rmax}
+net.core.wmem_max = ${wmax}
+net.ipv4.tcp_rmem = 8192 262144 ${rmem}
+net.ipv4.tcp_wmem = 8192 262144 ${wmem}
+net.core.somaxconn = ${somax}
+net.core.netdev_max_backlog = ${backlog}
+fs.file-max = ${filemax}
+net.ipv4.tcp_fin_timeout = ${fin_timeout}
+net.ipv4.tcp_fastopen = 3
+EOF
+
+    if [[ "$env" == "nat" ]]; then
+        cat >> "$target" <<EOF
+net.ipv4.tcp_keepalive_time = ${keepalive_time}
+net.ipv4.tcp_keepalive_intvl = ${keepalive_intvl}
+net.ipv4.tcp_keepalive_probes = ${keepalive_probes}
+EOF
+    fi
+
+    if [[ "$mode" == "perf" ]]; then
+        cat >> "$target" <<'EOF'
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_notsent_lowat = 16384
+EOF
+    fi
+}
+
+sysctl_key_supported() {
+    local key="$1"
+    [[ -e "/proc/sys/${key//./\/}" ]]
+}
+
+filter_supported_sysctl_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    local tmp
+    tmp="$(mktemp)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "${line//[[:space:]]/}" ]]; then
+            echo "$line" >> "$tmp"
+            continue
+        fi
+        local key="${line%%=*}"
+        key="$(echo "$key" | xargs 2>/dev/null || echo "$key")"
+        if sysctl_key_supported "$key"; then
+            echo "$line" >> "$tmp"
+        else
+            echo "# unsupported: $line" >> "$tmp"
+        fi
+    done < "$file"
+    mv -f "$tmp" "$file"
+}
+
 download_file() {
     # download_file URL DEST
     local url="$1"; local dest="$2"
@@ -225,7 +480,7 @@ check_env() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行！${RESET}" && exit 1
 
     # 依赖：尽量保守安装；缺啥装啥
-    local deps=(curl jq bc wget tar openssl unzip)
+    local deps=(curl jq bc wget tar openssl unzip ip ping)
     local missing=()
     for dep in "${deps[@]}"; do
         have_cmd "$dep" || missing+=("$dep")
@@ -235,9 +490,9 @@ check_env() {
         if have_cmd apt-get; then
             apt-get update -qq
             # xz-utils: 解 tar.xz；util-linux: flock；e2fsprogs: chattr/lsattr
-            apt-get install -yqq curl jq bc wget tar xz-utils openssl unzip util-linux e2fsprogs >/dev/null 2>&1 || true
+            apt-get install -yqq curl jq bc wget tar xz-utils openssl unzip util-linux e2fsprogs iproute2 iputils-ping >/dev/null 2>&1 || true
         elif have_cmd yum; then
-            yum install -yq curl jq bc wget tar xz openssl unzip util-linux e2fsprogs >/dev/null 2>&1 || true
+            yum install -yq curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute iputils >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -281,7 +536,6 @@ force_kill_service() {
 }
 
 # ==============================================================================
-# DNS 管理 (2.1): symlink 检测 + 一键解锁/恢复
 # ==============================================================================
 dns_backup() {
     mkdir -p "$DNS_BACKUP_DIR"
@@ -496,30 +750,57 @@ dns_status() {
 }
 
 
+
 dns_menu() {
     while true; do
         clear
         echo -e "${CYAN}========= DNS 管理中心 =========${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 查看 DNS 状态"
-        echo -e "${YELLOW} 2.${RESET} 设置 DNS（不锁，默认）"
-        echo -e "${YELLOW} 3.${RESET} 手动设置 DNS（自定义）"
-        echo -e "${YELLOW} 4.${RESET} 锁定 DNS（尽可能稳健：symlink 则走 systemd-resolved）"
-        echo -e "${YELLOW} 5.${RESET} 一键解锁并恢复（回滚至备份）"
+        echo -e "${GREEN} 1.${RESET} 查看 DNS 状态"
+        echo -e "${GREEN} 2.${RESET} 智能选优：稳定优先"
+        echo -e "${GREEN} 3.${RESET} 智能选优：极致优化"
+        echo -e "${YELLOW} 4.${RESET} 一键设置标准 DNS（不锁）"
+        echo -e "${YELLOW} 5.${RESET} 手动设置 DNS（自定义）"
+        echo -e "${YELLOW} 6.${RESET} 锁定 DNS（尽可能稳健）"
+        echo -e "${YELLOW} 7.${RESET} 一键解锁并恢复（回滚至备份）"
         echo -e " 0. 返回"
-        read -rp "输入 [0-5]: " dn
+        read -rp "输入 [0-7]: " dn
         case "$dn" in
-            1) clear; dns_status; echo ""; read -n 1 -s -r -p "按任意键返回..." ;;
-            2) dns_set_or_lock "set"; echo -e "${GREEN}✅ DNS 已设置。${RESET}"; sleep 2 ;;
-            3) dns_manual_set && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"; sleep 2 ;;
-            4) dns_set_or_lock "lock"; echo -e "${GREEN}✅ DNS 已锁定/固定。${RESET}"; sleep 2 ;;
-            5) dns_unlock_restore; echo -e "${GREEN}✅ 已解锁并恢复。${RESET}"; sleep 2 ;;
+            1)
+                clear
+                dns_status
+                echo ""
+                read -n 1 -s -r -p "按任意键返回..."
+                ;;
+            2|3)
+                local profile="stable" dns_mode
+                [[ "$dn" == "3" ]] && profile="extreme"
+                read -rp "DNS 模式 [auto/set/lock, 回车 auto]: " dns_mode
+                smart_dns_apply "$profile" "${dns_mode:-auto}"
+                sleep 2
+                ;;
+            4)
+                dns_set_or_lock "set" && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
+                sleep 2
+                ;;
+            5)
+                dns_manual_set && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
+                sleep 2
+                ;;
+            6)
+                dns_set_or_lock "lock" && echo -e "${GREEN}✅ DNS 已锁定/固定。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
+                sleep 2
+                ;;
+            7)
+                dns_unlock_restore
+                echo -e "${GREEN}✅ 已解锁并恢复。${RESET}"
+                sleep 2
+                ;;
             0) return ;;
         esac
     done
 }
 
 # ==============================================================================
-# Cloudflare DDNS (7.5: 隐藏 token + 权限收紧)
 # ==============================================================================
 setup_cf_ddns() {
     clear
@@ -557,7 +838,6 @@ LAST_IP=""
 EOF
     chmod 600 "$DDNS_CONF" 2>/dev/null || true
 
-    # 7.3: cron 写入时使用 flock；这里调用 install_global_command 会自动补齐 ddns cron
     install_global_command
 
     echo -e "${GREEN}✅ DDNS 配置保存成功！${RESET}\n${CYAN}>>> 正在进行首次推送...${RESET}"
@@ -638,7 +918,6 @@ remove_cf_ddns() {
     record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=A" \
         -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
 
-    # 6.3 修复：2>/dev/null 必须在 jq 外
     record_id=$(echo "$record_response" | jq -r '.result[0].id' 2>/dev/null)
 
     if [[ -n "$record_id" && "$record_id" != "null" ]]; then
@@ -693,16 +972,21 @@ cf_ddns_menu() {
 }
 
 # ==============================================================================
-# 基础系统管理（7.5: 密码输入隐藏）
 # ==============================================================================
 change_ssh_port() {
     read -rp "新的 SSH 端口号 (1-65535): " new_port
     if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
+        backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
         if have_cmd ufw && ufw status | grep -qw "active"; then ufw allow "$new_port"/tcp >/dev/null 2>&1; fi
         if have_cmd firewall-cmd; then firewall-cmd --add-port="$new_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
-        sed -i "s/^#\?Port [0-9]*/Port $new_port/g" /etc/ssh/sshd_config
-        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
-        echo -e "${GREEN}✅ SSH 端口已修改为 $new_port 。${RESET}"
+        replace_or_append_line /etc/ssh/sshd_config '^#?Port ' "Port $new_port"
+        if restart_ssh_safe; then
+            echo -e "${GREEN}✅ SSH 端口已修改为 $new_port 。${RESET}"
+        else
+            restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
+            restart_ssh_safe >/dev/null 2>&1 || true
+            echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
+        fi
     else
         echo -e "${RED}❌ 端口无效。${RESET}"
     fi
@@ -735,9 +1019,15 @@ sync_server_time() {
 }
 
 apply_ssh_key_sec() {
-    sed -i 's/^#\?PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config
-    sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication no/g' /etc/ssh/sshd_config
-    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+    backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
+    replace_or_append_line /etc/ssh/sshd_config '^#?PasswordAuthentication ' 'PasswordAuthentication no'
+    if ! restart_ssh_safe; then
+        restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
+        restart_ssh_safe >/dev/null 2>&1 || true
+        echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
+        sleep 2
+        return 1
+    fi
     echo -e "${GREEN}✅ 密码登录已封锁。${RESET}"
     sleep 2
 }
@@ -789,9 +1079,15 @@ ssh_key_menu() {
             [[ "$confirm" == "y" || "$confirm" == "Y" ]] && apply_ssh_key_sec
             ;;
         4)
-            sed -i 's/^#\?PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
-            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
-            echo -e "${GREEN}✅ 已恢复密码登录。${RESET}"
+            backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
+            replace_or_append_line /etc/ssh/sshd_config '^#?PasswordAuthentication ' 'PasswordAuthentication yes'
+            if ! restart_ssh_safe; then
+                restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
+                restart_ssh_safe >/dev/null 2>&1 || true
+                echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
+            else
+                echo -e "${GREEN}✅ 已恢复密码登录。${RESET}"
+            fi
             sleep 2
             ;;
         0) return ;;
@@ -799,7 +1095,6 @@ ssh_key_menu() {
 }
 
 # ==============================================================================
-# 节点原生部署模块（6.1: unit 修复；2.3: 临时下载校验 + 原子替换）
 # ==============================================================================
 install_ss_rust_native() {
     clear
@@ -896,7 +1191,6 @@ install_ss_rust_native() {
 { "server": "::", "server_port": $port, "password": "$pwd", "method": "$method", "mode": "tcp_and_udp", "fast_open": true }
 EOF
 
-    # 6.1 修复：systemd unit 必须真实换行
     cat > /etc/systemd/system/ss-rust.service << EOF
 [Unit]
 Description=Shadowsocks-Rust Server
@@ -996,7 +1290,6 @@ install_vless_native() {
 { "inbounds": [{ "port": $port, "protocol": "vless", "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" }, "streamSettings": { "network": "tcp", "security": "reality", "realitySettings": { "dest": "${sni_domain}:443", "serverNames": ["${sni_domain}"], "privateKey": "$priv", "shortIds": ["$short_id"] } } }], "outbounds": [{"protocol": "freedom"}] }
 EOF
 
-    # 6.1 修复：unit 换行
     cat > /etc/systemd/system/xray.service << EOF
 [Unit]
 Description=Xray Service
@@ -1098,7 +1391,6 @@ install_shadowtls_native() {
         return
     }
 
-    # 6.1 修复：unit 换行
     cat > /etc/systemd/system/shadowtls-${listen_port}.service << EOF
 [Unit]
 Description=ShadowTLS Service on port ${listen_port}
@@ -1335,34 +1627,31 @@ unified_node_manager() {
 #   - sysctl: 统一写入专用文件 + sysctl --system (要求)
 # ==============================================================================
 apply_journald_limit() {
-    # NAT 小鸡常见：磁盘小，journald 爆盘风险；稳定优先采用温和限制
     local limit="${1:-50M}"
-    if [[ -f /etc/systemd/journald.conf ]]; then
-        if grep -qE '^\s*SystemMaxUse=' /etc/systemd/journald.conf; then
-            sed -i "s|^\s*SystemMaxUse=.*|SystemMaxUse=${limit}|g" /etc/systemd/journald.conf
-        else
-            echo "SystemMaxUse=${limit}" >> /etc/systemd/journald.conf
-        fi
-        systemctl restart systemd-journald 2>/dev/null || true
-    fi
+    [[ -f /etc/systemd/journald.conf ]] || return 0
+    backup_file_once /etc/systemd/journald.conf "$JOURNALD_BACKUP_FILE"
+    replace_or_append_line /etc/systemd/journald.conf '^\s*SystemMaxUse=' "SystemMaxUse=${limit}"
+    systemctl restart systemd-journald 2>/dev/null || true
 }
 
 apply_ssh_keepalive() {
-    local interval="${1:-30}"
-    local count="${2:-3}"
-    if [[ -f /etc/ssh/sshd_config ]]; then
-        sed -i "s/^#\?ClientAliveInterval.*/ClientAliveInterval ${interval}/g" /etc/ssh/sshd_config
-        sed -i "s/^#\?ClientAliveCountMax.*/ClientAliveCountMax ${count}/g" /etc/ssh/sshd_config
-        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
-    fi
+    local interval="${1:-30}" count="${2:-3}"
+    [[ -f /etc/ssh/sshd_config ]] || return 0
+    backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
+    replace_or_append_line /etc/ssh/sshd_config '^#?ClientAliveInterval ' "ClientAliveInterval ${interval}"
+    replace_or_append_line /etc/ssh/sshd_config '^#?ClientAliveCountMax ' "ClientAliveCountMax ${count}"
+    restart_ssh_safe || true
 }
 
 ensure_swap() {
-    # NAT 小鸡：提供轻量 swap，避免 OOM；稳定优先：256M，性能档：512M
-    local size_mb="$1"
-    [[ -z "$size_mb" ]] && size_mb=256
-    if grep -q " swap " /etc/fstab 2>/dev/null; then
-        return
+    local size_mb="${1:-256}"
+    local active_swap
+    active_swap="$(awk 'NR>1 {print $1}' /proc/swaps 2>/dev/null | head -n 1)"
+    [[ -n "$active_swap" ]] && return 0
+    grep -qE '^[^#].+[[:space:]]swap[[:space:]]+swap[[:space:]]' /etc/fstab 2>/dev/null && return 0
+    if [[ -f /var/swap && ! -f "$SWAP_MARK_FILE" ]]; then
+        echo -e "${YELLOW}⚠️ 检测到现有 /var/swap，且非本脚本创建，已跳过。${RESET}"
+        return 0
     fi
 
     rm -f /var/swap
@@ -1370,7 +1659,9 @@ ensure_swap() {
         chmod 600 /var/swap
         mkswap /var/swap >/dev/null 2>&1
         swapon /var/swap >/dev/null 2>&1 || true
-        echo "/var/swap swap swap defaults 0 0" >> /etc/fstab
+        grep -qF '/var/swap swap swap defaults 0 0' /etc/fstab 2>/dev/null || echo '/var/swap swap swap defaults 0 0' >> /etc/fstab
+        mkdir -p "$META_DIR" 2>/dev/null || true
+        echo "1" > "$SWAP_MARK_FILE"
         echo -e "${GREEN}✅ ${size_mb}MB Swap 创建成功！${RESET}"
     else
         rm -f /var/swap
@@ -1378,164 +1669,84 @@ ensure_swap() {
     fi
 }
 
-apply_nat_profile() {
-    local profile="$1"  # stable|perf
-    rm -f "$CONF_FILE" 2>/dev/null || true
+apply_profile_core() {
+    local env="$1" mode="$(profile_alias "$2")" tier target swap_size
+    tier="$(detect_machine_tier)"
+    [[ "$env" == "nat" ]] && { target="$NAT_CONF_FILE"; rm -f "$CONF_FILE" 2>/dev/null || true; } || { target="$CONF_FILE"; rm -f "$NAT_CONF_FILE" 2>/dev/null || true; }
 
-    # NAT 相关附加措施
-    apply_journald_limit "50M"
-    apply_ssh_keepalive 30 3
-
-    # DNS：稳定档仅设置不锁；性能档尽量锁定（symlink 则走 systemd-resolved）
-    if [[ "$profile" == "perf" ]]; then
-        dns_set_or_lock "lock" || true
-        ensure_swap 512
-    else
-        dns_set_or_lock "set" || true
-        ensure_swap 256
+    if [[ "$env" == "nat" ]]; then
+        apply_journald_limit "50M"
+        apply_ssh_keepalive 30 3
+        if [[ "$mode" == "perf" ]]; then
+            dns_set_or_lock "lock" || true
+            case "$tier" in
+                tiny|small) swap_size=512 ;;
+                medium) swap_size=768 ;;
+                large) swap_size=1024 ;;
+                *) swap_size=512 ;;
+            esac
+        else
+            dns_set_or_lock "set" || true
+            case "$tier" in
+                tiny|small) swap_size=256 ;;
+                medium|large) swap_size=512 ;;
+                *) swap_size=256 ;;
+            esac
+        fi
+        ensure_swap "$swap_size"
     fi
 
-    # sysctl：写入专用文件 + sysctl --system
-    cat > "$NAT_CONF_FILE" << EOF
-# SSR NAT Profile: ${profile}
-# 说明：
-#  - 稳定优先：更保守的队列/超时；减少边缘副作用
-#  - 极致性能：更激进的队列/复用；更适合高并发/大吞吐
-
-net.ipv4.tcp_mtu_probing = 1
-
-# NAT/小鸡：保活，减少空闲断流
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 20
-net.ipv4.tcp_keepalive_probes = 3
-
-# 队列与拥塞控制
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# 连接与缓冲（按档位调整）
-EOF
-
-    if [[ "$profile" == "perf" ]]; then
-        cat >> "$NAT_CONF_FILE" << 'EOF'
-net.ipv4.tcp_rmem = 4096 16384 16777216
-net.ipv4.tcp_wmem = 4096 16384 16777216
-net.core.somaxconn = 8192
-net.core.netdev_max_backlog = 16384
-fs.file-max = 262144
-
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_notsent_lowat = 16384
-EOF
-    else
-        cat >> "$NAT_CONF_FILE" << 'EOF'
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.core.somaxconn = 4096
-net.core.netdev_max_backlog = 8192
-fs.file-max = 262144
-
-# 稳定优先：不强行启用 tw_reuse，避免极端边缘环境问题
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_fastopen = 3
-EOF
-    fi
-
+    render_sysctl_profile "$target" "$env" "$mode" "$tier"
+    filter_supported_sysctl_file "$target"
     sysctl --system >/dev/null 2>&1 || true
-    meta_set "SYSCTL_PROFILE" "nat-${profile}"
-
-    echo -e "${GREEN}✅ NAT(${profile}) Profile 已应用！${RESET}"
+    meta_set "SYSCTL_PROFILE" "${env}-${mode}"
+    meta_set "SYSCTL_TIER" "$tier"
+    echo -e "${GREEN}✅ 已应用 ${env} / $(profile_title "$mode") / ${tier} 档调优。${RESET}"
     sleep 2
+}
+
+apply_nat_profile() {
+    apply_profile_core nat "$1"
 }
 
 apply_regular_profile() {
-    local profile="$1"  # stable|perf
-    rm -f "$NAT_CONF_FILE" 2>/dev/null || true
-
-    # sysctl：写入专用文件 + sysctl --system
-    cat > "$CONF_FILE" << EOF
-# SSR Regular Profile: ${profile}
-
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_mtu_probing = 1
-
-# 注意：默认不改 IPv6 forwarding，避免影响 RA/IPv6 正常上网
-EOF
-
-    if [[ "$profile" == "perf" ]]; then
-        cat >> "$CONF_FILE" << 'EOF'
-# 极致性能：更高的 buffer/队列上限（适合大内存/高并发）
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 8192 262144 67108864
-net.ipv4.tcp_wmem = 8192 262144 67108864
-
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 32768
-fs.file-max = 1048576
-
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_notsent_lowat = 16384
-EOF
-    else
-        cat >> "$CONF_FILE" << 'EOF'
-# 稳定优先：更保守的 buffer/队列（适合大多数机器）
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 8192 262144 16777216
-net.ipv4.tcp_wmem = 8192 262144 16777216
-
-net.core.somaxconn = 8192
-net.core.netdev_max_backlog = 8192
-fs.file-max = 524288
-
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_fastopen = 3
-EOF
-    fi
-
-    sysctl --system >/dev/null 2>&1 || true
-    meta_set "SYSCTL_PROFILE" "regular-${profile}"
-
-    echo -e "${GREEN}✅ 常规(${profile}) Profile 已应用！${RESET}"
-    sleep 2
+    apply_profile_core regular "$1"
 }
+
+smart_optimize() {
+    local mode="$(profile_alias "${1:-stable}")" env
+    env="$(detect_network_topology)"
+    echo -e "${CYAN}>>> 自动识别环境：${env} / $(detect_machine_tier) / $(profile_title "$mode")${RESET}"
+    if [[ "$env" == "nat" ]]; then
+        apply_nat_profile "$mode"
+    else
+        apply_regular_profile "$mode"
+    fi
+    smart_dns_apply "$mode" auto
+}
+
 
 opt_menu() {
     while true; do
         clear
-        echo -e "${CYAN}========= 网络优化与清理中心 =========${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 常规机器：稳定优先 Profile"
-        echo -e "${YELLOW} 2.${RESET} 常规机器：极致性能 Profile"
-        echo -e "${GREEN} 3.${RESET} NAT 小鸡：稳定优先 Profile"
-        echo -e "${GREEN} 4.${RESET} NAT 小鸡：极致性能 Profile"
-        echo -e "${CYAN}--------------------------------------------${RESET}"
-        echo -e "${YELLOW} 5.${RESET} 手动清理系统垃圾与冗余日志"
-        echo -e "${YELLOW} 6.${RESET} DNS 管理中心（锁定/解锁/恢复）"
+        echo -e "${CYAN}========= 网络优化与系统清理中心 =========${RESET}"
+        echo -e "${GREEN} 1.${RESET} 智能调优：稳定优先"
+        echo -e "${GREEN} 2.${RESET} 智能调优：极致优化"
+        echo -e "${YELLOW} 3.${RESET} 手动清理系统垃圾与冗余日志"
         echo -e " 0. 返回主菜单"
-        read -rp "输入数字 [0-6]: " opt_num
+        read -rp "输入数字 [0-3]: " opt_num
         case "$opt_num" in
-            1) apply_regular_profile "stable" ;;
-            2) apply_regular_profile "perf" ;;
-            3) apply_nat_profile "stable" ;;
-            4) apply_nat_profile "perf" ;;
-            5) auto_clean ;;
-            6) dns_menu ;;
+            1) smart_optimize "stable" ;;
+            2) smart_optimize "extreme" ;;
+            3) auto_clean ;;
             0) return ;;
         esac
     done
 }
 
 # ==============================================================================
-# 守护、清理与安全热更（2.2 / 2.3）
 # ==============================================================================
 run_daemon_check() {
-    # 6.2 修复：用退出码判断，而不是 [[ $(grep -q) ]]
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ss-rust\.service'; then
         systemctl is-active --quiet ss-rust 2>/dev/null || systemctl restart ss-rust 2>/dev/null || true
     fi
@@ -1688,7 +1899,6 @@ update_shadowtls_if_needed() {
 }
 
 hot_update_components() {
-    # 2.2/2.3：仅有新版本才更新；下载到临时文件校验可运行后再原子替换
     local is_silent=$1
     local updated_any=0
 
@@ -1717,9 +1927,7 @@ daily_task() {
 # ==============================================================================
 # 完全卸载
 # ==============================================================================
-total_uninstall() {
-    echo -e "${RED}⚠️ 正在进行无痕毁灭性全量卸载...${RESET}"
-
+ssr_cleanup_artifacts() {
     if [[ -f "/etc/ss-rust/config.json" ]]; then
         local sp; sp=$(jq -r '.server_port' /etc/ss-rust/config.json 2>/dev/null)
         [[ -n "$sp" && "$sp" != "null" ]] && remove_firewall_rule "$sp" "both"
@@ -1734,6 +1942,7 @@ total_uninstall() {
     done
 
     systemctl stop ss-rust xray 2>/dev/null || true
+    systemctl disable ss-rust xray 2>/dev/null || true
     rm -rf /etc/ss-rust /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service
     rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service
 
@@ -1744,24 +1953,33 @@ total_uninstall() {
         rm -f "/etc/systemd/system/$s"
     done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep '^shadowtls-.*\.service$' || true)
 
-    if [[ -f "$DDNS_CONF" ]]; then
-        remove_cf_ddns "force"
-    fi
-
+    [[ -f "$DDNS_CONF" ]] && remove_cf_ddns "force" 2>/dev/null || true
     rm -f /usr/local/bin/shadow-tls "$CONF_FILE" "$NAT_CONF_FILE" "$DDNS_CONF" "$DDNS_LOG" "$META_FILE"
     rm -f /usr/local/bin/ssr /usr/local/bin/ssr.sh 2>/dev/null || true
-
     crontab -l 2>/dev/null | grep -vE "/usr/local/bin/ssr (auto_update|auto_task|daemon_check|hot_upgrade|clean|daily_task|ddns)" | crontab - 2>/dev/null || true
-
     dns_unlock_restore 2>/dev/null || true
 
-    if grep -q "/var/swap" /etc/fstab 2>/dev/null; then
+    if [[ -f "$SWAP_MARK_FILE" ]]; then
         swapoff /var/swap 2>/dev/null || true
         rm -f /var/swap
-        sed -i 's|/var/swap swap swap defaults 0 0||g' /etc/fstab
+        sed -i '/^\/var\/swap[[:space:]]\+swap[[:space:]]\+swap[[:space:]]\+defaults[[:space:]]\+0[[:space:]]\+0$/d' /etc/fstab 2>/dev/null || true
+        rm -f "$SWAP_MARK_FILE" 2>/dev/null || true
     fi
 
-    systemctl daemon-reload
+    restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
+    restore_file_if_present "$JOURNALD_BACKUP_FILE" /etc/systemd/journald.conf
+    restart_ssh_safe >/dev/null 2>&1 || true
+    systemctl restart systemd-journald 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+
+    rm -f "$SSHD_BACKUP_FILE" "$JOURNALD_BACKUP_FILE" 2>/dev/null || true
+    rm -rf "$META_DIR" "$DNS_BACKUP_DIR" 2>/dev/null || true
+    rm -f "$RESOLVED_DROPIN" 2>/dev/null || true
+}
+
+total_uninstall() {
+    echo -e "${RED}⚠️ 正在进行无痕毁灭性全量卸载...${RESET}"
+    ssr_cleanup_artifacts
     echo -e "${GREEN}✅ 完美无痕卸载完成！系统已彻底洁净退水。${RESET}"
     exit 0
 }
@@ -1780,7 +1998,7 @@ sys_menu() {
         echo -e "${GREEN} 5.${RESET} 原生 Cloudflare DDNS 解析模块"
         echo -e "${CYAN}--------------------------------------------${RESET}"
         echo -e "${YELLOW} 6.${RESET} 手动安全热更升级核心组件"
-        echo -e "${YELLOW} 7.${RESET} DNS 管理中心（锁定/解锁/恢复）"
+        echo -e "${YELLOW} 7.${RESET} DNS 管理中心（智能/手动/锁定/恢复）"
         echo -e " 0. 返回主菜单"
         read -rp "输入数字 [0-7]: " sys_num
         case "$sys_num" in
@@ -1807,7 +2025,7 @@ main_menu() {
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${GREEN} 4.${RESET} 🔰 统一节点管控中心 (查看 / 删除 / 核爆)"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (Profiles + DNS)"
+    echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (智能调优 + 清理)"
     echo -e "${YELLOW} 6.${RESET} 系统底层管控 (DDNS / 安全 / 更新)"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 退出脚本"
@@ -1833,7 +2051,7 @@ SSR_MODULE_EOF
 #!/bin/bash
 
 # ==========================================
-# nftables 端口转发管理面板 (Pro 稳定优化版)
+# nftables 端口转发管理面板 (Pro 智能优化版)
 # ==========================================
 
 set -o pipefail
@@ -2247,73 +2465,141 @@ auto_persist_setup() {
     fi
 }
 # --------------------------
-sysctl_set_kv() {
-    local key="$1"; local value="$2"
-    mkdir -p /etc/sysctl.d 2>/dev/null || true
-    touch "$SYSCTL_FILE" 2>/dev/null || true
+nft_profile_alias() {
+    case "${1:-stable}" in
+        perf|extreme|turbo) echo "perf" ;;
+        *) echo "stable" ;;
+    esac
+}
 
-    if grep -qE "^\s*${key}\s*=" "$SYSCTL_FILE" 2>/dev/null; then
-        sed -i "s|^\s*${key}\s*=.*|${key} = ${value}|g" "$SYSCTL_FILE"
+nft_profile_title() {
+    [[ "$(nft_profile_alias "$1")" == "perf" ]] && echo "极致优化" || echo "稳定优先"
+}
+
+nft_detect_machine_tier() {
+    local mem_mb
+    mem_mb="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+    if (( mem_mb < 700 )); then
+        echo tiny
+    elif (( mem_mb < 1400 )); then
+        echo small
+    elif (( mem_mb < 3000 )); then
+        echo medium
     else
-        echo "${key} = ${value}" >> "$SYSCTL_FILE"
+        echo large
     fi
+}
+
+nft_best_congestion_control() {
+    local avail
+    avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+    [[ " $avail " == *" bbr "* ]] && { echo bbr; return 0; }
+    [[ " $avail " == *" cubic "* ]] && { echo cubic; return 0; }
+    [[ " $avail " == *" reno "* ]] && { echo reno; return 0; }
+    sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic
+}
+
+nft_sysctl_key_supported() {
+    local key="$1"
+    [[ -e "/proc/sys/${key//./\/}" ]]
+}
+
+nft_write_sysctl_line() {
+    local out="$1" key="$2" value="$3"
+    nft_sysctl_key_supported "$key" || return 0
+    echo "${key} = ${value}" >> "$out"
 }
 
 ensure_forwarding() {
     local cur
     cur="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
     if [[ "$cur" != "1" ]]; then
-        sysctl_set_kv "net.ipv4.ip_forward" "1"
+        mkdir -p /etc/sysctl.d 2>/dev/null || true
+        touch "$SYSCTL_FILE" 2>/dev/null || true
+        if grep -qE "^\s*net\.ipv4\.ip_forward\s*=" "$SYSCTL_FILE" 2>/dev/null; then
+            sed -i 's|^\s*net\.ipv4\.ip_forward\s*=.*|net.ipv4.ip_forward = 1|g' "$SYSCTL_FILE"
+        else
+            echo "net.ipv4.ip_forward = 1" >> "$SYSCTL_FILE"
+        fi
         sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
     fi
 }
 
-bbr_available() {
-    sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr
-}
+nft_apply_profile() {
+    local mode="$(nft_profile_alias "${1:-stable}")" tier cc
+    local somax backlog filemax rmax wmax fin_timeout conntrack
+    tier="$(nft_detect_machine_tier)"
+    cc="$(nft_best_congestion_control)"
 
-optimize_system() {
-    clear
-    echo -e "${GREEN}--- 系统优化 (BBR + 转发 + 自启动) ---${PLAIN}"
-    echo "1) 稳定推荐：仅开启转发 + 尝试启用 BBR"
-    echo "2) 性能增强：在 1 的基础上，适度提升队列/并发（偏高负载）"
-    echo "0) 返回"
-    echo "--------------------------------"
-    read -rp "请选择 [0-2]: " pick
-
-    case "$pick" in
-        0) return ;;
-        1|2) ;;
-        *) msg_err "无效选项"; sleep 1; return ;;
+    case "${mode}:${tier}" in
+        stable:tiny|stable:small)
+            somax=4096; backlog=4096; filemax=262144; rmax=8388608;  wmax=8388608;  fin_timeout=30; conntrack=131072 ;;
+        stable:medium)
+            somax=8192; backlog=8192; filemax=524288; rmax=16777216; wmax=16777216; fin_timeout=25; conntrack=262144 ;;
+        stable:large)
+            somax=16384; backlog=16384; filemax=524288; rmax=33554432; wmax=33554432; fin_timeout=20; conntrack=524288 ;;
+        perf:tiny|perf:small)
+            somax=16384; backlog=16384; filemax=524288; rmax=16777216; wmax=16777216; fin_timeout=20; conntrack=262144 ;;
+        perf:medium)
+            somax=32768; backlog=32768; filemax=1048576; rmax=33554432; wmax=33554432; fin_timeout=15; conntrack=524288 ;;
+        perf:large)
+            somax=65535; backlog=65535; filemax=1048576; rmax=67108864; wmax=67108864; fin_timeout=15; conntrack=1048576 ;;
+        *)
+            somax=8192; backlog=8192; filemax=524288; rmax=16777216; wmax=16777216; fin_timeout=25; conntrack=262144 ;;
     esac
 
-    echo -e "${CYAN}正在写入 sysctl 配置...${PLAIN}"
-    sysctl_set_kv "net.ipv4.ip_forward" "1"
+    mkdir -p /etc/sysctl.d 2>/dev/null || true
+    : > "$SYSCTL_FILE"
+    chmod 644 "$SYSCTL_FILE" 2>/dev/null || true
+    echo "# nftmgr $(nft_profile_title "$mode") / ${tier}" >> "$SYSCTL_FILE"
 
-    # BBR: 仅在内核支持时写入，避免误导
-    if bbr_available; then
-        sysctl_set_kv "net.core.default_qdisc" "fq"
-        sysctl_set_kv "net.ipv4.tcp_congestion_control" "bbr"
-    else
-        msg_warn "⚠️ 当前内核未检测到 bbr（将仅启用转发）。"
-    fi
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.ip_forward" "1"
+    [[ "$cc" == "bbr" ]] && nft_write_sysctl_line "$SYSCTL_FILE" "net.core.default_qdisc" "fq"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_congestion_control" "$cc"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_mtu_probing" "1"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.core.somaxconn" "$somax"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.core.netdev_max_backlog" "$backlog"
+    nft_write_sysctl_line "$SYSCTL_FILE" "fs.file-max" "$filemax"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.core.rmem_max" "$rmax"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.core.wmem_max" "$wmax"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_rmem" "8192 262144 ${rmax}"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_wmem" "8192 262144 ${wmax}"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_fin_timeout" "$fin_timeout"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.ip_local_port_range" "10240 65535"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.netfilter.nf_conntrack_max" "$conntrack"
 
-    if [[ "$pick" == "2" ]]; then
-        sysctl_set_kv "net.core.somaxconn" "8192"
-        sysctl_set_kv "net.core.netdev_max_backlog" "8192"
-        sysctl_set_kv "fs.file-max" "524288"
+    if [[ "$mode" == "perf" ]]; then
+        nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_fastopen" "3"
+        nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_tw_reuse" "1"
+        nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_notsent_lowat" "16384"
     fi
 
     sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
 
     if have_cmd systemctl; then
-        echo -e "${CYAN}正在设置 nftables 开机自启...${PLAIN}"
         systemctl enable --now nftables >/dev/null 2>&1 || true
         ensure_nft_mgr_service
     fi
+    auto_persist_setup
 
-    msg_ok "✅ 系统优化已应用。"
+    msg_ok "✅ 已应用 NFT 智能调优：$(nft_profile_title "$mode") / ${tier} / ${cc}"
     sleep 2
+}
+
+optimize_system() {
+    clear
+    echo -e "${GREEN}--- NFT 智能调优中心 ---${PLAIN}"
+    echo "1) 稳定优先：保守提升转发与并发"
+    echo "2) 极致优化：激进提升队列/并发/连接追踪"
+    echo "0) 返回"
+    echo "--------------------------------"
+    read -rp "请选择 [0-2]: " pick
+    case "$pick" in
+        0) return ;;
+        1) nft_apply_profile "stable" ;;
+        2) nft_apply_profile "extreme" ;;
+        *) msg_err "无效选项"; sleep 1 ;;
+    esac
 }
 
 # --------------------------
@@ -2907,13 +3193,7 @@ clear_all_rules() { with_lock clear_all_rules_impl; }
 # --------------------------
 # 完全卸载
 # --------------------------
-uninstall_script_impl() {
-    clear
-    echo -e "${RED}--- 卸载 nftables 端口转发管理面板 ---${PLAIN}"
-    read -rp "警告: 此操作将删除本脚本、规则配置、定时任务、systemd 服务，并移除本脚本创建的 nft 表。确认？[y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
-
-    # 1) 删除防火墙放行（尽量清理）
+cleanup_nft_artifacts() {
     while IFS='|' read -r lp addr tp last_ip proto; do
         [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
         is_port "$lp" || continue
@@ -2921,30 +3201,24 @@ uninstall_script_impl() {
         manage_firewall "del" "$lp" "$proto" || true
     done < "$CONFIG_FILE" 2>/dev/null || true
 
-    # 2) 删除 nft 表（仅本脚本的表）
     have_cmd nft && nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
-
-    # 3) 删除 DDNS cron（无论路径差异）
     remove_ddns_cron_task || true
 
-    # 4) systemd：停用并删除 nft-mgr 服务
     if have_cmd systemctl; then
         systemctl disable --now nft-mgr >/dev/null 2>&1 || true
         rm -f "$NFT_MGR_SERVICE" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
-    # 5) 还原 /etc/nftables.conf 中的 include（只删我们添加的 include 行及标注）
     if [[ -f "$NFTABLES_CONF" ]]; then
         sed -i '/# nftmgr include (added .*$/d' "$NFTABLES_CONF" 2>/dev/null || true
         sed -i '/# nftmgr persistent include$/d' "$NFTABLES_CONF" 2>/dev/null || true
         sed -i '\|include "/etc/nftables.d/nft_mgr.conf"|d' "$NFTABLES_CONF" 2>/dev/null || true
     fi
 
-    # 6) 如果 /etc/nftables.conf 是我们创建的（marker 存在），则尝试恢复备份，否则删除并关闭 nftables.service
     if [[ -f "$NFTABLES_CREATED_MARK" ]]; then
         rm -f "$NFTABLES_CREATED_MARK" 2>/dev/null || true
-        local latest_bak
+        local latest_bak=""
         latest_bak="$(ls -1t ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null | head -n 1)"
         if [[ -n "$latest_bak" && -f "$latest_bak" ]]; then
             cp -a "$latest_bak" "$NFTABLES_CONF" 2>/dev/null || true
@@ -2956,22 +3230,25 @@ uninstall_script_impl() {
         fi
     fi
 
-    # 7) 删除我们创建的备份（仅 nftmgr 命名的）
     rm -f ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null || true
-
-    # 8) 删除脚本相关文件与目录（不留残留）
     rm -f "$NFT_MGR_CONF" "$CONFIG_FILE" "$SETTINGS_FILE" "$SYSCTL_FILE" "$LOCK_FILE" 2>/dev/null || true
     rm -rf "$LOG_DIR" 2>/dev/null || true
     rmdir "$NFT_MGR_DIR" 2>/dev/null || true
 
-    # 9) 刷新 nftables（可选）
     if have_cmd systemctl; then
         systemctl restart nftables >/dev/null 2>&1 || true
     fi
+}
 
+uninstall_script_impl() {
+    clear
+    echo -e "${RED}--- 卸载 nftables 端口转发管理面板 ---${PLAIN}"
+    read -rp "警告: 此操作将删除本脚本、规则配置、定时任务、systemd 服务，并移除本脚本创建的 nft 表。确认？[y/N]: " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
+
+    cleanup_nft_artifacts
     msg_ok "✅ 卸载完成（已清理脚本残留）。"
 
-    # 10) 删除自身
     rm -f "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
     exit 0
 }
@@ -2985,7 +3262,7 @@ main_menu() {
     echo -e "${GREEN}==========================================${PLAIN}"
     echo -e "${GREEN}     nftables 端口转发管理面板 (Pro)      ${PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
-    echo "1. 开启 BBR + 转发 + 自启动 (稳定/性能)"
+    echo "1. 智能系统调优 (稳定/极致)"
     echo "2. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
     echo "3. 规则管理 (查看/删除)"
     echo "4. 清空所有转发规则"
@@ -3180,66 +3457,13 @@ uninstall_ssr() {
     require_root
     msg_warn "⚠️ 开始卸载 SSR 相关组件..."
 
-    # 调用 SSR 模块里更成熟的防火墙/还原工具（在子 shell 中执行，避免污染主脚本变量）
-    ( 
+    (
       source "${SSR_MODULE_FILE}" 2>/dev/null || exit 0
-
-      # 移除端口放行
-      if have_cmd jq && [[ -f "/etc/ss-rust/config.json" ]]; then
-          local sp
-          sp=$(jq -r '.server_port' /etc/ss-rust/config.json 2>/dev/null || true)
-          [[ -n "$sp" && "$sp" != "null" ]] && remove_firewall_rule "$sp" "both"
-      fi
-      if have_cmd jq && [[ -f "/usr/local/etc/xray/config.json" ]]; then
-          local xp
-          xp=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json 2>/dev/null || true)
-          [[ -n "$xp" && "$xp" != "null" ]] && remove_firewall_rule "$xp" "tcp"
-      fi
-      for s in /etc/systemd/system/shadowtls-*.service; do
-          [[ -f "$s" ]] || continue
-          remove_firewall_rule "$(basename "$s" | sed 's/shadowtls-//g' | sed 's/.service//g')" "tcp"
-      done
-
-      # 停止服务并删除文件
-      systemctl stop ss-rust xray 2>/dev/null || true
-      rm -rf /etc/ss-rust /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service
-      rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service
-
-      while read -r s; do
-          [[ -z "$s" ]] && continue
-          systemctl stop "$s" 2>/dev/null || true
-          systemctl disable "$s" 2>/dev/null || true
-          rm -f "/etc/systemd/system/$s"
-      done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep '^shadowtls-.*\.service$' || true)
-
-      # 删除 DDNS 配置（如果存在）
-      if [[ -f "$DDNS_CONF" ]]; then
-          remove_cf_ddns "force" 2>/dev/null || true
-      fi
-
-      # 删除其余配置/日志
-      rm -f "$CONF_FILE" "$NAT_CONF_FILE" "$DDNS_CONF" "$DDNS_LOG" "$META_FILE" 2>/dev/null || true
-      rm -f /usr/local/bin/shadow-tls 2>/dev/null || true
-
-      # DNS 解锁还原（如有）
-      dns_unlock_restore 2>/dev/null || true
-
-      # 删除 swap（如脚本曾创建）
-      if grep -q "/var/swap" /etc/fstab 2>/dev/null; then
-          swapoff /var/swap 2>/dev/null || true
-          rm -f /var/swap
-          sed -i 's|/var/swap swap swap defaults 0 0||g' /etc/fstab
-      fi
-
-      systemctl daemon-reload 2>/dev/null || true
+      ssr_cleanup_artifacts
     )
 
-    # 清理 SSR 相关 cron
     my_disable_ssr_cron_tasks
-
-    # 删除旧快捷命令（如残留）
     rm -f /usr/local/bin/ssr /usr/local/bin/ssr.sh 2>/dev/null || true
-
     msg_ok "✅ SSR 卸载完成。"
 }
 
@@ -3249,68 +3473,10 @@ uninstall_nft() {
 
     (
       source "${NFT_MODULE_FILE}" 2>/dev/null || exit 0
-
-      # 1) 删除防火墙放行（尽量清理）
-      while IFS='|' read -r lp addr tp last_ip proto; do
-          [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-          is_port "$lp" || continue
-          proto="$(normalize_proto "$proto")"
-          manage_firewall "del" "$lp" "$proto" || true
-      done < "$CONFIG_FILE" 2>/dev/null || true
-
-      # 2) 删除 nft 表（仅本脚本的表）
-      have_cmd nft && nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
-
-      # 3) 删除 DDNS cron（无论路径差异）
-      remove_ddns_cron_task || true
-
-      # 4) systemd：停用并删除 nft-mgr 服务
-      if have_cmd systemctl; then
-          systemctl disable --now nft-mgr >/dev/null 2>&1 || true
-          rm -f "$NFT_MGR_SERVICE" 2>/dev/null || true
-          systemctl daemon-reload >/dev/null 2>&1 || true
-      fi
-
-      # 5) 还原 /etc/nftables.conf 中的 include（只删我们添加的 include 行及标注）
-      if [[ -f "$NFTABLES_CONF" ]]; then
-          sed -i '/# nftmgr include (added .*$/d' "$NFTABLES_CONF" 2>/dev/null || true
-          sed -i '/# nftmgr persistent include$/d' "$NFTABLES_CONF" 2>/dev/null || true
-          sed -i '\|include "/etc/nftables.d/nft_mgr.conf"|d' "$NFTABLES_CONF" 2>/dev/null || true
-      fi
-
-      # 6) 如果 /etc/nftables.conf 是我们创建的（marker 存在），则尝试恢复备份，否则删除并关闭 nftables.service
-      if [[ -f "$NFTABLES_CREATED_MARK" ]]; then
-          rm -f "$NFTABLES_CREATED_MARK" 2>/dev/null || true
-          local latest_bak
-          latest_bak="$(ls -1t ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null | head -n 1)"
-          if [[ -n "$latest_bak" && -f "$latest_bak" ]]; then
-              cp -a "$latest_bak" "$NFTABLES_CONF" 2>/dev/null || true
-          else
-              rm -f "$NFTABLES_CONF" 2>/dev/null || true
-              if have_cmd systemctl; then
-                  systemctl disable --now nftables >/dev/null 2>&1 || true
-              fi
-          fi
-      fi
-
-      # 7) 删除我们创建的备份（仅 nftmgr 命名的）
-      rm -f ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null || true
-
-      # 8) 删除脚本相关文件与目录（不留残留）
-      rm -f "$NFT_MGR_CONF" "$CONFIG_FILE" "$SETTINGS_FILE" "$SYSCTL_FILE" "$LOCK_FILE" 2>/dev/null || true
-      rm -rf "$LOG_DIR" 2>/dev/null || true
-      rmdir "$NFT_MGR_DIR" 2>/dev/null || true
-
-      # 9) 刷新 nftables（可选）
-      if have_cmd systemctl; then
-          systemctl restart nftables >/dev/null 2>&1 || true
-      fi
+      cleanup_nft_artifacts
     )
 
-    # 清理 NFT cron（my）
     my_remove_nft_cron_tasks
-
-    # 删除旧快捷命令（如残留）
     rm -f /usr/local/bin/nftmgr /usr/local/bin/nft_mgr.sh 2>/dev/null || true
 
     msg_ok "✅ NFT 转发卸载完成。"
@@ -3400,15 +3566,43 @@ ssr_cli() {
             ( source "${SSR_MODULE_FILE}" || exit 1; run_daemon_check )
             ;;
         ddns)
-            # ddns 需要读配置；执行前确保 cron 已启用/同步
             my_enable_ssr_cron_tasks
             ( source "${SSR_MODULE_FILE}" || exit 1; run_cf_ddns "auto" )
             ;;
         hot_upgrade|hot_update)
             ( source "${SSR_MODULE_FILE}" || exit 1; hot_update_components "silent" )
             ;;
+        auto)
+            ( source "${SSR_MODULE_FILE}" || exit 1; check_env; smart_optimize "${2:-stable}" )
+            ;;
+        regular|bbr)
+            ( source "${SSR_MODULE_FILE}" || exit 1; check_env; apply_regular_profile "${2:-stable}" )
+            ;;
+        nat)
+            ( source "${SSR_MODULE_FILE}" || exit 1; check_env; apply_nat_profile "${2:-stable}" )
+            ;;
+        dns)
+            case "${2:-}" in
+                status)
+                    ( source "${SSR_MODULE_FILE}" || exit 1; dns_status )
+                    ;;
+                set|lock)
+                    ( source "${SSR_MODULE_FILE}" || exit 1; dns_set_or_lock "${2}" )
+                    ;;
+                unlock)
+                    ( source "${SSR_MODULE_FILE}" || exit 1; dns_unlock_restore )
+                    ;;
+                auto|smart|"")
+                    ( source "${SSR_MODULE_FILE}" || exit 1; check_env; smart_dns_apply "${3:-stable}" "${4:-auto}" )
+                    ;;
+                *)
+                    msg_err "用法: my ssr dns [status|set|lock|unlock|auto [stable|extreme] [auto|set|lock]]"
+                    return 1
+                    ;;
+            esac
+            ;;
         *)
-            msg_err "用法: my ssr <daemon_check|ddns|hot_upgrade>"
+            msg_err "用法: my ssr <daemon_check|ddns|hot_upgrade|auto [stable|extreme]|dns ...> ；regular/nat 仍保留为高级兼容入口"
             return 1
             ;;
     esac
@@ -3420,8 +3614,11 @@ nft_cli() {
         --cron)
             ( source "${NFT_MODULE_FILE}" || exit 1; ddns_update )
             ;;
+        optimize|auto)
+            ( source "${NFT_MODULE_FILE}" || exit 1; check_env; nft_apply_profile "${2:-stable}" )
+            ;;
         *)
-            msg_err "用法: my nft --cron"
+            msg_err "用法: my nft <--cron|optimize [stable|extreme]>"
             return 1
             ;;
     esac
@@ -3469,7 +3666,11 @@ init() {
 # --------------------------
 # 入口
 # --------------------------
-init
+ensure_runtime_ready_for_cli() {
+    require_root
+    install_self_command
+    [[ -f "${SSR_MODULE_FILE}" && -f "${NFT_MODULE_FILE}" ]] || install_modules
+}
 
 if [[ $# -gt 0 ]]; then
     case "$1" in
@@ -3478,26 +3679,30 @@ if [[ $# -gt 0 ]]; then
             exit 0
             ;;
         ssr)
+            ensure_runtime_ready_for_cli
             shift
             ssr_cli "$@"
             exit $?
             ;;
         nft)
+            ensure_runtime_ready_for_cli
             shift
             nft_cli "$@"
             exit $?
             ;;
         update)
+            ensure_runtime_ready_for_cli
             github_update
             exit $?
             ;;
         *)
-            msg_err "未知参数。可用: my clean | my ssr ... | my nft --cron | my update"
+            msg_err "未知参数。可用: my clean | my ssr ... | my nft --cron | my nft optimize [stable|extreme] | my update"
             exit 1
             ;;
     esac
 fi
 
+init
 while true; do
     main_menu
 done
