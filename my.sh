@@ -1962,7 +1962,7 @@ ssr_cleanup_artifacts() {
     [[ -f "$DDNS_CONF" ]] && remove_cf_ddns "force" 2>/dev/null || true
     rm -f /usr/local/bin/shadow-tls "$CONF_FILE" "$NAT_CONF_FILE" "$DDNS_CONF" "$DDNS_LOG" "$META_FILE"
     rm -f /usr/local/bin/ssr /usr/local/bin/ssr.sh 2>/dev/null || true
-    crontab -l 2>/dev/null | grep -vE "/usr/local/bin/ssr (auto_update|auto_task|daemon_check|hot_upgrade|clean|daily_task|ddns)" | crontab - 2>/dev/null || true
+    crontab -l 2>/dev/null | grep -vE "/usr/local/bin/ssr (auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)" | crontab - 2>/dev/null || true
     dns_unlock_restore 2>/dev/null || true
 
     if [[ -f "$SWAP_MARK_FILE" ]]; then
@@ -2002,19 +2002,16 @@ sys_menu() {
         echo -e "${YELLOW} 3.${RESET} 服务器时间防偏移同步"
         echo -e "${YELLOW} 4.${RESET} SSH 密钥登录管理中心"
         echo -e "${GREEN} 5.${RESET} 原生 Cloudflare DDNS 解析模块"
-        echo -e "${CYAN}--------------------------------------------${RESET}"
-        echo -e "${YELLOW} 6.${RESET} 手动安全热更升级核心组件"
-        echo -e "${YELLOW} 7.${RESET} DNS 管理中心（智能/手动/锁定/恢复）"
-        echo -e " 0. 返回主菜单"
-        read -rp "输入数字 [0-7]: " sys_num
+        echo -e "${YELLOW} 6.${RESET} DNS 管理中心（智能/手动/锁定/恢复）"
+        echo -e " 0. 返回上级菜单"
+        read -rp "输入数字 [0-6]: " sys_num
         case "$sys_num" in
             1) change_ssh_port ;;
             2) change_root_password ;;
             3) sync_server_time ;;
             4) ssh_key_menu ;;
             5) cf_ddns_menu ;;
-            6) hot_update_components ;;
-            7) dns_menu ;;
+            6) dns_menu ;;
             0) return ;;
         esac
     done
@@ -2032,21 +2029,20 @@ main_menu() {
     echo -e "${GREEN} 4.${RESET} 🔰 统一节点管控中心 (查看 / 删除 / 核爆)"
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (智能调优 + 清理)"
-    echo -e "${YELLOW} 6.${RESET} 系统底层管控 (DDNS / 安全 / 更新)"
     echo -e "${CYAN}============================================${RESET}"
-    echo -e " 0. 退出脚本"
-    read -rp "请输入对应数字 [0-6]: " num
+    echo -e " 0. 返回上级菜单"
+    read -rp "请输入对应数字 [0-5]: " num
     case "$num" in
         1) install_ss_rust_native ;;
         2) install_vless_native ;;
         3) install_shadowtls_native ;;
         4) unified_node_manager ;;
         5) opt_menu ;;
-        6) sys_menu ;;
-        0) echo -e "${GREEN}感谢使用，再见！${RESET}"; exit 0 ;;
+        0) return 1 ;;
         *) echo -e "${RED}请输入正确的选项！${RESET}" ;;
     esac
-    echo -e "\n${CYAN}按任意键返回主菜单，或按 Ctrl+C 直接退出...${RESET}"
+    echo -e "
+${CYAN}按任意键返回上一层...${RESET}"
     read -n 1 -s -r
 }
 
@@ -3605,12 +3601,50 @@ ngx_list_proxies() {
         domain="${domain%.conf}"
         backend="$(grep -E '^# backend=' "$conf" 2>/dev/null | head -n1 | cut -d= -f2-)"
         [[ -n "$backend" ]] || backend="未知"
-        echo -e " ${GREEN}● 域名:${RESET} ${domain}  ==>  ${YELLOW}后端:${RESET} ${backend}"
         count=$((count+1))
+        echo -e " ${GREEN}${count}.${RESET} ${domain}  ==>  ${YELLOW}${backend}${RESET}"
     done
     shopt -u nullglob
     [[ $count -eq 0 ]] && echo -e "${YELLOW}当前未发现任何由本脚本管理的 Nginx 代理配置。${RESET}"
     echo "------------------------------------------------"
+}
+
+ngx_delete_proxy_pick() {
+    local conf domain backend idx=0 pick
+    local -a domains backends
+    shopt -s nullglob
+    for conf in /etc/nginx/conf.d/my-rproxy.*.conf; do
+        domain="$(basename "$conf")"
+        domain="${domain#my-rproxy.}"
+        domain="${domain%.conf}"
+        backend="$(grep -E '^# backend=' "$conf" 2>/dev/null | head -n1 | cut -d= -f2-)"
+        [[ -n "$backend" ]] || backend="未知"
+        domains[idx]="$domain"
+        backends[idx]="$backend"
+        idx=$((idx+1))
+    done
+    shopt -u nullglob
+
+    if [[ ${#domains[@]} -eq 0 ]]; then
+        ngx_msg_warn "当前没有可删除的反向代理。"
+        return 1
+    fi
+
+    echo -e "${CYAN}=== 按序号删除反向代理 ===${RESET}"
+    local i display
+    for ((i=0; i<${#domains[@]}; i++)); do
+        display=$((i+1))
+        echo -e " ${GREEN}${display}.${RESET} ${domains[i]}  ==>  ${YELLOW}${backends[i]}${RESET}"
+    done
+    read -rp "请输入要删除的序号 [1-${#domains[@]}]，直接回车取消: " pick
+    [[ -z "$pick" ]] && { ngx_msg_warn "已取消删除。"; return 1; }
+    [[ "$pick" =~ ^[0-9]+$ ]] || { ngx_msg_err "请输入有效序号。"; return 1; }
+    (( pick >= 1 && pick <= ${#domains[@]} )) || { ngx_msg_err "序号超出范围。"; return 1; }
+
+    local target="${domains[$((pick-1))]}"
+    read -rp "确认删除 ${target} ? [y/N]: " confirm
+    [[ "$confirm" =~ ^[yY]$ ]] || { ngx_msg_warn "已取消删除。"; return 1; }
+    ngx_delete_proxy_domain "$target"
 }
 
 ngx_add_proxy() {
@@ -3727,7 +3761,7 @@ nginx_menu() {
         echo -e "${CYAN}================================================${RESET}"
         echo "  1. ➕ 添加新的反向代理 (含 HTTPS)"
         echo "  2. 🔍 查看已配置的代理列表"
-        echo "  3. 🗑️  删除指定的反向代理"
+        echo "  3. 🗑️  按序号删除反向代理"
         echo "  4. 🔧 重新安装/修复依赖环境"
         echo "  0. 返回上级菜单"
         echo -e "${CYAN}================================================${RESET}"
@@ -3735,7 +3769,7 @@ nginx_menu() {
         case "$choice" in
             1) ngx_add_proxy; ngx_pause ;;
             2) ngx_list_proxies; ngx_pause ;;
-            3) read -rp "请输入要删除的域名: " d; ngx_delete_proxy_domain "$d"; ngx_pause ;;
+            3) ngx_delete_proxy_pick; ngx_pause ;;
             4) ngx_install_dependencies; ngx_pause ;;
             0) return ;;
             *) ngx_msg_err "无效的选项，请重新输入。"; sleep 1 ;;
@@ -3789,13 +3823,13 @@ my_enable_ssr_cron_tasks() {
     fi
 
     # 清理旧任务（ssr/旧脚本）
-    cron_remove_regex '(^|\s)(/usr/local/bin/ssr|/usr/local/bin/my\s+ssr)\s+(auto_update|auto_task|daemon_check|hot_upgrade|clean|daily_task|ddns)(\s|$)'
+    cron_remove_regex '(^|\s)(/usr/local/bin/ssr|/usr/local/bin/my\s+ssr)\s+(auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)(\s|$)'
 
     # 守护检查（每分钟）
     cron_add_line_once "* * * * * ${lock_prefix} ${my_cmd} ssr daemon_check > /dev/null 2>&1"
 
     # 核心组件安全热更（每天 3 点；清理由全局 2 点任务负责）
-    cron_add_line_once "0 3 * * * ${lock_prefix} ${my_cmd} ssr hot_upgrade > /dev/null 2>&1"
+    cron_add_line_once "0 3 * * * ${lock_prefix} ${my_cmd} ssr auto_core_update > /dev/null 2>&1"
 
     # DDNS（存在配置才启用）
     if [[ -f "${SSR_DDNS_CONF}" ]]; then
@@ -3806,7 +3840,7 @@ my_enable_ssr_cron_tasks() {
 }
 
 my_disable_ssr_cron_tasks() {
-    cron_remove_regex '(^|\s)(/usr/local/bin/ssr|/usr/local/bin/my\s+ssr)\s+(auto_update|auto_task|daemon_check|hot_upgrade|clean|daily_task|ddns)(\s|$)'
+    cron_remove_regex '(^|\s)(/usr/local/bin/ssr|/usr/local/bin/my\s+ssr)\s+(auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)(\s|$)'
 }
 
 my_remove_nft_cron_tasks() {
@@ -4011,12 +4045,20 @@ uninstall_menu() {
 
 run_ssr_module_menu() {
     my_enable_ssr_cron_tasks
-    ( 
+    (
       source "${SSR_MODULE_FILE}" || exit 1
       check_env
       while true; do
-          main_menu
+          main_menu || break
       done
+    )
+}
+
+run_system_module_menu() {
+    (
+      source "${SSR_MODULE_FILE}" || exit 1
+      check_env
+      sys_menu
     )
 }
 
@@ -4458,7 +4500,7 @@ ssr_cli() {
             my_enable_ssr_cron_tasks
             ( source "${SSR_MODULE_FILE}" || exit 1; run_cf_ddns "auto" )
             ;;
-        hot_upgrade|hot_update)
+        auto_core_update|hot_upgrade|hot_update)
             ( source "${SSR_MODULE_FILE}" || exit 1; hot_update_components "silent" )
             ;;
         auto)
@@ -4491,7 +4533,7 @@ ssr_cli() {
             esac
             ;;
         *)
-            msg_err "用法: my ssr <daemon_check|ddns|hot_upgrade|auto [stable|extreme]|dns ...> ；regular/nat 仍保留为高级兼容入口"
+            msg_err "用法: my ssr <daemon_check|ddns|auto [stable|extreme]|dns ...> ；regular/nat 仍保留为高级兼容入口"
             return 1
             ;;
     esac
@@ -4549,20 +4591,22 @@ main_menu() {
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${YELLOW} 1.${RESET} SSR 管理"
     echo -e "${YELLOW} 2.${RESET} NFT 转发"
-    echo -e "${YELLOW} 3.${RESET} Nginx 反向代理"
-    echo -e "${GREEN} 4.${RESET} DD / 重装系统中心"
-    echo -e "${YELLOW} 5.${RESET} 一键卸载"
-    echo -e "${YELLOW} 6.${RESET} GitHub 一键更新"
+    echo -e "${YELLOW} 3.${RESET} 系统底层管控"
+    echo -e "${YELLOW} 4.${RESET} Nginx 反向代理"
+    echo -e "${GREEN} 5.${RESET} DD / 重装系统中心"
+    echo -e "${YELLOW} 6.${RESET} 一键卸载"
+    echo -e "${YELLOW} 7.${RESET} GitHub 一键更新"
     echo -e " 0. 退出"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    read -rp "请输入数字 [0-6]: " choice
+    read -rp "请输入数字 [0-7]: " choice
     case "$choice" in
         1) run_ssr_module_menu ;;
         2) run_nft_module_menu ;;
-        3) run_nginx_module_menu ;;
-        4) dd_menu ;;
-        5) uninstall_menu ;;
-        6) github_update ;;
+        3) run_system_module_menu ;;
+        4) run_nginx_module_menu ;;
+        5) dd_menu ;;
+        6) uninstall_menu ;;
+        7) github_update ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
@@ -4579,7 +4623,7 @@ init() {
 
     # 兼容清理旧脚本遗留 cron（只删旧 ssr/nftmgr 任务，不新增）
     cron_remove_regex '(^|\s)(/usr/local/bin/ssr|/usr/local/bin/nftmgr|nftmgr)\s+--cron(\s|$)'
-    cron_remove_regex '(^|\s)/usr/local/bin/ssr\s+(auto_update|auto_task|daemon_check|hot_upgrade|clean|daily_task|ddns)(\s|$)'
+    cron_remove_regex '(^|\s)/usr/local/bin/ssr\s+(auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)(\s|$)'
 }
 
 # --------------------------
