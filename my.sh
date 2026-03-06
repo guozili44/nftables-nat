@@ -3,7 +3,7 @@
 # 综合管理脚本：SSR + nftables
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v1.1.0  (build 2026-03-06+acd-smart)
+# 版本：v1.3.0  (build 2026-03-06+acdndd-nginx)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 # ============================================================
 
@@ -17,11 +17,12 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # --------------------------
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="1.1.0"
+MY_VERSION="1.3.0"
 
 MY_INSTALL_DIR="/usr/local/lib/my"
 SSR_MODULE_FILE="${MY_INSTALL_DIR}/ssr_module.sh"
 NFT_MODULE_FILE="${MY_INSTALL_DIR}/nft_module.sh"
+NGX_MODULE_FILE="${MY_INSTALL_DIR}/nginx_module.sh"
 
 MY_LOCK_FILE="/var/lock/my.lock"
 SSR_LOCK_FILE="/var/lock/ssr.lock"
@@ -30,6 +31,11 @@ SSR_DDNS_CONF="/usr/local/etc/ssr_ddns.conf"
 
 UPDATE_URL_DIRECT="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh"
 UPDATE_URL_PROXY="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh"
+
+REINSTALL_UPSTREAM_GLOBAL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+REINSTALL_UPSTREAM_CN="https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh"
+REINSTALL_WORKDIR="/tmp/my-reinstall"
+REINSTALL_SCRIPT_PATH="${REINSTALL_WORKDIR}/reinstall.sh"
 
 # --------------------------
 # 颜色
@@ -3285,7 +3291,460 @@ main_menu() {
 
 NFT_MODULE_EOF
 
-    chmod 755 "${SSR_MODULE_FILE}" "${NFT_MODULE_FILE}" 2>/dev/null || true
+    # Nginx 反向代理模块（并入 my 统一管理，避免与 Certbot/多站点冲突）
+    cat > "${NGX_MODULE_FILE}" <<'NGX_MODULE_EOF'
+#!/bin/bash
+set -o pipefail
+
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly CYAN='\033[0;36m'
+readonly RESET='\033[0m'
+
+readonly MY_NGX_ID="my-nginx-proxy"
+readonly NGX_META_DIR="/usr/local/etc/my_nginx_proxy"
+readonly NGX_STATE_FILE="${NGX_META_DIR}/state.conf"
+readonly NGX_COMMON_CONF="/etc/nginx/conf.d/00-my-rproxy-common.conf"
+readonly NGX_CONF_PREFIX="/etc/nginx/conf.d/my-rproxy"
+readonly NGX_WEBROOT="/var/lib/my-nginx-proxy/acme"
+readonly NGX_WORKDIR="/var/lib/my-nginx-proxy"
+readonly NGX_TMP_DIR="${NGX_WORKDIR}/tmp"
+readonly NGX_LOG_DIR="/var/log/nginx"
+
+ngx_have_cmd() { command -v "$1" >/dev/null 2>&1; }
+ngx_msg_ok() { echo -e "${GREEN}$*${RESET}"; }
+ngx_msg_warn() { echo -e "${YELLOW}$*${RESET}"; }
+ngx_msg_err() { echo -e "${RED}$*${RESET}"; }
+ngx_msg_info() { echo -e "${CYAN}$*${RESET}"; }
+ngx_pause() { read -n 1 -s -r -p "按任意键继续..."; echo; }
+
+ngx_state_get() {
+    local key="$1"
+    [[ -f "$NGX_STATE_FILE" ]] || return 1
+    grep -E "^${key}=" "$NGX_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//; s/"$//'
+}
+
+ngx_state_set() {
+    local key="$1" value="$2"
+    mkdir -p "$NGX_META_DIR" 2>/dev/null || true
+    touch "$NGX_STATE_FILE"
+    chmod 600 "$NGX_STATE_FILE" 2>/dev/null || true
+    if grep -qE "^${key}=" "$NGX_STATE_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=\"${value}\"|g" "$NGX_STATE_FILE"
+    else
+        echo "${key}=\"${value}\"" >> "$NGX_STATE_FILE"
+    fi
+}
+
+ngx_pkg_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+ngx_state_init_if_needed() {
+    [[ "$(ngx_state_get STATE_INIT)" == "1" ]] && return 0
+    ngx_state_set STATE_INIT 1
+    ngx_pkg_installed nginx && ngx_state_set PKG_NGINX_BY_MY 0 || ngx_state_set PKG_NGINX_BY_MY 1
+    ngx_pkg_installed certbot && ngx_state_set PKG_CERTBOT_BY_MY 0 || ngx_state_set PKG_CERTBOT_BY_MY 1
+    ngx_pkg_installed python3-certbot-nginx && ngx_state_set PKG_CERTBOT_NGINX_BY_MY 0 || ngx_state_set PKG_CERTBOT_NGINX_BY_MY 1
+}
+
+ngx_require_apt() {
+    ngx_have_cmd apt-get || { ngx_msg_err "当前仅支持 Debian/Ubuntu 系 apt 环境。"; return 1; }
+}
+
+ngx_validate_domain() {
+    local d="${1,,}"
+    [[ -n "$d" ]] || return 1
+    [[ "$d" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || return 1
+    [[ "$d" == *.* ]] || return 1
+    [[ "$d" != *..* ]] || return 1
+    return 0
+}
+
+ngx_is_ip_literal() {
+    local h="$1"
+    [[ "$h" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 0
+    [[ "$h" =~ ^\[[0-9a-fA-F:]+\]$ ]] && return 0
+    return 1
+}
+
+ngx_parse_backend() {
+    local input="$1"
+    NGX_BACKEND_PROTO="http"
+    local rest="$input"
+    if [[ "$input" == https://* ]]; then
+        NGX_BACKEND_PROTO="https"
+        rest="${input#https://}"
+    elif [[ "$input" == http://* ]]; then
+        NGX_BACKEND_PROTO="http"
+        rest="${input#http://}"
+    fi
+    rest="${rest%/}"
+    [[ -n "$rest" ]] || return 1
+
+    local host port
+    if [[ "$rest" =~ ^\[[0-9a-fA-F:]+\]:[0-9]+$ ]]; then
+        host="${rest%%]:*}]"
+        port="${rest##*:}"
+    else
+        host="${rest%:*}"
+        port="${rest##*:}"
+        [[ "$host" != "$rest" ]] || return 1
+    fi
+
+    [[ -n "$host" && "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( port >= 1 && port <= 65535 )) || return 1
+
+    NGX_BACKEND_RAW="$input"
+    NGX_BACKEND_HOST="$host"
+    NGX_BACKEND_PORT="$port"
+    NGX_BACKEND_ADDR="$rest"
+    return 0
+}
+
+ngx_proxy_ssl_block() {
+    if [[ "$NGX_BACKEND_PROTO" == "https" ]]; then
+        if ngx_is_ip_literal "$NGX_BACKEND_HOST"; then
+            printf '%s\n' '        proxy_ssl_server_name off;'
+        else
+            printf '%s\n' '        proxy_ssl_server_name on;'
+            printf '        proxy_ssl_name %s;\n' "$NGX_BACKEND_HOST"
+        fi
+    fi
+}
+
+ngx_site_conf() {
+    printf '%s\n' "${NGX_CONF_PREFIX}.${1}.conf"
+}
+
+ngx_write_common_conf() {
+    mkdir -p /etc/nginx/conf.d "$NGX_WEBROOT" "$NGX_TMP_DIR" "$NGX_META_DIR" 2>/dev/null || true
+    cat > "$NGX_COMMON_CONF" <<'EOF'
+# managed-by=my-nginx-proxy
+map $http_upgrade $my_proxy_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
+}
+
+ngx_test_reload() {
+    nginx -t >/dev/null 2>&1 || return 1
+    systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || return 1
+    return 0
+}
+
+ngx_install_dependencies() {
+    ngx_require_apt || return 1
+    ngx_state_init_if_needed
+    export DEBIAN_FRONTEND=noninteractive
+    ngx_msg_info "检查并安装 Nginx / Certbot 环境..."
+    apt-get update -qq || return 1
+    apt-get install -y -qq nginx certbot curl ca-certificates >/dev/null || return 1
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl start nginx >/dev/null 2>&1 || true
+    ngx_write_common_conf
+    ngx_msg_ok "环境依赖就绪。"
+}
+
+ngx_domain_dns_hint() {
+    local domain="$1" pub4="" pub6="" dns4="" dns6=""
+    ngx_have_cmd curl && pub4="$(curl -4 -fsS --connect-timeout 3 --max-time 6 https://api.ip.sb/ip 2>/dev/null || true)"
+    ngx_have_cmd curl && pub6="$(curl -6 -fsS --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
+    dns4="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd ',' -)"
+    dns6="$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd ',' -)"
+    [[ -n "$dns4$dns6" ]] || { ngx_msg_warn "提示：当前本机未解析到 ${domain} 的 DNS 记录，证书申请可能失败。"; return 0; }
+    [[ -n "$pub4" && ",$dns4," != *",$pub4,"* ]] && ngx_msg_warn "提示：${domain} 的 IPv4 DNS 未命中本机公网 IPv4 ${pub4}。"
+    [[ -n "$pub6" && -n "$dns6" && ",$dns6," != *",$pub6,"* ]] && ngx_msg_warn "提示：${domain} 的 IPv6 DNS 未命中本机公网 IPv6 ${pub6}。"
+}
+
+ngx_render_http_conf() {
+    local domain="$1"
+    cat <<EOF
+# managed-by=${MY_NGX_ID}
+# domain=${domain}
+# backend=${NGX_BACKEND_RAW}
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+
+    access_log ${NGX_LOG_DIR}/${domain}_access.log;
+    error_log  ${NGX_LOG_DIR}/${domain}_error.log;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${NGX_WEBROOT};
+        default_type "text/plain";
+    }
+
+    location / {
+        proxy_pass ${NGX_BACKEND_PROTO}://${NGX_BACKEND_ADDR};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$my_proxy_connection_upgrade;
+        proxy_connect_timeout 90s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+        proxy_buffering off;
+        proxy_cache off;
+$(ngx_proxy_ssl_block)
+    }
+}
+EOF
+}
+
+ngx_render_https_conf() {
+    local domain="$1"
+    cat <<EOF
+# managed-by=${MY_NGX_ID}
+# domain=${domain}
+# backend=${NGX_BACKEND_RAW}
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${NGX_WEBROOT};
+        default_type "text/plain";
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${domain};
+
+    access_log ${NGX_LOG_DIR}/${domain}_access.log;
+    error_log  ${NGX_LOG_DIR}/${domain}_error.log;
+
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_tickets off;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    client_max_body_size 0;
+    server_tokens off;
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+
+    location / {
+        proxy_pass ${NGX_BACKEND_PROTO}://${NGX_BACKEND_ADDR};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$my_proxy_connection_upgrade;
+        proxy_connect_timeout 90s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+        proxy_buffering off;
+        proxy_cache off;
+$(ngx_proxy_ssl_block)
+    }
+}
+EOF
+}
+
+ngx_install_conf_from_stdin() {
+    local dst="$1"
+    local tmp
+    tmp="$(mktemp "${NGX_TMP_DIR}/conf.XXXXXX")" || return 1
+    cat > "$tmp"
+    install -m 644 "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+}
+
+ngx_delete_cert_if_exists() {
+    local domain="$1"
+    certbot delete --cert-name "$domain" --non-interactive --quiet >/dev/null 2>&1 || true
+}
+
+ngx_delete_proxy_domain() {
+    local domain="${1,,}"
+    ngx_validate_domain "$domain" || { ngx_msg_err "域名格式无效。"; return 1; }
+    local conf
+    conf="$(ngx_site_conf "$domain")"
+    [[ -f "$conf" ]] || { ngx_msg_err "未找到由本脚本管理的域名 ${domain}。"; return 1; }
+
+    ngx_delete_cert_if_exists "$domain"
+    rm -f "$conf" "${NGX_LOG_DIR}/${domain}_access.log" "${NGX_LOG_DIR}/${domain}_error.log" 2>/dev/null || true
+    if ngx_have_cmd nginx && ngx_test_reload; then
+        ngx_msg_ok "域名 ${domain} 的反代与证书已清理。"
+    else
+        ngx_msg_warn "配置文件已删除，但 Nginx 重载失败，请检查其它非本脚本配置。"
+    fi
+    return 0
+}
+
+ngx_list_proxies() {
+    echo -e "${CYAN}=== 当前由本脚本管理的反向代理 ===${RESET}"
+    local conf count=0 domain backend
+    shopt -s nullglob
+    for conf in /etc/nginx/conf.d/my-rproxy.*.conf; do
+        domain="$(basename "$conf")"
+        domain="${domain#my-rproxy.}"
+        domain="${domain%.conf}"
+        backend="$(grep -E '^# backend=' "$conf" 2>/dev/null | head -n1 | cut -d= -f2-)"
+        [[ -n "$backend" ]] || backend="未知"
+        echo -e " ${GREEN}● 域名:${RESET} ${domain}  ==>  ${YELLOW}后端:${RESET} ${backend}"
+        count=$((count+1))
+    done
+    shopt -u nullglob
+    [[ $count -eq 0 ]] && echo -e "${YELLOW}当前未发现任何由本脚本管理的 Nginx 代理配置。${RESET}"
+    echo "------------------------------------------------"
+}
+
+ngx_add_proxy() {
+    local backend_input domain_name cert_email conf tmp_final
+    echo -e "${CYAN}=== 添加新的反向代理 ===${RESET}"
+    ngx_install_dependencies || { ngx_msg_err "依赖安装失败。"; sleep 2; return 1; }
+
+    while :; do
+        read -rp "后端服务地址（格式: IP:端口 / 域名:端口 / http:// / https://）: " backend_input
+        ngx_parse_backend "$backend_input" && break
+        ngx_msg_err "后端地址格式无效，请重新输入。"
+    done
+    while :; do
+        read -rp "绑定域名（请确保已解析到本机）: " domain_name
+        domain_name="${domain_name,,}"
+        ngx_validate_domain "$domain_name" && break
+        ngx_msg_err "域名格式无效，请重新输入。"
+    done
+    read -rp "申请证书邮箱（可留空）: " cert_email
+
+    conf="$(ngx_site_conf "$domain_name")"
+    if [[ -f "$conf" ]]; then
+        ngx_msg_err "域名 ${domain_name} 的配置已存在，请先删除或更换域名。"
+        sleep 2
+        return 1
+    fi
+
+    ngx_domain_dns_hint "$domain_name"
+    ngx_write_common_conf
+    mkdir -p "$NGX_WEBROOT" "$NGX_TMP_DIR" 2>/dev/null || true
+
+    ngx_render_http_conf "$domain_name" | ngx_install_conf_from_stdin "$conf" || { ngx_msg_err "写入 HTTP 配置失败。"; return 1; }
+    if ! ngx_test_reload; then
+        rm -f "$conf"
+        ngx_msg_err "Nginx 配置验证失败，已回滚。"
+        sleep 2
+        return 1
+    fi
+
+    local email_args=()
+    if [[ -n "$cert_email" ]]; then
+        email_args=(--email "$cert_email")
+    else
+        email_args=(--register-unsafely-without-email)
+    fi
+
+    ngx_msg_info "开始申请 SSL 证书..."
+    if ! certbot certonly --webroot -w "$NGX_WEBROOT" --non-interactive --agree-tos "${email_args[@]}" -d "$domain_name" >/dev/null 2>&1; then
+        rm -f "$conf"
+        ngx_test_reload >/dev/null 2>&1 || true
+        ngx_delete_cert_if_exists "$domain_name"
+        ngx_msg_err "SSL 证书申请失败，已自动回滚配置。"
+        sleep 2
+        return 1
+    fi
+
+    tmp_final="$(mktemp "${NGX_TMP_DIR}/final.XXXXXX")" || { ngx_delete_cert_if_exists "$domain_name"; rm -f "$conf"; return 1; }
+    ngx_render_https_conf "$domain_name" > "$tmp_final"
+    install -m 644 "$tmp_final" "$conf" 2>/dev/null || { rm -f "$tmp_final"; ngx_delete_cert_if_exists "$domain_name"; rm -f "$conf"; return 1; }
+    rm -f "$tmp_final"
+
+    if ! ngx_test_reload; then
+        rm -f "$conf"
+        ngx_delete_cert_if_exists "$domain_name"
+        ngx_test_reload >/dev/null 2>&1 || true
+        ngx_msg_err "最终 HTTPS 配置校验失败，已回滚。"
+        sleep 2
+        return 1
+    fi
+
+    ngx_msg_ok "✅ 部署完成：https://${domain_name}"
+    return 0
+}
+
+nginx_cleanup_artifacts() {
+    local conf domain
+    shopt -s nullglob
+    for conf in /etc/nginx/conf.d/my-rproxy.*.conf; do
+        domain="$(basename "$conf")"
+        domain="${domain#my-rproxy.}"
+        domain="${domain%.conf}"
+        ngx_delete_cert_if_exists "$domain"
+        rm -f "$conf" "${NGX_LOG_DIR}/${domain}_access.log" "${NGX_LOG_DIR}/${domain}_error.log" 2>/dev/null || true
+    done
+    shopt -u nullglob
+
+    rm -f "$NGX_COMMON_CONF" 2>/dev/null || true
+
+    if ngx_have_cmd nginx; then
+        if nginx -t >/dev/null 2>&1; then
+            systemctl reload nginx >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if [[ "$(ngx_state_get PKG_CERTBOT_NGINX_BY_MY)" == "1" || "$(ngx_state_get PKG_CERTBOT_BY_MY)" == "1" || "$(ngx_state_get PKG_NGINX_BY_MY)" == "1" ]]; then
+        export DEBIAN_FRONTEND=noninteractive
+        [[ "$(ngx_state_get PKG_CERTBOT_NGINX_BY_MY)" == "1" ]] && apt-get purge -y -qq python3-certbot-nginx >/dev/null 2>&1 || true
+        [[ "$(ngx_state_get PKG_CERTBOT_BY_MY)" == "1" ]] && apt-get purge -y -qq certbot >/dev/null 2>&1 || true
+        [[ "$(ngx_state_get PKG_NGINX_BY_MY)" == "1" ]] && apt-get purge -y -qq nginx nginx-common nginx-core >/dev/null 2>&1 || true
+        apt-get autoremove -y -qq >/dev/null 2>&1 || true
+        apt-get clean -qq >/dev/null 2>&1 || true
+        [[ "$(ngx_state_get PKG_NGINX_BY_MY)" == "1" ]] && rm -rf /etc/nginx /var/log/nginx 2>/dev/null || true
+        [[ "$(ngx_state_get PKG_CERTBOT_BY_MY)" == "1" ]] && rm -rf /var/lib/letsencrypt 2>/dev/null || true
+    fi
+
+    rm -rf "$NGX_META_DIR" "$NGX_WORKDIR" 2>/dev/null || true
+}
+
+nginx_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}================================================${RESET}"
+        echo -e "${GREEN}      Nginx 反向代理与 HTTPS 管理中心         ${RESET}"
+        echo -e "${CYAN}================================================${RESET}"
+        echo "  1. ➕ 添加新的反向代理 (含 HTTPS)"
+        echo "  2. 🔍 查看已配置的代理列表"
+        echo "  3. 🗑️  删除指定的反向代理"
+        echo "  4. 🔧 重新安装/修复依赖环境"
+        echo "  0. 返回上级菜单"
+        echo -e "${CYAN}================================================${RESET}"
+        read -rp "请输入选项 [0-4]: " choice
+        case "$choice" in
+            1) ngx_add_proxy; ngx_pause ;;
+            2) ngx_list_proxies; ngx_pause ;;
+            3) read -rp "请输入要删除的域名: " d; ngx_delete_proxy_domain "$d"; ngx_pause ;;
+            4) ngx_install_dependencies; ngx_pause ;;
+            0) return ;;
+            *) ngx_msg_err "无效的选项，请重新输入。"; sleep 1 ;;
+        esac
+    done
+}
+NGX_MODULE_EOF
+
+    chmod 755 "${SSR_MODULE_FILE}" "${NFT_MODULE_FILE}" "${NGX_MODULE_FILE}" 2>/dev/null || true
 }
 
 # --------------------------
@@ -3366,6 +3825,9 @@ daily_clean() {
 
     # 清理临时文件/缓存
     rm -rf /root/.cache/* /tmp/*.tar.xz /tmp/shadow-tls /tmp/ssserver /tmp/ssr_update.sh /tmp/xray* /tmp/tmp.json 2>/dev/null || true
+
+    # 清理 ddns / nginx 模块日志与临时文件
+    rm -rf /var/lib/my-nginx-proxy/tmp/* 2>/dev/null || true
 
     # 清理 ddns 日志：保留最近 7 天
     if [[ -d /var/log/nft_ddns ]]; then
@@ -3482,18 +3944,31 @@ uninstall_nft() {
     msg_ok "✅ NFT 转发卸载完成。"
 }
 
+uninstall_nginx() {
+    require_root
+    msg_warn "⚠️ 开始卸载 Nginx 反向代理相关组件..."
+
+    (
+      source "${NGX_MODULE_FILE}" 2>/dev/null || exit 0
+      nginx_cleanup_artifacts
+    )
+
+    msg_ok "✅ Nginx 反向代理卸载完成。"
+}
+
 uninstall_all() {
     require_root
-    msg_warn "⚠️ 将卸载 SSR + NFT 转发 + 本综合脚本本身（my）..."
+    msg_warn "⚠️ 将卸载 SSR + NFT 转发 + Nginx 反代 + DD 临时文件 + 本综合脚本本身（my）..."
 
     uninstall_ssr || true
     uninstall_nft || true
+    uninstall_nginx || true
 
     # 清理全局 cron（clean）
     cron_remove_regex '(^|\s)/usr/local/bin/my\s+(clean|daily_clean)(\s|$)'
 
     # 删除模块与自身
-    rm -rf "${MY_INSTALL_DIR}" 2>/dev/null || true
+    rm -rf "${MY_INSTALL_DIR}" "$REINSTALL_WORKDIR" 2>/dev/null || true
     rm -f "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
 
     msg_ok "✅ 已卸载全部。"
@@ -3504,11 +3979,12 @@ uninstall_menu() {
     while true; do
         clear
         echo -e "${CYAN}========= 一键卸载中心 =========${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 一键卸载所有（SSR + NFT + my）"
+        echo -e "${YELLOW} 1.${RESET} 一键卸载所有（SSR + NFT + Nginx + DD 临时文件 + my）"
         echo -e "${YELLOW} 2.${RESET} 一键卸载 SSR"
         echo -e "${YELLOW} 3.${RESET} 一键卸载 NFT 转发"
+        echo -e "${YELLOW} 4.${RESET} 一键卸载 Nginx 反向代理"
         echo -e " 0. 返回主菜单"
-        read -rp "请输入数字 [0-3]: " u
+        read -rp "请输入数字 [0-4]: " u
 
         case "$u" in
             1)
@@ -3523,15 +3999,16 @@ uninstall_menu() {
                 read -rp "确认卸载 NFT 转发？[y/N]: " c
                 [[ "$c" =~ ^[yY]$ ]] && uninstall_nft
                 ;;
+            4)
+                read -rp "确认卸载 Nginx 反向代理？[y/N]: " c
+                [[ "$c" =~ ^[yY]$ ]] && uninstall_nginx
+                ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
         esac
     done
 }
 
-# --------------------------
-# 运行模块
-# --------------------------
 run_ssr_module_menu() {
     my_enable_ssr_cron_tasks
     ( 
@@ -3556,9 +4033,421 @@ run_nft_module_menu() {
     )
 }
 
+
+run_nginx_module_menu() {
+    (
+      source "${NGX_MODULE_FILE}" || exit 1
+      nginx_menu
+    )
+}
+
+# --------------------------
+# DD / 重装系统工具（基于 bin456789/reinstall）
+# --------------------------
+DDTOOL_UPSTREAM_LABEL=""
+DDTOOL_UPSTREAM_URL=""
+DDTOOL_LAST_PASSWORD=""
+
+_ddtool_rand_pass() {
+    if have_cmd openssl; then
+        openssl rand -base64 12 2>/dev/null | tr -d '=+/
+' | cut -c1-14
+    else
+        tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 14
+    fi
+}
+
+ddtool_is_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 && "$1" -le 65535 ]]
+}
+
+ddtool_need_downloader() {
+    have_cmd curl || have_cmd wget
+}
+
+ddtool_human_size() {
+    local n="$1"
+    if have_cmd numfmt && [[ "$n" =~ ^[0-9]+$ ]]; then
+        numfmt --to=iec --suffix=B "$n" 2>/dev/null || echo "$n"
+    else
+        echo "$n"
+    fi
+}
+
+ddtool_get_boot_mode() {
+    [[ -d /sys/firmware/efi ]] && echo "UEFI" || echo "Legacy BIOS"
+}
+
+ddtool_get_virt_type() {
+    if have_cmd systemd-detect-virt; then
+        local vt
+        vt="$(systemd-detect-virt 2>/dev/null || true)"
+        [[ -n "$vt" && "$vt" != "none" ]] && echo "$vt" || echo "physical/unknown"
+    else
+        echo "unknown"
+    fi
+}
+
+ddtool_get_root_disk() {
+    local root_src base pk
+    root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+    [[ -z "$root_src" ]] && return 1
+    base="${root_src#/dev/}"
+    pk="$(lsblk -ndo PKNAME "$root_src" 2>/dev/null | head -n1)"
+    if [[ -n "$pk" ]]; then
+        echo "/dev/$pk"
+        return 0
+    fi
+    case "$base" in
+        nvme*n*p[0-9]*|mmcblk*p[0-9]*) echo "/dev/${base%p[0-9]*}" ;;
+        sd[a-z][0-9]*|vd[a-z][0-9]*|xvd[a-z][0-9]*) echo "/dev/${base%%[0-9]*}" ;;
+        *) echo "$root_src" ;;
+    esac
+}
+
+ddtool_cleanup_temp() {
+    rm -rf "$REINSTALL_WORKDIR" 2>/dev/null || true
+    DDTOOL_UPSTREAM_LABEL=""
+    DDTOOL_UPSTREAM_URL=""
+    DDTOOL_LAST_PASSWORD=""
+}
+
+ddtool_fail_and_return() {
+    local msg="$1"
+    ddtool_cleanup_temp
+    [[ -n "$msg" ]] && msg_err "$msg"
+    read -n 1 -s -r -p "按任意键返回..."
+    echo
+    return 1
+}
+
+ddtool_preflight() {
+    require_root
+    if ! ddtool_need_downloader; then
+        msg_err "缺少 curl 或 wget，无法拉取 reinstall.sh。"
+        return 1
+    fi
+    if have_cmd systemd-detect-virt; then
+        local vt
+        vt="$(systemd-detect-virt 2>/dev/null || true)"
+        case "$vt" in
+            openvz|lxc|lxc-libvirt)
+                msg_err "检测到当前环境为 ${vt}。上游脚本明确不支持 OpenVZ/LXC，已停止执行。"
+                return 1
+                ;;
+        esac
+    fi
+    return 0
+}
+
+ddtool_measure_url_ms() {
+    local url="$1"
+    if have_cmd curl; then
+        local out code total
+        out="$(curl -k -L -o /dev/null -sS --connect-timeout 4 --max-time 8 -w '%{http_code} %{time_total}' "$url" 2>/dev/null)" || return 1
+        code="${out%% *}"
+        total="${out##* }"
+        [[ "$code" =~ ^2|3 ]] || return 1
+        awk -v t="$total" 'BEGIN{printf "%d", t*1000}'
+        return 0
+    fi
+    if have_cmd wget; then
+        local start end
+        start=$(date +%s%3N 2>/dev/null || echo 0)
+        wget -qO /dev/null --timeout=8 "$url" >/dev/null 2>&1 || return 1
+        end=$(date +%s%3N 2>/dev/null || echo 0)
+        if [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$end" -ge "$start" ]]; then
+            echo $((end - start))
+        else
+            echo 9999
+        fi
+        return 0
+    fi
+    return 1
+}
+
+ddtool_pick_upstream() {
+    local gms="" cms=""
+    gms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_GLOBAL" 2>/dev/null || true)"
+    cms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_CN" 2>/dev/null || true)"
+    if [[ -n "$gms" && -n "$cms" ]]; then
+        if (( cms + 80 < gms )); then
+            echo "国内镜像|$REINSTALL_UPSTREAM_CN|${cms}ms"
+        else
+            echo "国际直连|$REINSTALL_UPSTREAM_GLOBAL|${gms}ms"
+        fi
+        return 0
+    fi
+    if [[ -n "$gms" ]]; then
+        echo "国际直连|$REINSTALL_UPSTREAM_GLOBAL|${gms}ms"
+        return 0
+    fi
+    if [[ -n "$cms" ]]; then
+        echo "国内镜像|$REINSTALL_UPSTREAM_CN|${cms}ms"
+        return 0
+    fi
+    return 1
+}
+
+ddtool_download_upstream() {
+    local choice label url latency
+    choice="$(ddtool_pick_upstream)" || {
+        msg_err "无法连接 bin456789/reinstall 的 GitHub 直连或国内镜像地址。"
+        return 1
+    }
+    label="${choice%%|*}"
+    url="${choice#*|}"
+    latency="${url##*|}"
+    url="${url%|*}"
+    mkdir -p "$REINSTALL_WORKDIR" 2>/dev/null || true
+    msg_info "已自动选择上游源：${label}（${latency}）"
+    if have_cmd curl; then
+        curl -fsSL "$url" -o "$REINSTALL_SCRIPT_PATH" || {
+            msg_err "下载 reinstall.sh 失败。"
+            ddtool_cleanup_temp
+            return 1
+        }
+    else
+        wget -qO "$REINSTALL_SCRIPT_PATH" "$url" || {
+            msg_err "下载 reinstall.sh 失败。"
+            ddtool_cleanup_temp
+            return 1
+        }
+    fi
+    chmod 700 "$REINSTALL_SCRIPT_PATH" 2>/dev/null || true
+    bash -n "$REINSTALL_SCRIPT_PATH" >/dev/null 2>&1 || {
+        msg_err "下载到的 reinstall.sh 语法校验失败。"
+        ddtool_cleanup_temp
+        return 1
+    }
+    DDTOOL_UPSTREAM_LABEL="$label"
+    DDTOOL_UPSTREAM_URL="$url"
+    return 0
+}
+
+ddtool_preview_cmd() {
+    local out=""
+    printf -v out '%q ' "$@"
+    echo "${out% }"
+}
+
+ddtool_confirm_exec() {
+    local prompt="${1:-确认继续请输入 YES: }"
+    local ans
+    read -rp "$prompt" ans
+    [[ "$ans" == "YES" ]]
+}
+
+ddtool_append_common_runtime_args() {
+    local -n _arr=$1
+    local ssh_port="$2" web_port="$3" hold_mode="$4" frpc_toml="$5"
+    [[ -n "$ssh_port" ]] && _arr+=(--ssh-port "$ssh_port")
+    [[ -n "$web_port" ]] && _arr+=(--web-port "$web_port")
+    [[ -n "$hold_mode" ]] && _arr+=(--hold "$hold_mode")
+    [[ -n "$frpc_toml" ]] && _arr+=(--frpc-toml "$frpc_toml")
+}
+
+ddtool_health_check() {
+    local interactive="${1:-yes}"
+    local virt boot root_disk root_size mem_total cpu_model default_route def_if gw dns_list ip4 ip6
+    local global_ms cn_ms warn_count=0 fatal_count=0
+    virt="$(ddtool_get_virt_type)"
+    boot="$(ddtool_get_boot_mode)"
+    root_disk="$(ddtool_get_root_disk 2>/dev/null || true)"
+    root_size="$(lsblk -bdno SIZE "$root_disk" 2>/dev/null | head -n1)"
+    mem_total="$(awk '/MemTotal/ {printf "%.1f GiB", $2/1024/1024}' /proc/meminfo 2>/dev/null | head -n1)"
+    cpu_model="$(awk -F: '/model name/ {gsub(/^[ 	]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)"
+    default_route="$(ip route show default 2>/dev/null | head -n1)"
+    def_if="$(awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<< "$default_route")"
+    gw="$(awk '/^default/ {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<< "$default_route")"
+    dns_list="$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ',' -)"
+    [[ -z "$dns_list" ]] && dns_list="未检测到"
+    if have_cmd curl; then
+        ip4="$(curl -4 -fsS --connect-timeout 3 --max-time 6 https://api.ip.sb/ip 2>/dev/null || true)"
+        ip6="$(curl -6 -fsS --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
+    fi
+    global_ms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_GLOBAL" 2>/dev/null || true)"
+    cn_ms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_CN" 2>/dev/null || true)"
+
+    clear
+    echo -e "${CYAN}========= 安装前网络与磁盘条件体检 =========${RESET}"
+    echo -e "虚拟化: ${GREEN}${virt}${RESET}"
+    echo -e "启动模式: ${GREEN}${boot}${RESET}"
+    echo -e "系统盘: ${GREEN}${root_disk:-未知}${RESET}  大小: ${GREEN}$(ddtool_human_size "$root_size")${RESET}"
+    echo -e "内存: ${GREEN}${mem_total:-未知}${RESET}"
+    echo -e "CPU: ${GREEN}${cpu_model:-未知}${RESET}"
+    echo -e "默认网卡: ${GREEN}${def_if:-未知}${RESET}  网关: ${GREEN}${gw:-未知}${RESET}"
+    echo -e "DNS: ${GREEN}${dns_list}${RESET}"
+    [[ -n "$ip4" ]] && echo -e "IPv4 出口: ${GREEN}${ip4}${RESET}"
+    [[ -n "$ip6" ]] && echo -e "IPv6 出口: ${GREEN}${ip6}${RESET}"
+    [[ -n "$global_ms" ]] && echo -e "GitHub 直连测速: ${GREEN}${global_ms}ms${RESET}" || { echo -e "GitHub 直连测速: ${RED}失败${RESET}"; warn_count=$((warn_count+1)); }
+    [[ -n "$cn_ms" ]] && echo -e "国内镜像测速: ${GREEN}${cn_ms}ms${RESET}" || { echo -e "国内镜像测速: ${RED}失败${RESET}"; warn_count=$((warn_count+1)); }
+
+    if [[ -z "$default_route" ]]; then
+        echo -e "${RED}失败：未检测到默认路由。${RESET}"
+        fatal_count=$((fatal_count+1))
+    fi
+    if [[ -z "$root_disk" ]]; then
+        echo -e "${RED}失败：未能明确识别系统盘，已阻止继续执行。${RESET}"
+        fatal_count=$((fatal_count+1))
+    fi
+    if [[ -n "$root_size" && "$root_size" =~ ^[0-9]+$ && "$root_size" -lt 21474836480 ]]; then
+        echo -e "${YELLOW}提示：系统盘小于 20GiB，建议确认镜像占用与分区策略。${RESET}"
+        warn_count=$((warn_count+1))
+    fi
+
+    echo
+    if (( fatal_count > 0 )); then
+        echo -e "${RED}体检未通过：存在 ${fatal_count} 个阻断项。${RESET}"
+        [[ "$interactive" == "yes" ]] && read -n 1 -s -r -p "按任意键返回..."
+        return 1
+    fi
+    if (( warn_count > 0 )); then
+        echo -e "${YELLOW}体检通过，但有 ${warn_count} 个提醒项。${RESET}"
+    else
+        echo -e "${GREEN}体检通过，未发现明显阻断项。${RESET}"
+    fi
+    [[ "$interactive" == "yes" ]] && read -n 1 -s -r -p "按任意键继续..."
+    return 0
+}
+
+ddtool_prompt_linux_access() {
+    local mode_title="$1"
+    DDTOOL_LAST_PASSWORD=""
+    DDTOOL_PASSWORD=""
+    DDTOOL_SSH_KEY=""
+    DDTOOL_SSH_PORT=""
+    DDTOOL_WEB_PORT=""
+    DDTOOL_FRPC_TOML=""
+    DDTOOL_HOLD_MODE=""
+
+    echo -e "${CYAN}>>> ${mode_title}：访问与安装参数${RESET}"
+    read -rp "root 密码（回车自动生成随机密码）: " DDTOOL_PASSWORD
+    read -rp "SSH 公钥（可空；填写后将优先密钥登录）: " DDTOOL_SSH_KEY
+    if [[ -n "$DDTOOL_SSH_KEY" ]]; then
+        DDTOOL_PASSWORD=""
+        DDTOOL_LAST_PASSWORD=""
+    else
+        if [[ -z "$DDTOOL_PASSWORD" ]]; then
+            DDTOOL_PASSWORD="$(_ddtool_rand_pass)"
+            DDTOOL_LAST_PASSWORD="$DDTOOL_PASSWORD"
+            msg_warn "已自动生成随机 root 密码：${DDTOOL_PASSWORD}"
+        else
+            DDTOOL_LAST_PASSWORD="$DDTOOL_PASSWORD"
+        fi
+    fi
+    read -rp "安装环境 SSH 端口（可空，默认 22）: " DDTOOL_SSH_PORT
+    if [[ -n "$DDTOOL_SSH_PORT" ]] && ! ddtool_is_port "$DDTOOL_SSH_PORT"; then
+        msg_err "SSH 端口无效。"
+        return 1
+    fi
+    read -rp "安装环境 Web 日志端口（可空，默认 80）: " DDTOOL_WEB_PORT
+    if [[ -n "$DDTOOL_WEB_PORT" ]] && ! ddtool_is_port "$DDTOOL_WEB_PORT"; then
+        msg_err "Web 端口无效。"
+        return 1
+    fi
+    read -rp "frpc 配置路径/URL（可空）: " DDTOOL_FRPC_TOML
+    read -rp "hold 模式（可空/1/2）: " DDTOOL_HOLD_MODE
+    [[ -n "$DDTOOL_HOLD_MODE" && "$DDTOOL_HOLD_MODE" != "1" && "$DDTOOL_HOLD_MODE" != "2" ]] && { msg_err "hold 仅支持 1 或 2。"; return 1; }
+    return 0
+}
+
+ddtool_execute() {
+    local action_desc="$1"
+    shift
+    local cmd=("$@")
+
+    ddtool_preflight || return 1
+    ddtool_download_upstream || return 1
+    ddtool_health_check no || { ddtool_fail_and_return "安装前体检未通过，已清理临时文件并返回菜单。"; return 1; }
+
+    echo
+    echo -e "${CYAN}========= DD / 重装系统执行确认 =========${RESET}"
+    echo -e "任务: ${GREEN}${action_desc}${RESET}"
+    echo -e "上游源: ${YELLOW}${DDTOOL_UPSTREAM_LABEL}${RESET}"
+    [[ -n "$DDTOOL_LAST_PASSWORD" ]] && echo -e "root 密码: ${YELLOW}${DDTOOL_LAST_PASSWORD}${RESET}"
+    echo -e "命令: ${CYAN}$(ddtool_preview_cmd "${cmd[@]}")${RESET}"
+    echo -e "${RED}警告：该操作会清空整块硬盘及全部分区数据。${RESET}"
+    echo -e "${RED}如机器可用 IPMI/U盘/控制台，优先使用更稳妥的方式。${RESET}"
+    echo
+    ddtool_confirm_exec "确认继续请输入 YES: " || { ddtool_cleanup_temp; msg_warn "已取消，临时文件已清理。"; sleep 1; return 1; }
+    clear
+    echo -e "${CYAN}>>> 已开始执行：${action_desc}${RESET}"
+    "${cmd[@]}"
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        ddtool_cleanup_temp
+        msg_err "上游命令返回非 0：$rc，临时文件已清理。"
+        read -n 1 -s -r -p "按任意键返回..."
+        echo
+        return $rc
+    fi
+    DDTOOL_LAST_PASSWORD=""
+    return 0
+}
+
+ddtool_run_linux_reinstall() {
+    local distro="$1" version="$2" title="$3"
+    shift 3
+    local extra=("$@")
+    ddtool_prompt_linux_access "$title" || return 1
+    local cmd=(bash "$REINSTALL_SCRIPT_PATH" "$distro")
+    [[ -n "$version" ]] && cmd+=("$version")
+    [[ ${#extra[@]} -gt 0 ]] && cmd+=("${extra[@]}")
+    if [[ -n "$DDTOOL_SSH_KEY" ]]; then
+        cmd+=(--ssh-key "$DDTOOL_SSH_KEY")
+    elif [[ -n "$DDTOOL_PASSWORD" ]]; then
+        cmd+=(--password "$DDTOOL_PASSWORD")
+    fi
+    ddtool_append_common_runtime_args cmd "$DDTOOL_SSH_PORT" "$DDTOOL_WEB_PORT" "$DDTOOL_HOLD_MODE" "$DDTOOL_FRPC_TOML"
+    ddtool_execute "$title" "${cmd[@]}"
+}
+
+dd_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}========= DD / 重装系统中心 =========${RESET}"
+        echo -e "${GREEN} 1.${RESET} 一键重装 Debian 13"
+        echo -e "${GREEN} 2.${RESET} 一键重装 Debian 12"
+        echo -e "${GREEN} 3.${RESET} 一键重装 Ubuntu 24.04"
+        echo -e " 0. 返回主菜单"
+        read -rp "请输入数字 [0-3]: " ddn
+        case "$ddn" in
+            1) ddtool_run_linux_reinstall debian 13 "一键重装 Debian 13" ;;
+            2) ddtool_run_linux_reinstall debian 12 "一键重装 Debian 12" ;;
+            3) ddtool_run_linux_reinstall ubuntu 24.04 "一键重装 Ubuntu 24.04" ;;
+            0) return ;;
+            *) msg_err "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
 # --------------------------
 # CLI（供 cron/脚本调用）
 # --------------------------
+nginx_cli() {
+    local action="${1:-menu}"
+    case "$action" in
+        menu|"")
+            ( source "${NGX_MODULE_FILE}" || exit 1; nginx_menu )
+            ;;
+        list)
+            ( source "${NGX_MODULE_FILE}" || exit 1; ngx_list_proxies )
+            ;;
+        delete)
+            shift
+            ( source "${NGX_MODULE_FILE}" || exit 1; ngx_delete_proxy_domain "$1" )
+            ;;
+        repair|install)
+            ( source "${NGX_MODULE_FILE}" || exit 1; ngx_install_dependencies )
+            ;;
+        *)
+            msg_err "用法: my nginx <menu|list|delete <domain>|repair>"
+            return 1
+            ;;
+    esac
+}
+
 ssr_cli() {
     local action="${1:-}"
     case "$action" in
@@ -3608,6 +4497,32 @@ ssr_cli() {
     esac
 }
 
+dd_cli() {
+    local action="${1:-}"
+    shift || true
+    case "$action" in
+        debian13)
+            local cmd=(bash "$REINSTALL_SCRIPT_PATH" debian 13 "$@")
+            ddtool_execute "CLI 一键重装 Debian 13" "${cmd[@]}"
+            ;;
+        debian12)
+            local cmd=(bash "$REINSTALL_SCRIPT_PATH" debian 12 "$@")
+            ddtool_execute "CLI 一键重装 Debian 12" "${cmd[@]}"
+            ;;
+        ubuntu2404)
+            local cmd=(bash "$REINSTALL_SCRIPT_PATH" ubuntu 24.04 "$@")
+            ddtool_execute "CLI 一键重装 Ubuntu 24.04" "${cmd[@]}"
+            ;;
+        menu|"")
+            dd_menu
+            ;;
+        *)
+            msg_err "用法: my dd <menu|debian13|debian12|ubuntu2404> ..."
+            return 1
+            ;;
+    esac
+}
+
 nft_cli() {
     local action="${1:-}"
     case "$action" in
@@ -3634,16 +4549,20 @@ main_menu() {
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${YELLOW} 1.${RESET} SSR 管理"
     echo -e "${YELLOW} 2.${RESET} NFT 转发"
-    echo -e "${YELLOW} 3.${RESET} 一键卸载"
-    echo -e "${YELLOW} 4.${RESET} GitHub 一键更新"
+    echo -e "${YELLOW} 3.${RESET} Nginx 反向代理"
+    echo -e "${GREEN} 4.${RESET} DD / 重装系统中心"
+    echo -e "${YELLOW} 5.${RESET} 一键卸载"
+    echo -e "${YELLOW} 6.${RESET} GitHub 一键更新"
     echo -e " 0. 退出"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    read -rp "请输入数字 [0-4]: " choice
+    read -rp "请输入数字 [0-6]: " choice
     case "$choice" in
         1) run_ssr_module_menu ;;
         2) run_nft_module_menu ;;
-        3) uninstall_menu ;;
-        4) github_update ;;
+        3) run_nginx_module_menu ;;
+        4) dd_menu ;;
+        5) uninstall_menu ;;
+        6) github_update ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
@@ -3669,7 +4588,7 @@ init() {
 ensure_runtime_ready_for_cli() {
     require_root
     install_self_command
-    [[ -f "${SSR_MODULE_FILE}" && -f "${NFT_MODULE_FILE}" ]] || install_modules
+    [[ -f "${SSR_MODULE_FILE}" && -f "${NFT_MODULE_FILE}" && -f "${NGX_MODULE_FILE}" ]] || install_modules
 }
 
 if [[ $# -gt 0 ]]; then
@@ -3690,13 +4609,26 @@ if [[ $# -gt 0 ]]; then
             nft_cli "$@"
             exit $?
             ;;
+        nginx)
+            ensure_runtime_ready_for_cli
+            shift
+            nginx_cli "$@"
+            exit $?
+            ;;
+        dd)
+            require_root
+            install_self_command
+            shift
+            dd_cli "$@"
+            exit $?
+            ;;
         update)
             ensure_runtime_ready_for_cli
             github_update
             exit $?
             ;;
         *)
-            msg_err "未知参数。可用: my clean | my ssr ... | my nft --cron | my nft optimize [stable|extreme] | my update"
+            msg_err "未知参数。可用: my clean | my ssr ... | my nft ... | my nginx <menu|list|delete <domain>|repair> | my dd <menu|debian13|debian12|ubuntu2404> | my update"
             exit 1
             ;;
     esac
