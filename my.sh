@@ -4582,6 +4582,31 @@ nft_cli() {
 }
 
 # --------------------------
+# 综合管理目录
+# --------------------------
+comprehensive_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${CYAN}          综合管理目录                      ${RESET}"
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${YELLOW} 1.${RESET} 系统底层管控"
+        echo -e "${YELLOW} 2.${RESET} Nginx 反向代理"
+        echo -e "${GREEN} 3.${RESET} DD / 重装系统中心"
+        echo -e " 0. 返回主菜单"
+        echo -e "${CYAN}--------------------------------------------${RESET}"
+        read -rp "请输入数字 [0-3]: " choice
+        case "$choice" in
+            1) run_system_module_menu ;;
+            2) run_nginx_module_menu ;;
+            3) dd_menu ;;
+            0) return ;;
+            *) msg_err "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+# --------------------------
 # 主菜单
 # --------------------------
 main_menu() {
@@ -4591,22 +4616,18 @@ main_menu() {
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${YELLOW} 1.${RESET} SSR 管理"
     echo -e "${YELLOW} 2.${RESET} NFT 转发"
-    echo -e "${YELLOW} 3.${RESET} 系统底层管控"
-    echo -e "${YELLOW} 4.${RESET} Nginx 反向代理"
-    echo -e "${GREEN} 5.${RESET} DD / 重装系统中心"
-    echo -e "${YELLOW} 6.${RESET} 一键卸载"
-    echo -e "${YELLOW} 7.${RESET} GitHub 一键更新"
+    echo -e "${YELLOW} 3.${RESET} 综合管理目录"
+    echo -e "${YELLOW} 4.${RESET} 一键卸载"
+    echo -e "${YELLOW} 5.${RESET} GitHub 一键更新"
     echo -e " 0. 退出"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    read -rp "请输入数字 [0-7]: " choice
+    read -rp "请输入数字 [0-5]: " choice
     case "$choice" in
         1) run_ssr_module_menu ;;
         2) run_nft_module_menu ;;
-        3) run_system_module_menu ;;
-        4) run_nginx_module_menu ;;
-        5) dd_menu ;;
-        6) uninstall_menu ;;
-        7) github_update ;;
+        3) comprehensive_menu ;;
+        4) uninstall_menu ;;
+        5) github_update ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
