@@ -96,13 +96,13 @@ install_modules() {
 # 脚本名称: SSR 综合管理脚本 (稳定优先 + 极致性能 Profiles)
 # 核心特性:
 #   - 节点部署: SS-Rust / VLESS Reality (Xray) / ShadowTLS
-#   - 双档位网络调优: NAT / 常规机器 => 稳定优先 / 极致性能
+#   - 双档位网络调优: 手动选择 常规机器 / NAT 小鸡 => 稳定优先 / 极致优化
 #   - Cloudflare DDNS: 原生 API + 定时守护
 #   - 自动任务互斥: cron 使用 flock 防并发踩踏
-#   - 安全热更: 仅在有新版本时更新；下载到临时目录校验可运行后再原子替换
+#   - 自动热更: 仅在有新版本时更新；下载到临时目录校验可运行后再原子替换
 #   - DNS 管理: 检测 /etc/resolv.conf 是否 symlink；提供一键解锁/恢复
 #
-# 命令：ssr auto|regular|nat [stable|extreme] / ssr dns ...
+# 命令：ssr regular|nat [stable|extreme] / ssr dns ...
 # ==============================================================================
 
 set -o pipefail
@@ -113,7 +113,7 @@ readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
 
-readonly SCRIPT_VERSION="21.2-Auto-Tuned"
+readonly SCRIPT_VERSION="21.3-Manual-Tuned"
 
 # Sysctl profile files (互斥写入)
 readonly CONF_FILE="/etc/sysctl.d/99-ssr-net.conf"
@@ -130,6 +130,7 @@ readonly META_DIR="/usr/local/etc/ssr_meta"
 readonly META_FILE="${META_DIR}/versions.conf"
 readonly SWAP_MARK_FILE="${META_DIR}/swap_created_by_ssr"
 readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
+readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/99-my-auth.conf"
 readonly JOURNALD_BACKUP_FILE="${META_DIR}/journald.conf.bak"
 
 readonly DNS_BACKUP_DIR="/usr/local/etc/ssr_dns_backup"
@@ -204,6 +205,25 @@ replace_or_append_line() {
     fi
 }
 
+
+write_ssh_auth_dropin() {
+    local pass_mode="$1" kb_mode="$2" challenge_mode="$3"
+    mkdir -p "$(dirname "$SSH_AUTH_DROPIN")" 2>/dev/null || true
+    cat > "$SSH_AUTH_DROPIN" <<EOF
+# managed by my
+PasswordAuthentication ${pass_mode}
+KbdInteractiveAuthentication ${kb_mode}
+ChallengeResponseAuthentication ${challenge_mode}
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+UsePAM yes
+EOF
+}
+
+remove_ssh_auth_dropin() {
+    rm -f "$SSH_AUTH_DROPIN" 2>/dev/null || true
+}
+
 restart_ssh_safe() {
     local cfg="/etc/ssh/sshd_config"
     if have_cmd sshd && ! sshd -t -f "$cfg" >/dev/null 2>&1; then
@@ -232,12 +252,6 @@ current_ipv4_for_route() {
     ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
 }
 
-detect_network_topology() {
-    local ip
-    ip="$(current_ipv4_for_route)"
-    [[ -n "$ip" ]] && is_private_ipv4 "$ip" && { echo nat; return 0; }
-    echo regular
-}
 
 detect_machine_tier() {
     local mem cpu
@@ -1027,14 +1041,40 @@ sync_server_time() {
 apply_ssh_key_sec() {
     backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
     replace_or_append_line /etc/ssh/sshd_config '^#?PasswordAuthentication ' 'PasswordAuthentication no'
+    replace_or_append_line /etc/ssh/sshd_config '^#?KbdInteractiveAuthentication ' 'KbdInteractiveAuthentication no'
+    replace_or_append_line /etc/ssh/sshd_config '^#?ChallengeResponseAuthentication ' 'ChallengeResponseAuthentication no'
+    replace_or_append_line /etc/ssh/sshd_config '^#?PubkeyAuthentication ' 'PubkeyAuthentication yes'
+    replace_or_append_line /etc/ssh/sshd_config '^#?UsePAM ' 'UsePAM yes'
+    replace_or_append_line /etc/ssh/sshd_config '^#?PermitRootLogin ' 'PermitRootLogin prohibit-password'
+    write_ssh_auth_dropin no no no
     if ! restart_ssh_safe; then
+        remove_ssh_auth_dropin
         restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
         restart_ssh_safe >/dev/null 2>&1 || true
         echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
         sleep 2
         return 1
     fi
-    echo -e "${GREEN}✅ 密码登录已封锁。${RESET}"
+    echo -e "${GREEN}✅ 已启用密钥登录并禁止密码登录。${RESET}"
+    sleep 2
+}
+
+restore_password_login() {
+    backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
+    replace_or_append_line /etc/ssh/sshd_config '^#?PasswordAuthentication ' 'PasswordAuthentication yes'
+    replace_or_append_line /etc/ssh/sshd_config '^#?KbdInteractiveAuthentication ' 'KbdInteractiveAuthentication yes'
+    replace_or_append_line /etc/ssh/sshd_config '^#?ChallengeResponseAuthentication ' 'ChallengeResponseAuthentication yes'
+    replace_or_append_line /etc/ssh/sshd_config '^#?PubkeyAuthentication ' 'PubkeyAuthentication yes'
+    remove_ssh_auth_dropin
+    if ! restart_ssh_safe; then
+        write_ssh_auth_dropin no no no
+        restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
+        restart_ssh_safe >/dev/null 2>&1 || true
+        echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
+        sleep 2
+        return 1
+    fi
+    echo -e "${GREEN}✅ 已恢复密码登录。${RESET}"
     sleep 2
 }
 
@@ -1085,16 +1125,7 @@ ssh_key_menu() {
             [[ "$confirm" == "y" || "$confirm" == "Y" ]] && apply_ssh_key_sec
             ;;
         4)
-            backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
-            replace_or_append_line /etc/ssh/sshd_config '^#?PasswordAuthentication ' 'PasswordAuthentication yes'
-            if ! restart_ssh_safe; then
-                restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
-                restart_ssh_safe >/dev/null 2>&1 || true
-                echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
-            else
-                echo -e "${GREEN}✅ 已恢复密码登录。${RESET}"
-            fi
-            sleep 2
+            restore_password_login
             ;;
         0) return ;;
     esac
@@ -1719,32 +1750,23 @@ apply_regular_profile() {
     apply_profile_core regular "$1"
 }
 
-smart_optimize() {
-    local mode="$(profile_alias "${1:-stable}")" env
-    env="$(detect_network_topology)"
-    echo -e "${CYAN}>>> 自动识别环境：${env} / $(detect_machine_tier) / $(profile_title "$mode")${RESET}"
-    if [[ "$env" == "nat" ]]; then
-        apply_nat_profile "$mode"
-    else
-        apply_regular_profile "$mode"
-    fi
-    smart_dns_apply "$mode" auto
-}
-
-
 opt_menu() {
     while true; do
         clear
         echo -e "${CYAN}========= 网络优化与系统清理中心 =========${RESET}"
-        echo -e "${GREEN} 1.${RESET} 智能调优：稳定优先"
-        echo -e "${GREEN} 2.${RESET} 智能调优：极致优化"
-        echo -e "${YELLOW} 3.${RESET} 手动清理系统垃圾与冗余日志"
+        echo -e "${GREEN} 1.${RESET} 常规机器调优：稳定优先"
+        echo -e "${GREEN} 2.${RESET} 常规机器调优：极致优化"
+        echo -e "${YELLOW} 3.${RESET} NAT 小鸡调优：稳定优先"
+        echo -e "${YELLOW} 4.${RESET} NAT 小鸡调优：极致优化"
+        echo -e "${CYAN} 5.${RESET} 手动清理系统垃圾与冗余日志"
         echo -e " 0. 返回主菜单"
-        read -rp "输入数字 [0-3]: " opt_num
+        read -rp "输入数字 [0-5]: " opt_num
         case "$opt_num" in
-            1) smart_optimize "stable" ;;
-            2) smart_optimize "extreme" ;;
-            3) auto_clean ;;
+            1) apply_regular_profile "stable" ;;
+            2) apply_regular_profile "extreme" ;;
+            3) apply_nat_profile "stable" ;;
+            4) apply_nat_profile "extreme" ;;
+            5) auto_clean ;;
             0) return ;;
         esac
     done
@@ -1980,7 +2002,7 @@ ssr_cleanup_artifacts() {
 
     rm -f "$SSHD_BACKUP_FILE" "$JOURNALD_BACKUP_FILE" 2>/dev/null || true
     rm -rf "$META_DIR" "$DNS_BACKUP_DIR" 2>/dev/null || true
-    rm -f "$RESOLVED_DROPIN" 2>/dev/null || true
+    rm -f "$RESOLVED_DROPIN" "$SSH_AUTH_DROPIN" 2>/dev/null || true
 }
 
 total_uninstall() {
@@ -2028,7 +2050,7 @@ main_menu() {
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${GREEN} 4.${RESET} 🔰 统一节点管控中心 (查看 / 删除 / 核爆)"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (智能调优 + 清理)"
+    echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (手动常规/NAT + 清理)"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 返回上级菜单"
     read -rp "请输入对应数字 [0-5]: " num
@@ -4503,9 +4525,6 @@ ssr_cli() {
         auto_core_update|hot_upgrade|hot_update)
             ( source "${SSR_MODULE_FILE}" || exit 1; hot_update_components "silent" )
             ;;
-        auto)
-            ( source "${SSR_MODULE_FILE}" || exit 1; check_env; smart_optimize "${2:-stable}" )
-            ;;
         regular|bbr)
             ( source "${SSR_MODULE_FILE}" || exit 1; check_env; apply_regular_profile "${2:-stable}" )
             ;;
@@ -4533,7 +4552,7 @@ ssr_cli() {
             esac
             ;;
         *)
-            msg_err "用法: my ssr <daemon_check|ddns|auto [stable|extreme]|dns ...> ；regular/nat 仍保留为高级兼容入口"
+            msg_err "用法: my ssr <daemon_check|ddns|regular [stable|extreme]|nat [stable|extreme]|dns ...>"
             return 1
             ;;
     esac
