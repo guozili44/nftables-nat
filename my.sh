@@ -4302,15 +4302,6 @@ ddtool_confirm_exec() {
     [[ "$ans" == "YES" ]]
 }
 
-ddtool_append_common_runtime_args() {
-    local -n _arr=$1
-    local ssh_port="$2" web_port="$3" hold_mode="$4" frpc_toml="$5"
-    [[ -n "$ssh_port" ]] && _arr+=(--ssh-port "$ssh_port")
-    [[ -n "$web_port" ]] && _arr+=(--web-port "$web_port")
-    [[ -n "$hold_mode" ]] && _arr+=(--hold "$hold_mode")
-    [[ -n "$frpc_toml" ]] && _arr+=(--frpc-toml "$frpc_toml")
-}
-
 ddtool_health_check() {
     local interactive="${1:-yes}"
     local virt boot root_disk root_size mem_total cpu_model default_route def_if gw dns_list ip4 ip6
@@ -4379,40 +4370,22 @@ ddtool_prompt_linux_access() {
     local mode_title="$1"
     DDTOOL_LAST_PASSWORD=""
     DDTOOL_PASSWORD=""
-    DDTOOL_SSH_KEY=""
-    DDTOOL_SSH_PORT=""
-    DDTOOL_WEB_PORT=""
-    DDTOOL_FRPC_TOML=""
-    DDTOOL_HOLD_MODE=""
+    DDTOOL_SSH_PORT="22"
 
-    echo -e "${CYAN}>>> ${mode_title}：访问与安装参数${RESET}"
+    echo -e "${CYAN}>>> ${mode_title}：仅需填写 root 密码与 SSH 端口${RESET}"
     read -rp "root 密码（回车自动生成随机密码）: " DDTOOL_PASSWORD
-    read -rp "SSH 公钥（可空；填写后将优先密钥登录）: " DDTOOL_SSH_KEY
-    if [[ -n "$DDTOOL_SSH_KEY" ]]; then
-        DDTOOL_PASSWORD=""
-        DDTOOL_LAST_PASSWORD=""
-    else
-        if [[ -z "$DDTOOL_PASSWORD" ]]; then
-            DDTOOL_PASSWORD="$(_ddtool_rand_pass)"
-            DDTOOL_LAST_PASSWORD="$DDTOOL_PASSWORD"
-            msg_warn "已自动生成随机 root 密码：${DDTOOL_PASSWORD}"
-        else
-            DDTOOL_LAST_PASSWORD="$DDTOOL_PASSWORD"
-        fi
+    if [[ -z "$DDTOOL_PASSWORD" ]]; then
+        DDTOOL_PASSWORD="$(_ddtool_rand_pass)"
+        msg_warn "已自动生成随机 root 密码：${DDTOOL_PASSWORD}"
     fi
-    read -rp "安装环境 SSH 端口（可空，默认 22）: " DDTOOL_SSH_PORT
-    if [[ -n "$DDTOOL_SSH_PORT" ]] && ! ddtool_is_port "$DDTOOL_SSH_PORT"; then
+    DDTOOL_LAST_PASSWORD="$DDTOOL_PASSWORD"
+
+    read -rp "SSH 端口（回车默认 22）: " DDTOOL_SSH_PORT
+    DDTOOL_SSH_PORT="${DDTOOL_SSH_PORT:-22}"
+    if ! ddtool_is_port "$DDTOOL_SSH_PORT"; then
         msg_err "SSH 端口无效。"
         return 1
     fi
-    read -rp "安装环境 Web 日志端口（可空，默认 80）: " DDTOOL_WEB_PORT
-    if [[ -n "$DDTOOL_WEB_PORT" ]] && ! ddtool_is_port "$DDTOOL_WEB_PORT"; then
-        msg_err "Web 端口无效。"
-        return 1
-    fi
-    read -rp "frpc 配置路径/URL（可空）: " DDTOOL_FRPC_TOML
-    read -rp "hold 模式（可空/1/2）: " DDTOOL_HOLD_MODE
-    [[ -n "$DDTOOL_HOLD_MODE" && "$DDTOOL_HOLD_MODE" != "1" && "$DDTOOL_HOLD_MODE" != "2" ]] && { msg_err "hold 仅支持 1 或 2。"; return 1; }
     return 0
 }
 
@@ -4430,6 +4403,7 @@ ddtool_execute() {
     echo -e "任务: ${GREEN}${action_desc}${RESET}"
     echo -e "上游源: ${YELLOW}${DDTOOL_UPSTREAM_LABEL}${RESET}"
     [[ -n "$DDTOOL_LAST_PASSWORD" ]] && echo -e "root 密码: ${YELLOW}${DDTOOL_LAST_PASSWORD}${RESET}"
+    [[ -n "$DDTOOL_SSH_PORT" ]] && echo -e "SSH 端口: ${YELLOW}${DDTOOL_SSH_PORT}${RESET}"
     echo -e "命令: ${CYAN}$(ddtool_preview_cmd "${cmd[@]}")${RESET}"
     echo -e "${RED}警告：该操作会清空整块硬盘及全部分区数据。${RESET}"
     echo -e "${RED}如机器可用 IPMI/U盘/控制台，优先使用更稳妥的方式。${RESET}"
@@ -4458,12 +4432,7 @@ ddtool_run_linux_reinstall() {
     local cmd=(bash "$REINSTALL_SCRIPT_PATH" "$distro")
     [[ -n "$version" ]] && cmd+=("$version")
     [[ ${#extra[@]} -gt 0 ]] && cmd+=("${extra[@]}")
-    if [[ -n "$DDTOOL_SSH_KEY" ]]; then
-        cmd+=(--ssh-key "$DDTOOL_SSH_KEY")
-    elif [[ -n "$DDTOOL_PASSWORD" ]]; then
-        cmd+=(--password "$DDTOOL_PASSWORD")
-    fi
-    ddtool_append_common_runtime_args cmd "$DDTOOL_SSH_PORT" "$DDTOOL_WEB_PORT" "$DDTOOL_HOLD_MODE" "$DDTOOL_FRPC_TOML"
+    cmd+=(--password "$DDTOOL_PASSWORD" --ssh-port "$DDTOOL_SSH_PORT")
     ddtool_execute "$title" "${cmd[@]}"
 }
 
