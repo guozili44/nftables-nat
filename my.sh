@@ -642,12 +642,71 @@ download_file() {
 
 github_latest_tag() {
     # github_latest_tag "owner/repo"
-    local repo="$1"
-    local tag=""
-    if have_cmd curl && have_cmd jq; then
-        tag=$(curl -fsSL --max-time 10 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | jq -r '.tag_name' 2>/dev/null)
+    local repo="$1" body="" tag=""
+    [[ -n "$repo" ]] || return 1
+    if have_cmd curl; then
+        body=$(curl -fsSL --max-time 10 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null || true)
+    fi
+    if [[ -n "$body" ]] && have_cmd jq; then
+        tag=$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null)
+    fi
+    if [[ -z "$tag" && -n "$body" ]]; then
+        tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*//p' | head -n1)
     fi
     [[ -n "$tag" && "$tag" != "null" ]] && echo "$tag"
+}
+
+github_release_asset_url() {
+    # github_release_asset_url "owner/repo" "tag" "asset_name"
+    local repo="$1" tag="$2" asset_name="$3" body="" url=""
+    [[ -n "$repo" && -n "$tag" && -n "$asset_name" ]] || return 1
+    have_cmd curl || return 1
+    body=$(curl -fsSL --max-time 12 "https://api.github.com/repos/${repo}/releases/tags/${tag}" 2>/dev/null || true)
+    [[ -n "$body" ]] || return 1
+    if have_cmd jq; then
+        url=$(printf '%s' "$body" | jq -r --arg name "$asset_name" '.assets[]? | select(.name==$name) | .browser_download_url // empty' 2>/dev/null | head -n1)
+    fi
+    if [[ -z "$url" ]] && have_cmd python3; then
+        url=$(python3 - "$asset_name" "$body" <<'PYURL'
+import json, sys
+asset = sys.argv[1]
+body = sys.argv[2]
+try:
+    data = json.loads(body)
+    for item in data.get('assets', []):
+        if item.get('name') == asset and item.get('browser_download_url'):
+            print(item['browser_download_url'])
+            break
+except Exception:
+    pass
+PYURL
+)
+    fi
+    [[ -n "$url" ]] && echo "$url"
+}
+
+download_file_any() {
+    # download_file_any DEST URL1 URL2 ...
+    local dest="$1"; shift
+    local u=""
+    for u in "$@"; do
+        [[ -n "$u" ]] || continue
+        if download_file "$u" "$dest" && [[ -s "$dest" ]]; then
+            return 0
+        fi
+        rm -f "$dest" 2>/dev/null || true
+    done
+    return 1
+}
+
+shadowtls_arch_name() {
+    local arch="$1"
+    case "$arch" in
+        x86_64|amd64) echo "x86_64-unknown-linux-musl" ;;
+        aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
+        armv7l|armv7|arm) echo "arm-unknown-linux-musleabi" ;;
+        *) return 1 ;;
+    esac
 }
 
 safe_install_binary() {
@@ -675,19 +734,23 @@ check_env() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行！${RESET}" && exit 1
 
     # 依赖：尽量保守安装；缺啥装啥
-    local deps=(curl jq bc wget tar openssl unzip ip ping)
+    local deps=(curl bc wget tar openssl unzip ip ping)
     local missing=()
+    local dep
     for dep in "${deps[@]}"; do
         have_cmd "$dep" || missing+=("$dep")
     done
 
     if ((${#missing[@]} > 0)); then
         if have_cmd apt-get; then
-            apt-get update -qq
-            # xz-utils: 解 tar.xz；util-linux: flock；e2fsprogs: chattr/lsattr
-            apt-get install -yqq curl jq bc wget tar xz-utils openssl unzip util-linux e2fsprogs iproute2 iputils-ping >/dev/null 2>&1 || true
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -yqq curl jq bc wget tar xz-utils openssl unzip util-linux e2fsprogs iproute2 iputils-ping python3 coreutils >/dev/null 2>&1 || true
+        elif have_cmd dnf; then
+            dnf install -y curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute iputils python3 coreutils >/dev/null 2>&1 || true
         elif have_cmd yum; then
-            yum install -yq curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute iputils >/dev/null 2>&1 || true
+            yum install -yq curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute iputils python3 coreutils >/dev/null 2>&1 || true
+        elif have_cmd apk; then
+            apk add --no-cache curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute2 iputils python3 coreutils >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -716,18 +779,134 @@ remove_firewall_rule() {
 }
 
 force_kill_service() {
-    local target=$1; local from_menu=$2
+    local target="$1" from_menu="$2"
+    local port="" pidfile="" target_desc="$1"
     if [[ -z "$target" ]]; then
         echo -e "${RED}❌ 目标服务名为空！${RESET}"
         [[ "$from_menu" == "menu" ]] && { sleep 2; return; } || exit 1
     fi
-    echo -e "${RED}☢️ 正在执行系统级物理粉碎: ${target} ...${RESET}"
-    systemctl stop "$target" 2>/dev/null
-    systemctl disable "$target" 2>/dev/null
-    rm -f "/etc/systemd/system/${target}.service" "/etc/systemd/system/${target}"
-    systemctl daemon-reload
-    echo -e "${GREEN}✅ 目标服务 [${target}] 已彻底蒸发！${RESET}"
+
+    echo -e "${RED}☢️ 正在执行全链路强制核爆: ${target} ...${RESET}"
+
+    if service_use_systemd; then
+        systemctl stop "$target" 2>/dev/null || true
+        systemctl disable "$target" 2>/dev/null || true
+    fi
+    have_cmd service && service "$target" stop >/dev/null 2>&1 || true
+    have_cmd rc-service && rc-service "$target" stop >/dev/null 2>&1 || true
+
+    case "$target" in
+        ss-rust)
+            port="$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null || true)"
+            [[ "$port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$port" "both"
+            pidfile="/var/run/ss-rust.pid"
+            pkill -9 -f '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' 2>/dev/null || true
+            pkill -9 -x ss-rust 2>/dev/null || true
+            rm -rf /etc/ss-rust
+            rm -f /usr/local/bin/ss-rust /var/log/ss-rust.log
+            ;;
+        xray)
+            port="$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null || true)"
+            [[ "$port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$port" "tcp"
+            pidfile="/var/run/xray.pid"
+            pkill -9 -f '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' 2>/dev/null || true
+            pkill -9 -x xray 2>/dev/null || true
+            rm -rf /usr/local/etc/xray
+            rm -f /usr/local/bin/xray /var/log/xray.log
+            ;;
+        shadowtls-generic)
+            pkill -9 -f '/usr/local/bin/shadow-tls' 2>/dev/null || true
+            rm -f /usr/local/bin/shadow-tls /var/log/shadowtls.log
+            ;;
+        shadowtls-*)
+            port="${target#shadowtls-}"
+            [[ "$port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$port" "tcp"
+            pidfile="/var/run/${target}.pid"
+            pkill -9 -f "shadowtls-${port}" 2>/dev/null || true
+            pkill -9 -f '/usr/local/bin/shadow-tls' 2>/dev/null || true
+            rm -f "/var/log/${target}.log"
+            ;;
+        *)
+            pkill -9 -f "$target" 2>/dev/null || true
+            ;;
+    esac
+
+    if [[ -n "$pidfile" && -f "$pidfile" ]]; then
+        kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$pidfile"
+    fi
+
+    rm -f \
+        "/etc/systemd/system/${target}.service" \
+        "/etc/systemd/system/${target}" \
+        "/lib/systemd/system/${target}.service" \
+        "/lib/systemd/system/${target}" \
+        "/usr/lib/systemd/system/${target}.service" \
+        "/usr/lib/systemd/system/${target}"
+
+    if service_use_systemd; then
+        systemctl reset-failed "$target" >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$target" == shadowtls-* || "$target" == "shadowtls-generic" ]]; then
+        if ! ls /etc/systemd/system/shadowtls-*.service /lib/systemd/system/shadowtls-*.service /usr/lib/systemd/system/shadowtls-*.service >/dev/null 2>&1; then
+            rm -f /usr/local/bin/shadow-tls
+        fi
+    fi
+
+    echo -e "${GREEN}✅ 目标服务 [${target_desc}] 已被强制清理完成！${RESET}"
     [[ "$from_menu" == "menu" ]] && sleep 2 || exit 0
+}
+
+nuke_index_has_target() {
+    local needle="$1" i
+    for i in "${NUCLEAR_TARGETS[@]}"; do
+        [[ "$i" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+managed_nuke_build_index() {
+    NUCLEAR_TARGETS=()
+    NUCLEAR_LABELS=()
+    NUCLEAR_PORTS=()
+    local idx=1 port unit target
+
+    port="$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null || true)"
+    if [[ -f /etc/ss-rust/config.json || -x /usr/local/bin/ss-rust || -f /etc/systemd/system/ss-rust.service || -f /var/run/ss-rust.pid ]] || pgrep -f '/usr/local/bin/ss-rust' >/dev/null 2>&1; then
+        NUCLEAR_TARGETS[$idx]="ss-rust"
+        NUCLEAR_LABELS[$idx]="SS-Rust"
+        NUCLEAR_PORTS[$idx]="$port"
+        ((idx++))
+    fi
+
+    port="$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null || true)"
+    if [[ -f /usr/local/etc/xray/config.json || -x /usr/local/bin/xray || -f /etc/systemd/system/xray.service || -f /var/run/xray.pid ]] || pgrep -f '/usr/local/bin/xray' >/dev/null 2>&1; then
+        NUCLEAR_TARGETS[$idx]="xray"
+        NUCLEAR_LABELS[$idx]="Xray / VLESS Reality"
+        NUCLEAR_PORTS[$idx]="$port"
+        ((idx++))
+    fi
+
+    for unit in /etc/systemd/system/shadowtls-*.service /lib/systemd/system/shadowtls-*.service /usr/lib/systemd/system/shadowtls-*.service; do
+        [[ -e "$unit" ]] || continue
+        port="$(basename "$unit" | sed 's/^shadowtls-//' | sed 's/\.service$//')"
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        target="shadowtls-${port}"
+        if ! nuke_index_has_target "$target"; then
+            NUCLEAR_TARGETS[$idx]="$target"
+            NUCLEAR_LABELS[$idx]="ShadowTLS 实例"
+            NUCLEAR_PORTS[$idx]="$port"
+            ((idx++))
+        fi
+    done
+
+    if [[ -x /usr/local/bin/shadow-tls ]] && ! pgrep -f '/usr/local/bin/shadow-tls' >/dev/null 2>&1 && ! ls /etc/systemd/system/shadowtls-*.service /lib/systemd/system/shadowtls-*.service /usr/lib/systemd/system/shadowtls-*.service >/dev/null 2>&1; then
+        NUCLEAR_TARGETS[$idx]="shadowtls-generic"
+        NUCLEAR_LABELS[$idx]="ShadowTLS 残留二进制"
+        NUCLEAR_PORTS[$idx]=""
+    fi
 }
 
 # ==============================================================================
@@ -1377,15 +1556,21 @@ install_ss_rust_native() {
     local arch; arch=$(uname -m)
     local ss_arch_primary="x86_64-unknown-linux-musl"
     local ss_arch_fallback="x86_64-unknown-linux-gnu"
-    if [[ "$arch" == "aarch64" ]]; then
-        ss_arch_primary="aarch64-unknown-linux-musl"
-        ss_arch_fallback="aarch64-unknown-linux-gnu"
-    fi
+    case "$arch" in
+        aarch64|arm64)
+            ss_arch_primary="aarch64-unknown-linux-musl"
+            ss_arch_fallback="aarch64-unknown-linux-gnu"
+            ;;
+        armv7l|armv7|arm)
+            ss_arch_primary="arm-unknown-linux-musleabi"
+            ss_arch_fallback="arm-unknown-linux-gnueabi"
+            ;;
+    esac
 
     echo -e "${CYAN}>>> 正在获取 SS-Rust 最新版本信息...${RESET}"
     local ss_latest
     ss_latest=$(github_latest_tag "shadowsocks/shadowsocks-rust")
-    [[ -z "$ss_latest" ]] && ss_latest="v1.22.0"
+    [[ -z "$ss_latest" ]] && ss_latest="v1.24.0"
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-ssrust.XXXXXX)
     local tarball="${tmpdir}/ss-rust.tar.xz"
@@ -1486,12 +1671,15 @@ install_vless_native() {
 
     local arch; arch=$(uname -m)
     local xray_arch="64"
-    [[ "$arch" == "aarch64" ]] && xray_arch="arm64-v8a"
+    case "$arch" in
+        aarch64|arm64) xray_arch="arm64-v8a" ;;
+        armv7l|armv7|arm) xray_arch="arm32-v7a" ;;
+    esac
 
     echo -e "${CYAN}>>> 正在获取 Xray 最新版本信息...${RESET}"
     local xray_latest
     xray_latest=$(github_latest_tag "XTLS/Xray-core")
-    [[ -z "$xray_latest" ]] && xray_latest="v1.8.24"
+    [[ -z "$xray_latest" ]] && xray_latest="v26.2.6"
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-xray.XXXXXX)
     local zipf="${tmpdir}/xray.zip"
@@ -1531,13 +1719,31 @@ install_vless_native() {
     local uuid keys priv pub short_id
     uuid=$(/usr/local/bin/xray uuid 2>/dev/null)
     keys=$(/usr/local/bin/xray x25519 2>/dev/null)
-    priv=$(echo "$keys" | grep "Private" | awk '{print $3}')
-    pub=$(echo "$keys" | grep "Public" | awk '{print $3}')
-    short_id=$(openssl rand -hex 8 2>/dev/null)
+    priv=$(echo "$keys" | awk '/Private/{print $3}' | head -n1)
+    pub=$(echo "$keys" | awk '/Public/{print $3}' | head -n1)
+    if have_cmd openssl; then
+        short_id=$(openssl rand -hex 8 2>/dev/null)
+    else
+        short_id=$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' 
+')
+    fi
+    if [[ -z "$uuid" || -z "$priv" || -z "$pub" || -z "$short_id" ]]; then
+        echo -e "${RED}❌ Xray 密钥材料生成失败。${RESET}"
+        rm -rf "$tmpdir"
+        sleep 3
+        return
+    fi
 
     cat > /usr/local/etc/xray/config.json << EOF
-{ "inbounds": [{ "port": $port, "protocol": "vless", "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" }, "streamSettings": { "network": "tcp", "security": "reality", "realitySettings": { "dest": "${sni_domain}:443", "serverNames": ["${sni_domain}"], "privateKey": "$priv", "shortIds": ["$short_id"] } } }], "outbounds": [{"protocol": "freedom"}] }
+{ "inbounds": [{ "listen": "::", "port": $port, "protocol": "vless", "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" }, "streamSettings": { "network": "tcp", "security": "reality", "realitySettings": { "dest": "${sni_domain}:443", "serverNames": ["${sni_domain}"], "privateKey": "$priv", "shortIds": ["$short_id"] } } }], "outbounds": [{"protocol": "freedom"}] }
 EOF
+
+    if ! /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1; then
+        echo -e "${RED}❌ Xray 配置自检失败，已中止启动。${RESET}"
+        rm -rf "$tmpdir"
+        sleep 3
+        return
+    fi
 
     local xray_unit='[Unit]
 Description=Xray Service
@@ -1603,10 +1809,21 @@ install_shadowtls_native() {
     read -rp "伪装域名 (SNI) [留空默认 updates.cdn-apple.com]: " sni_domain
     [[ -z "$sni_domain" ]] && sni_domain="updates.cdn-apple.com"
 
-    local pwd; pwd=$(openssl rand -base64 8 2>/dev/null | tr -d '\n')
+    local pwd
+    if have_cmd openssl; then
+        pwd=$(openssl rand -base64 8 2>/dev/null | tr -d '
+')
+    else
+        pwd=$(head -c 8 /dev/urandom 2>/dev/null | base64_nw)
+    fi
+    [[ -n "$pwd" ]] || { echo -e "${RED}❌ ShadowTLS 密码生成失败。${RESET}"; sleep 3; return; }
     local arch; arch=$(uname -m)
-    local st_arch="x86_64-unknown-linux-musl"
-    [[ "$arch" == "aarch64" ]] && st_arch="aarch64-unknown-linux-musl"
+    local st_arch
+    st_arch=$(shadowtls_arch_name "$arch") || {
+        echo -e "${RED}❌ 当前架构暂不支持自动安装 ShadowTLS: ${arch}${RESET}"
+        sleep 3
+        return
+    }
 
     echo -e "${CYAN}>>> 正在获取 ShadowTLS 最新版本信息...${RESET}"
     local st_latest
@@ -1615,11 +1832,15 @@ install_shadowtls_native() {
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-stls.XXXXXX)
     local binf="${tmpdir}/shadow-tls"
-    local url="https://github.com/ihciah/shadow-tls/releases/download/${st_latest}/shadow-tls-${st_arch}"
+    local asset_name="shadow-tls-${st_arch}"
+    local official_url="https://github.com/ihciah/shadow-tls/releases/download/${st_latest}/${asset_name}"
+    local api_url=""
+    api_url=$(github_release_asset_url "ihciah/shadow-tls" "$st_latest" "$asset_name" 2>/dev/null || true)
+    local proxy_url="https://ghproxy.net/${official_url}"
 
     echo -e "${CYAN}>>> 下载核心: ${st_latest} (${st_arch}) ...${RESET}"
-    if ! download_file "$url" "$binf" || [[ ! -s "$binf" ]]; then
-        echo -e "${RED}❌ 下载失败。${RESET}"
+    if ! download_file_any "$binf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$binf" ]]; then
+        echo -e "${RED}❌ 下载失败。已尝试 GitHub 直连与代理地址。${RESET}"
         rm -rf "$tmpdir"
         sleep 3
         return
@@ -1643,17 +1864,17 @@ install_shadowtls_native() {
         return
     }
 
-    cat > /etc/systemd/system/shadowtls-${listen_port}.service << EOF
+    local st_cmd="/usr/local/bin/shadow-tls --v3 --strict server --listen 0.0.0.0:${listen_port} --server 127.0.0.1:${up_port} --tls ${sni_domain}:443 --password ${pwd}"
+    local st_cmd_legacy="env MONOIO_FORCE_LEGACY_DRIVER=1 ${st_cmd}"
+    if service_use_systemd; then
+        mkdir -p /etc/systemd/system
+        cat > /etc/systemd/system/shadowtls-${listen_port}.service << EOF
 [Unit]
 Description=ShadowTLS Service on port ${listen_port}
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/shadow-tls --v3 --strict server \\
-  --listen 0.0.0.0:${listen_port} \\
-  --server 127.0.0.1:${up_port} \\
-  --tls ${sni_domain}:443 \\
-  --password ${pwd}
+ExecStart=${st_cmd}
 Restart=always
 LimitNOFILE=1048576
 
@@ -1661,8 +1882,44 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable --now shadowtls-"${listen_port}" >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if ! systemctl enable --now shadowtls-"${listen_port}" >/dev/null 2>&1 || ! systemctl is-active --quiet shadowtls-"${listen_port}" 2>/dev/null; then
+            cat > /etc/systemd/system/shadowtls-${listen_port}.service << EOF
+[Unit]
+Description=ShadowTLS Service on port ${listen_port}
+After=network.target
+
+[Service]
+Environment=MONOIO_FORCE_LEGACY_DRIVER=1
+ExecStart=${st_cmd}
+Restart=always
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl restart shadowtls-"${listen_port}" >/dev/null 2>&1 || systemctl enable --now shadowtls-"${listen_port}" >/dev/null 2>&1 || {
+                echo -e "${RED}❌ ShadowTLS 服务启动失败。${RESET}"
+                rm -rf "$tmpdir"
+                sleep 3
+                return
+            }
+            systemctl is-active --quiet shadowtls-"${listen_port}" 2>/dev/null || {
+                echo -e "${RED}❌ ShadowTLS 未处于运行状态。${RESET}"
+                rm -rf "$tmpdir"
+                sleep 3
+                return
+            }
+        fi
+    else
+        restart_managed_service "shadowtls-${listen_port}" "$st_cmd" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/log/shadowtls.log" "/var/run/shadowtls-${listen_port}.pid" ||         restart_managed_service "shadowtls-${listen_port}" "$st_cmd_legacy" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/log/shadowtls.log" "/var/run/shadowtls-${listen_port}.pid" || {
+            echo -e "${RED}❌ ShadowTLS 后台启动失败（无 systemd 环境）。${RESET}"
+            rm -rf "$tmpdir"
+            sleep 3
+            return
+        }
+    fi
 
     if have_cmd ufw; then ufw allow "$listen_port"/tcp >/dev/null 2>&1; fi
     if have_cmd firewall-cmd; then firewall-cmd --add-port="$listen_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
@@ -1853,13 +2110,52 @@ unified_node_manager() {
                 fi
                 ;;
             4)
-                clear
-                echo -e "${CYAN}========= ☢️ 全局强制核爆中心 =========${RESET}"
-                echo -e "${YELLOW}支持强制抹除系统中任何卡死、报错或残留的服务。${RESET}"
-                echo -e "参考名：${GREEN}ss-rust${RESET} | ${GREEN}xray${RESET} | ${GREEN}shadowtls-端口${RESET}"
-                echo -e "---------------------------------"
-                read -rp "请输入要粉碎的服务名 (直接回车取消): " nuke_target
-                [[ -n "$nuke_target" ]] && force_kill_service "$nuke_target" "menu"
+                while true; do
+                    clear
+                    echo -e "${CYAN}========= ☢️ 全局强制核爆中心 =========${RESET}"
+                    echo -e "${YELLOW}已改为序号选择，直接核爆已识别到的节点残留。${RESET}"
+                    echo -e "---------------------------------"
+                    managed_nuke_build_index
+                    local nuke_count=0 i target label port
+                    for i in "${!NUCLEAR_TARGETS[@]}"; do
+                        [[ -n "${NUCLEAR_TARGETS[$i]}" ]] || continue
+                        target="${NUCLEAR_TARGETS[$i]}"
+                        label="${NUCLEAR_LABELS[$i]}"
+                        port="${NUCLEAR_PORTS[$i]}"
+                        if [[ -n "$port" ]]; then
+                            echo -e " ${CYAN}${i})${RESET} ${label} ${YELLOW}${target}${RESET} [端口 ${GREEN}${port}${RESET}]"
+                        else
+                            echo -e " ${CYAN}${i})${RESET} ${label} ${YELLOW}${target}${RESET}"
+                        fi
+                        ((nuke_count++))
+                    done
+                    if [[ "$nuke_count" -eq 0 ]]; then
+                        echo -e "${RED}未识别到可核爆的节点残留。${RESET}"
+                        read -n1 -rsp "按任意键返回..." _
+                        break
+                    fi
+                    echo -e "---------------------------------"
+                    echo -e "${RED} 9) ⚠️ 核爆全部已识别残留${RESET}"
+                    echo -e " 0) 返回"
+                    read -rp "请选择序号: " nuke_choice
+                    case "$nuke_choice" in
+                        0) break ;;
+                        9)
+                            for i in "${!NUCLEAR_TARGETS[@]}"; do
+                                [[ -n "${NUCLEAR_TARGETS[$i]}" ]] || continue
+                                force_kill_service "${NUCLEAR_TARGETS[$i]}" "menu"
+                            done
+                            ;;
+                        *)
+                            if [[ -n "${NUCLEAR_TARGETS[$nuke_choice]}" ]]; then
+                                force_kill_service "${NUCLEAR_TARGETS[$nuke_choice]}" "menu"
+                            else
+                                echo -e "${RED}❌ 序号无效${RESET}"
+                                sleep 1
+                            fi
+                            ;;
+                    esac
+                done
                 ;;
             0) return ;;
         esac
@@ -2013,10 +2309,16 @@ update_ss_rust_if_needed() {
     local arch; arch=$(uname -m)
     local ss_arch_primary="x86_64-unknown-linux-musl"
     local ss_arch_fallback="x86_64-unknown-linux-gnu"
-    if [[ "$arch" == "aarch64" ]]; then
-        ss_arch_primary="aarch64-unknown-linux-musl"
-        ss_arch_fallback="aarch64-unknown-linux-gnu"
-    fi
+    case "$arch" in
+        aarch64|arm64)
+            ss_arch_primary="aarch64-unknown-linux-musl"
+            ss_arch_fallback="aarch64-unknown-linux-gnu"
+            ;;
+        armv7l|armv7|arm)
+            ss_arch_primary="arm-unknown-linux-musleabi"
+            ss_arch_fallback="arm-unknown-linux-gnueabi"
+            ;;
+    esac
 
     local latest; latest=$(github_latest_tag "shadowsocks/shadowsocks-rust")
     [[ -z "$latest" ]] && return 2
@@ -2066,7 +2368,10 @@ update_xray_if_needed() {
 
     local arch; arch=$(uname -m)
     local xray_arch="64"
-    [[ "$arch" == "aarch64" ]] && xray_arch="arm64-v8a"
+    case "$arch" in
+        aarch64|arm64) xray_arch="arm64-v8a" ;;
+        armv7l|armv7|arm) xray_arch="arm32-v7a" ;;
+    esac
 
     local latest; latest=$(github_latest_tag "XTLS/Xray-core")
     [[ -z "$latest" ]] && return 2
@@ -2106,8 +2411,8 @@ update_shadowtls_if_needed() {
     [[ -x "/usr/local/bin/shadow-tls" ]] || return 1
 
     local arch; arch=$(uname -m)
-    local st_arch="x86_64-unknown-linux-musl"
-    [[ "$arch" == "aarch64" ]] && st_arch="aarch64-unknown-linux-musl"
+    local st_arch
+    st_arch=$(shadowtls_arch_name "$arch") || return 2
 
     local latest; latest=$(github_latest_tag "ihciah/shadow-tls")
     [[ -z "$latest" ]] && return 2
@@ -2117,9 +2422,13 @@ update_shadowtls_if_needed() {
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-stls.XXXXXX)
     local binf="${tmpdir}/shadow-tls"
-    local url="https://github.com/ihciah/shadow-tls/releases/download/${latest}/shadow-tls-${st_arch}"
+    local asset_name="shadow-tls-${st_arch}"
+    local official_url="https://github.com/ihciah/shadow-tls/releases/download/${latest}/${asset_name}"
+    local api_url=""
+    api_url=$(github_release_asset_url "ihciah/shadow-tls" "$latest" "$asset_name" 2>/dev/null || true)
+    local proxy_url="https://ghproxy.net/${official_url}"
 
-    if ! download_file "$url" "$binf" || [[ ! -s "$binf" ]]; then
+    if ! download_file_any "$binf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$binf" ]]; then
         rm -rf "$tmpdir"
         return 2
     fi
