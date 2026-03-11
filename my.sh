@@ -411,6 +411,17 @@ shadowtls_detect_ports() {
     } | awk '/^[0-9]+$/' | sort -n -u
 }
 
+shadowtls_find_ports_by_upstream() {
+    local upstream="$1" p up
+    [[ -n "$upstream" ]] || return 0
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        up="$(shadowtls_get_field "$p" UPSTREAM_PORT 2>/dev/null || true)"
+        [[ "$up" == "$upstream" ]] && printf '%s
+' "$p"
+    done < <(shadowtls_detect_ports)
+}
+
 shadowtls_is_active() {
     local port="$1" pid
     if service_use_systemd && systemctl is-active --quiet "shadowtls-${port}" 2>/dev/null; then
@@ -478,17 +489,35 @@ ssr_make_ss_link() {
 }
 
 show_ss_rust_summary() {
-    local ip port method password link
+    local ip port method password link st_link p found_st=0
+    local protected_ports=()
     ip=$(ssr_fetch_public_ip)
     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
     method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
     password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
     link=$(ssr_make_ss_link "$ip" 2>/dev/null || true)
+    mapfile -t protected_ports < <(shadowtls_find_ports_by_upstream "$port")
     echo -e "IP: ${GREEN}${ip}${RESET}"
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
     echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
-    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
+    if [[ ${#protected_ports[@]} -gt 0 ]]; then
+        echo -e "${GREEN}ShadowTLS 保护:${RESET} 已检测到 ${#protected_ports[@]} 个外层入口"
+        for p in "${protected_ports[@]}"; do
+            [[ -n "$p" ]] || continue
+            st_link="$(shadowtls_make_ss_link "$p" "$ip" 2>/dev/null || true)"
+            echo -e "  - 外层端口: ${GREEN}${p}${RESET}"
+            if [[ -n "$st_link" ]]; then
+                echo -e "${YELLOW}ShadowTLS 链接:${RESET}
+${st_link}"
+                found_st=1
+            else
+                echo -e "${RED}ShadowTLS 链接生成失败，请检查该实例状态。${RESET}"
+            fi
+        done
+        echo -e "${CYAN}说明:${RESET} 以上为优先使用的 ShadowTLS 链接；下方为直连 SS2022 链接（仅在需要直连时使用）。"
+    fi
+    [[ -n "$link" ]] && echo -e "${YELLOW}直连 SS-Rust 链接:${RESET}
 ${link}"
 }
 
@@ -2247,6 +2276,8 @@ unified_node_manager() {
                         if [[ -n "$view_port" ]]; then
                             clear
                             show_shadowtls_summary "$view_port"
+                            echo
+                            echo -e "${CYAN}提示:${RESET} ShadowTLS 链接必须带 plugin=shadow-tls 参数；如果客户端只看到普通 SS 链接，请优先使用这里显示的 ShadowTLS 链接。"
                             read -n 1 -s -r -p "按任意键返回上一层..."
                         fi
                     elif [[ "$op" == "2" ]]; then
