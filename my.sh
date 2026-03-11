@@ -233,6 +233,181 @@ restart_ssh_safe() {
     systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 }
 
+service_use_systemd() {
+    have_cmd systemctl && [[ -d /etc/systemd/system ]]
+}
+
+json_get_path() {
+    local file="$1" path="$2"
+    [[ -f "$file" ]] || return 1
+    if have_cmd python3; then
+        python3 - "$file" "$path" <<'PYPARSE'
+import json, sys
+file, path = sys.argv[1], sys.argv[2]
+with open(file, 'r', encoding='utf-8') as f:
+    obj = json.load(f)
+cur = obj
+for part in path.split('.'):
+    if part.isdigit():
+        cur = cur[int(part)]
+    else:
+        cur = cur[part]
+if cur is None:
+    print("")
+elif isinstance(cur, bool):
+    print("true" if cur else "false")
+else:
+    print(cur)
+PYPARSE
+        return 0
+    fi
+    if have_cmd jq; then
+        local expr="."
+        IFS='.' read -r -a _parts <<< "$path"
+        local part
+        for part in "${_parts[@]}"; do
+            if [[ "$part" =~ ^[0-9]+$ ]]; then
+                expr+="[$part]"
+            else
+                expr+=".$part"
+            fi
+        done
+        jq -r "$expr" "$file" 2>/dev/null
+        return 0
+    fi
+    case "$path" in
+        server_port) sed -n 's/.*"server_port": \([0-9][0-9]*\).*/\1/p' "$file" | head -n1 ;;
+        method) sed -n 's/.*"method": "\([^"]*\)".*/\1/p' "$file" | head -n1 ;;
+        password) sed -n 's/.*"password": "\([^"]*\)".*/\1/p' "$file" | head -n1 ;;
+        inbounds.0.port) sed -n 's/.*"port": \([0-9][0-9]*\).*/\1/p' "$file" | head -n1 ;;
+        inbounds.0.settings.clients.0.id) sed -n 's/.*"id": "\([^"]*\)".*/\1/p' "$file" | head -n1 ;;
+        inbounds.0.streamSettings.realitySettings.serverNames.0) sed -n 's/.*"serverNames": \["\([^"]*\)"\].*/\1/p' "$file" | head -n1 ;;
+        inbounds.0.streamSettings.realitySettings.privateKey) sed -n 's/.*"privateKey": "\([^"]*\)".*/\1/p' "$file" | head -n1 ;;
+        inbounds.0.streamSettings.realitySettings.shortIds.0) sed -n 's/.*"shortIds": \["\([^"]*\)"\].*/\1/p' "$file" | head -n1 ;;
+        *) return 1 ;;
+    esac
+}
+
+json_set_top_value() {
+    local file="$1" key="$2" value="$3" kind="$4"
+    [[ -f "$file" ]] || return 1
+    if have_cmd python3; then
+        python3 - "$file" "$key" "$value" "$kind" <<'PYPARSE'
+import json, sys
+file, key, value, kind = sys.argv[1:5]
+with open(file, 'r', encoding='utf-8') as f:
+    obj = json.load(f)
+obj[key] = int(value) if kind == 'number' else value
+with open(file, 'w', encoding='utf-8') as f:
+    json.dump(obj, f, ensure_ascii=False)
+PYPARSE
+        return 0
+    fi
+    if [[ "$kind" == "number" ]]; then
+        sed -i "s|\"${key}\": [0-9][0-9]*|\"${key}\": ${value}|g" "$file"
+    else
+        local esc
+        esc=$(printf '%s' "$value" | sed 's/[&]/\\&/g')
+        sed -i "s|\"${key}\": \"[^\"]*\"|\"${key}\": \"${esc}\"|g" "$file"
+    fi
+}
+
+ssr_fetch_public_ip() {
+    curl -s4m8 ip.sb 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || curl -s6m8 ip.sb 2>/dev/null || echo "0.0.0.0"
+}
+
+ssr_make_ss_link() {
+    local ip port method password b64
+    ip="${1:-$(ssr_fetch_public_ip)}"
+    port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
+    method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
+    password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
+    [[ -n "$ip" && -n "$port" && -n "$method" && -n "$password" ]] || return 1
+    b64=$(printf '%s' "${method}:${password}" | base64_nw)
+    printf 'ss://%s@%s:%s#SS-Rust' "$b64" "$ip" "$port"
+}
+
+show_ss_rust_summary() {
+    local ip port method password link
+    ip=$(ssr_fetch_public_ip)
+    port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
+    method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
+    password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
+    link=$(ssr_make_ss_link "$ip" 2>/dev/null || true)
+    echo -e "IP: ${GREEN}${ip}${RESET}"
+    echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
+    echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
+    echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
+    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
+${link}"
+}
+
+show_vless_summary() {
+    local ip port uuid sni priv pub sid link
+    ip=$(ssr_fetch_public_ip)
+    port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
+    uuid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.settings.clients.0.id 2>/dev/null)
+    sni=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.serverNames.0 2>/dev/null)
+    priv=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.privateKey 2>/dev/null)
+    sid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.shortIds.0 2>/dev/null)
+    if [[ -n "$priv" && -x /usr/local/bin/xray ]]; then
+        pub=$(/usr/local/bin/xray x25519 -i "$priv" 2>/dev/null | awk '/Public/{print $3}' | head -n1)
+    fi
+    echo -e "IP: ${GREEN}${ip}${RESET}"
+    echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
+    echo -e "UUID: ${GREEN}${uuid:-未读取}${RESET}"
+    echo -e "SNI: ${GREEN}${sni:-未读取}${RESET}"
+    if [[ -n "$ip" && -n "$port" && -n "$uuid" && -n "$sni" && -n "$pub" && -n "$sid" ]]; then
+        link="vless://${uuid}@${ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#VLESS-Reality"
+        echo -e "${YELLOW}链接:${RESET}
+${link}"
+    fi
+}
+
+start_managed_service() {
+    local name="$1" unit_content="$2" bg_cmd="$3" bg_match="$4" log_file="$5" pid_file="$6"
+    if service_use_systemd; then
+        mkdir -p /etc/systemd/system 2>/dev/null || true
+        printf '%s
+' "$unit_content" > "/etc/systemd/system/${name}.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now "$name" >/dev/null 2>&1 || return 1
+        systemctl is-active --quiet "$name" 2>/dev/null || return 1
+    else
+        [[ -n "$bg_match" ]] && pkill -f "$bg_match" 2>/dev/null || true
+        mkdir -p "$(dirname "$pid_file")" 2>/dev/null || true
+        nohup sh -c "$bg_cmd" >"$log_file" 2>&1 &
+        echo $! > "$pid_file"
+        sleep 1
+        kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || return 1
+    fi
+}
+
+restart_managed_service() {
+    local name="$1" bg_cmd="$2" bg_match="$3" log_file="$4" pid_file="$5"
+    if service_use_systemd; then
+        systemctl restart "$name" >/dev/null 2>&1 || return 1
+        systemctl is-active --quiet "$name" 2>/dev/null || return 1
+    else
+        [[ -n "$bg_match" ]] && pkill -f "$bg_match" 2>/dev/null || true
+        mkdir -p "$(dirname "$pid_file")" 2>/dev/null || true
+        nohup sh -c "$bg_cmd" >"$log_file" 2>&1 &
+        echo $! > "$pid_file"
+        sleep 1
+        kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || return 1
+    fi
+}
+
+stop_managed_service() {
+    local name="$1" bg_match="$2" pid_file="$3"
+    if service_use_systemd; then
+        systemctl stop "$name" >/dev/null 2>&1 || true
+        systemctl disable "$name" >/dev/null 2>&1 || true
+    fi
+    [[ -n "$bg_match" ]] && pkill -f "$bg_match" 2>/dev/null || true
+    rm -f "$pid_file" 2>/dev/null || true
+}
+
 system_memory_mb() {
     awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null
 }
@@ -1136,7 +1311,7 @@ ssh_key_menu() {
 install_ss_rust_native() {
     clear
     echo -e "${CYAN}========= 原生交互安装 SS-Rust =========${RESET}"
-    rm -f /etc/systemd/system/ss-rust.service
+    rm -f /etc/systemd/system/ss-rust.service 2>/dev/null || true
 
     read -rp "自定义端口 (1-65535) [留空随机]: " custom_port
     local port=$custom_port
@@ -1159,18 +1334,41 @@ install_ss_rust_native() {
         4) method="aes-256-gcm"; pwd_len=0 ;;
     esac
 
-    local pwd=""
+    local pwd="" input_pwd=""
     if [[ "$pwd_len" -ne 0 ]]; then
-        read -rp "密码 (留空生成 Base64): " input_pwd
+        read -rp "密码 (留空自动生成安全密钥): " input_pwd
         if [[ -z "$input_pwd" ]]; then
-            pwd=$(openssl rand -base64 "$pwd_len" 2>/dev/null | tr -d '\n')
+            if have_cmd openssl; then
+                pwd=$(openssl rand "$pwd_len" 2>/dev/null | base64_nw)
+            else
+                pwd=$(head -c "$pwd_len" /dev/urandom 2>/dev/null | base64_nw)
+            fi
         else
-            pwd=$(echo -n "$input_pwd" | base64_nw)
+            local raw_len decoded_len=0 tmp_dec="/tmp/ssr-key.$$"
+            raw_len=$(printf '%s' "$input_pwd" | wc -c | tr -d ' ')
+            if printf '%s' "$input_pwd" | base64 -d >"$tmp_dec" 2>/dev/null; then
+                decoded_len=$(wc -c <"$tmp_dec" | tr -d ' ')
+            fi
+            rm -f "$tmp_dec" 2>/dev/null || true
+            if [[ "$decoded_len" == "$pwd_len" ]]; then
+                pwd="$input_pwd"
+            elif [[ "$raw_len" == "$pwd_len" ]]; then
+                pwd=$(printf '%s' "$input_pwd" | base64_nw)
+            else
+                echo -e "${RED}❌ 2022 协议密钥长度错误：需要 ${pwd_len} 字节原始密钥，或对应的 Base64 密钥。${RESET}"
+                sleep 3
+                return
+            fi
         fi
+        [[ -n "$pwd" ]] || { echo -e "${RED}❌ 密钥生成失败。${RESET}"; sleep 3; return; }
     else
         read -rp "传统密码 (留空随机): " input_pwd
         if [[ -z "$input_pwd" ]]; then
-            pwd=$(openssl rand -hex 12 2>/dev/null)
+            if have_cmd openssl; then
+                pwd=$(openssl rand -hex 12 2>/dev/null)
+            else
+                pwd=$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            fi
         else
             pwd="$input_pwd"
         fi
@@ -1229,8 +1427,16 @@ install_ss_rust_native() {
 { "server": "::", "server_port": $port, "password": "$pwd", "method": "$method", "mode": "tcp_and_udp", "fast_open": true }
 EOF
 
-    cat > /etc/systemd/system/ss-rust.service << EOF
-[Unit]
+    run_with_timeout 2 /usr/local/bin/ss-rust -c /etc/ss-rust/config.json >/dev/null 2>&1
+    local rc=$?
+    if [[ "$rc" -ne 0 && "$rc" -ne 124 && "$rc" -ne 137 ]]; then
+        echo -e "${RED}❌ 配置自检失败，已中止启动。${RESET}"
+        rm -rf "$tmpdir"
+        sleep 3
+        return
+    fi
+
+    local ss_unit='[Unit]
 Description=Shadowsocks-Rust Server
 After=network.target
 
@@ -1240,11 +1446,14 @@ Restart=on-failure
 LimitNOFILE=1048576
 
 [Install]
-WantedBy=multi-user.target
-EOF
+WantedBy=multi-user.target'
 
-    systemctl daemon-reload
-    systemctl enable --now ss-rust >/dev/null 2>&1 || true
+    if ! start_managed_service "ss-rust" "$ss_unit" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid"; then
+        echo -e "${RED}❌ SS-Rust 启动失败。请检查 /var/log/ss-rust.log${RESET}"
+        rm -rf "$tmpdir"
+        sleep 3
+        return
+    fi
 
     if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; ufw allow "$port"/udp >/dev/null 2>&1; fi
     if have_cmd firewall-cmd; then
@@ -1256,9 +1465,11 @@ EOF
     meta_set "SS_RUST_TAG" "$ss_latest"
 
     echo -e "${GREEN}✅ SS-Rust (${ss_latest}) 安装完成！${RESET}"
+    show_ss_rust_summary
     rm -rf "$tmpdir"
-    sleep 2
+    read -n 1 -s -r -p "按任意键返回上一层..."
 }
+
 
 install_vless_native() {
     clear
@@ -1328,8 +1539,7 @@ install_vless_native() {
 { "inbounds": [{ "port": $port, "protocol": "vless", "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" }, "streamSettings": { "network": "tcp", "security": "reality", "realitySettings": { "dest": "${sni_domain}:443", "serverNames": ["${sni_domain}"], "privateKey": "$priv", "shortIds": ["$short_id"] } } }], "outbounds": [{"protocol": "freedom"}] }
 EOF
 
-    cat > /etc/systemd/system/xray.service << EOF
-[Unit]
+    local xray_unit='[Unit]
 Description=Xray Service
 After=network.target
 
@@ -1339,11 +1549,14 @@ Restart=on-failure
 LimitNOFILE=1048576
 
 [Install]
-WantedBy=multi-user.target
-EOF
+WantedBy=multi-user.target'
 
-    systemctl daemon-reload
-    systemctl enable --now xray >/dev/null 2>&1 || true
+    if ! start_managed_service "xray" "$xray_unit" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid"; then
+        echo -e "${RED}❌ Xray 启动失败。请检查 /var/log/xray.log${RESET}"
+        rm -rf "$tmpdir"
+        sleep 3
+        return
+    fi
 
     if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; fi
     if have_cmd firewall-cmd; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
@@ -1351,8 +1564,9 @@ EOF
     meta_set "XRAY_TAG" "$xray_latest"
 
     echo -e "${GREEN}✅ VLESS Reality (${xray_latest}) 安装成功！${RESET}"
+    show_vless_summary
     rm -rf "$tmpdir"
-    sleep 2
+    read -n 1 -s -r -p "按任意键返回上一层..."
 }
 
 install_shadowtls_native() {
@@ -1361,7 +1575,7 @@ install_shadowtls_native() {
 
     local ss_port=""
     if [[ -f "/etc/ss-rust/config.json" ]]; then
-        ss_port=$(jq -r '.server_port' /etc/ss-rust/config.json 2>/dev/null)
+        ss_port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
     fi
 
     local up_port=""
@@ -1456,8 +1670,9 @@ EOF
     meta_set "SHADOWTLS_TAG" "$st_latest"
 
     echo -e "${GREEN}✅ ShadowTLS (${st_latest}) 安装成功！已挂载在 ${up_port} 上层。${RESET}"
+    echo -e "监听端口: ${GREEN}${listen_port}${RESET} | 上游端口: ${GREEN}${up_port}${RESET} | SNI: ${GREEN}${sni_domain}${RESET} | 密码: ${GREEN}${pwd}${RESET}"
     rm -rf "$tmpdir"
-    sleep 2
+    read -n 1 -s -r -p "按任意键返回上一层..."
 }
 
 # ==============================================================================
@@ -1512,25 +1727,19 @@ unified_node_manager() {
             1)
                 if [[ $has_ss -eq 1 ]]; then
                     clear
-                    local ip port method password b64 link
-                    ip=$(curl -s4m8 ip.sb 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || echo "0.0.0.0")
-                    port=$(jq -r '.server_port' /etc/ss-rust/config.json 2>/dev/null)
-                    method=$(jq -r '.method' /etc/ss-rust/config.json 2>/dev/null)
-                    password=$(jq -r '.password' /etc/ss-rust/config.json 2>/dev/null)
-                    b64=$(echo -n "${method}:${password}" | base64_nw)
-                    link="ss://${b64}@${ip}:${port}#SS-Rust"
-                    echo -e "IP: ${GREEN}${ip}${RESET}"
-                    echo -e "端口: ${GREEN}${port}${RESET}"
-                    echo -e "协议: ${GREEN}${method}${RESET}"
-                    echo -e "密码: ${GREEN}${password}${RESET}"
-                    echo -e "${YELLOW}链接:${RESET}\n${link}"
+                    local port method password link
+                    show_ss_rust_summary
+                    port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
+                    method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
+                    password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
+                    link=$(ssr_make_ss_link 2>/dev/null || true)
                     echo -e "---------------------------------"
                     echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 修改密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
                     read -rp "输入操作: " op
                     if [[ "$op" == "1" ]]; then
                         read -rp "新端口 (1-65535): " np
                         if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
-                            jq --argjson p "$np" '.server_port = $p' /etc/ss-rust/config.json > /tmp/tmp.json && mv -f /tmp/tmp.json /etc/ss-rust/config.json
+                            json_set_top_value /etc/ss-rust/config.json server_port "$np" number
                             remove_firewall_rule "$port" "both"
                             if have_cmd ufw; then ufw allow "$np"/tcp >/dev/null 2>&1; ufw allow "$np"/udp >/dev/null 2>&1; fi
                             if have_cmd firewall-cmd; then
@@ -1538,7 +1747,7 @@ unified_node_manager() {
                                 firewall-cmd --add-port="$np"/udp --permanent >/dev/null 2>&1
                                 firewall-cmd --reload >/dev/null 2>&1
                             fi
-                            systemctl restart ss-rust 2>/dev/null || true
+                            restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
                             echo -e "${GREEN}✅ 修改成功${RESET}"
                         else
                             echo -e "${RED}❌ 端口无效${RESET}"
@@ -1547,16 +1756,15 @@ unified_node_manager() {
                     elif [[ "$op" == "2" ]]; then
                         read -rp "新密码: " npwd
                         [[ -z "$npwd" ]] && { echo -e "${RED}❌ 密码不能为空${RESET}"; sleep 1; continue; }
-                        jq --arg pwd "$npwd" '.password = $pwd' /etc/ss-rust/config.json > /tmp/tmp.json && mv -f /tmp/tmp.json /etc/ss-rust/config.json
-                        systemctl restart ss-rust 2>/dev/null || true
+                        json_set_top_value /etc/ss-rust/config.json password "$npwd" string
+                        restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
                         echo -e "${GREEN}✅ 修改成功${RESET}"
                         sleep 1
                     elif [[ "$op" == "3" ]]; then
                         remove_firewall_rule "$port" "both"
-                        systemctl stop ss-rust 2>/dev/null || true
-                        systemctl disable ss-rust 2>/dev/null || true
-                        rm -rf /etc/ss-rust /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service
-                        systemctl daemon-reload
+                        stop_managed_service "ss-rust" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/run/ss-rust.pid"
+                        rm -rf /etc/ss-rust /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service /var/log/ss-rust.log
+                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
                         echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
                         sleep 1
                     fi
@@ -1567,9 +1775,9 @@ unified_node_manager() {
                     clear
                     local ip port uuid sni
                     ip=$(curl -s4m8 ip.sb 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || echo "0.0.0.0")
-                    port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json 2>/dev/null)
-                    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' /usr/local/etc/xray/config.json 2>/dev/null)
-                    sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json 2>/dev/null)
+                    port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
+                    uuid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.settings.clients.0.id 2>/dev/null)
+                    sni=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.serverNames.0 2>/dev/null)
                     echo -e "IP: ${GREEN}${ip}${RESET}"
                     echo -e "端口: ${GREEN}${port}${RESET}"
                     echo -e "UUID: ${GREEN}${uuid}${RESET}"
@@ -1578,15 +1786,14 @@ unified_node_manager() {
                     echo -e "${YELLOW}1) 重启节点${RESET} | ${RED}2) 删除节点${RESET} | 0) 返回"
                     read -rp "输入操作: " op
                     if [[ "$op" == "1" ]]; then
-                        systemctl restart xray 2>/dev/null || true
+                        restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
                         echo -e "${GREEN}✅ 已重启${RESET}"
                         sleep 1
                     elif [[ "$op" == "2" ]]; then
                         remove_firewall_rule "$port" "tcp"
-                        systemctl stop xray 2>/dev/null || true
-                        systemctl disable xray 2>/dev/null || true
-                        rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service
-                        systemctl daemon-reload
+                        stop_managed_service "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"
+                        rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service /var/log/xray.log
+                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
                         echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
                         sleep 1
                     fi
@@ -1777,11 +1984,11 @@ opt_menu() {
 # ==============================================================================
 run_daemon_check() {
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ss-rust\.service'; then
-        systemctl is-active --quiet ss-rust 2>/dev/null || systemctl restart ss-rust 2>/dev/null || true
+        systemctl is-active --quiet ss-rust 2>/dev/null || restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
     fi
 
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^xray\.service'; then
-        systemctl is-active --quiet xray 2>/dev/null || systemctl restart xray 2>/dev/null || true
+        systemctl is-active --quiet xray 2>/dev/null || restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
     fi
 
     while read -r svc; do
@@ -1849,7 +2056,7 @@ update_ss_rust_if_needed() {
     safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || { rm -rf "$tmpdir"; return 2; }
 
     meta_set "SS_RUST_TAG" "$latest"
-    systemctl restart ss-rust 2>/dev/null || true
+    restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
     rm -rf "$tmpdir"
     return 0
 }
@@ -1890,7 +2097,7 @@ update_xray_if_needed() {
     safe_install_binary "${tmpdir}/xray" /usr/local/bin/xray || { rm -rf "$tmpdir"; return 2; }
 
     meta_set "XRAY_TAG" "$latest"
-    systemctl restart xray 2>/dev/null || true
+    restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
     rm -rf "$tmpdir"
     return 0
 }
@@ -1967,11 +2174,11 @@ daily_task() {
 # ==============================================================================
 ssr_cleanup_artifacts() {
     if [[ -f "/etc/ss-rust/config.json" ]]; then
-        local sp; sp=$(jq -r '.server_port' /etc/ss-rust/config.json 2>/dev/null)
+        local sp; sp=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
         [[ -n "$sp" && "$sp" != "null" ]] && remove_firewall_rule "$sp" "both"
     fi
     if [[ -f "/usr/local/etc/xray/config.json" ]]; then
-        local xp; xp=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json 2>/dev/null)
+        local xp; xp=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
         [[ -n "$xp" && "$xp" != "null" ]] && remove_firewall_rule "$xp" "tcp"
     fi
     for s in /etc/systemd/system/shadowtls-*.service; do
@@ -1979,10 +2186,10 @@ ssr_cleanup_artifacts() {
         remove_firewall_rule "$(basename "$s" | sed 's/shadowtls-//g' | sed 's/.service//g')" "tcp"
     done
 
-    systemctl stop ss-rust xray 2>/dev/null || true
-    systemctl disable ss-rust xray 2>/dev/null || true
-    rm -rf /etc/ss-rust /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service
-    rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service
+    stop_managed_service "ss-rust" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/run/ss-rust.pid"
+    stop_managed_service "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"
+    rm -rf /etc/ss-rust /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service /var/log/ss-rust.log
+    rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service /var/log/xray.log
 
     while read -r s; do
         [[ -z "$s" ]] && continue
