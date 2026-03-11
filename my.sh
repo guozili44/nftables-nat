@@ -423,6 +423,17 @@ shadowtls_is_active() {
     pgrep -f "/usr/local/bin/shadow-tls --v3 --strict server --listen 0.0.0.0:${port}" >/dev/null 2>&1
 }
 
+port_listening_tcp() {
+    local port="$1"
+    if have_cmd ss; then
+        ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\])${port}$"
+    elif have_cmd netstat; then
+        netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\])${port}$"
+    else
+        return 1
+    fi
+}
+
 shadowtls_make_ss_link() {
     local listen_port="$1" ip method password st_sni st_pwd plugin_raw plugin_enc userinfo
     ip="${2:-$(ssr_fetch_public_ip)}"
@@ -432,7 +443,7 @@ shadowtls_make_ss_link() {
     st_pwd="$(shadowtls_get_field "$listen_port" PASSWORD 2>/dev/null || true)"
     [[ -n "$ip" && -n "$listen_port" && -n "$method" && -n "$password" && -n "$st_sni" && -n "$st_pwd" ]] || return 1
     userinfo="$(ss_make_userinfo "$method" "$password")"
-    plugin_raw="shadow-tls;host=;passwd=;v3"
+    plugin_raw="shadow-tls;host=${st_sni};passwd=${st_pwd};v3"
     plugin_enc="$(uri_encode "$plugin_raw")"
     printf 'ss://%s@%s:%s/?plugin=%s#SS-Rust-ShadowTLS' "$userinfo" "$ip" "$listen_port" "$plugin_enc"
 }
@@ -1800,8 +1811,8 @@ install_vless_native() {
     echo -e "${CYAN}========= 原生交互安装 VLESS Reality =========${RESET}"
     rm -f /etc/systemd/system/xray.service
 
-    read -rp "伪装域名 [默认 updates.cdn-apple.com]: " sni_domain
-    [[ -z "$sni_domain" ]] && sni_domain="updates.cdn-apple.com"
+    read -rp "伪装域名 [默认 publicassets.cdn-apple.com]: " sni_domain
+    [[ -z "$sni_domain" ]] && sni_domain="publicassets.cdn-apple.com"
 
     read -rp "监听端口 [留空随机]: " port
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
@@ -1945,8 +1956,8 @@ install_shadowtls_native() {
         listen_port=$((RANDOM % 55535 + 10000))
     fi
 
-    read -rp "伪装域名 (SNI) [留空默认 updates.cdn-apple.com]: " sni_domain
-    [[ -z "$sni_domain" ]] && sni_domain="updates.cdn-apple.com"
+    read -rp "伪装域名 (SNI) [留空默认 publicassets.cdn-apple.com]: " sni_domain
+    [[ -z "$sni_domain" ]] && sni_domain="publicassets.cdn-apple.com"
 
     local pwd
     if have_cmd openssl; then
@@ -2063,11 +2074,24 @@ EOF
     if have_cmd ufw; then ufw allow "$listen_port"/tcp >/dev/null 2>&1; fi
     if have_cmd firewall-cmd; then firewall-cmd --add-port="$listen_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
 
+    sleep 1
+    if ! shadowtls_is_active "$listen_port" || ! port_listening_tcp "$listen_port"; then
+        echo -e "${RED}❌ ShadowTLS 进程未稳定监听在 ${listen_port}/tcp。${RESET}"
+        if [[ -f /var/log/shadowtls.log ]]; then
+            echo -e "${YELLOW}最近日志:${RESET}"
+            tail -n 20 /var/log/shadowtls.log 2>/dev/null || true
+        fi
+        rm -rf "$tmpdir"
+        sleep 5
+        return
+    fi
+
     meta_set "SHADOWTLS_TAG" "$st_latest"
     shadowtls_state_save "$listen_port" "$up_port" "$sni_domain" "$pwd"
 
     echo -e "${GREEN}✅ ShadowTLS (${st_latest}) 安装成功！已挂载在 ${up_port} 上层。${RESET}"
     show_shadowtls_summary "$listen_port"
+    echo -e "${YELLOW}手动参数:${RESET} 外层端口=${listen_port} | 上游端口=${up_port} | SNI=${sni_domain} | ShadowTLS密码=${pwd}"
     rm -rf "$tmpdir"
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
