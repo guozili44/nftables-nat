@@ -128,6 +128,7 @@ readonly LOCK_FILE="/var/lock/ssr.lock"
 # Meta (用于判断是否有新版本)
 readonly META_DIR="/usr/local/etc/ssr_meta"
 readonly META_FILE="${META_DIR}/versions.conf"
+readonly SHADOWTLS_STATE_DIR="${META_DIR}/shadowtls"
 readonly SWAP_MARK_FILE="${META_DIR}/swap_created_by_ssr"
 readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/99-my-auth.conf"
@@ -312,19 +313,157 @@ PYPARSE
     fi
 }
 
+
+uri_encode() {
+    local raw="$1"
+    if have_cmd python3; then
+        python3 - "$raw" <<'PYURL'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=''))
+PYURL
+        return 0
+    fi
+    local out="" i ch hex
+    for ((i=0; i<${#raw}; i++)); do
+        ch="${raw:i:1}"
+        case "$ch" in
+            [a-zA-Z0-9.~_-]) out+="$ch" ;;
+            *) printf -v hex '%%%02X' "'${ch}"; out+="$hex" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+ss_make_userinfo() {
+    local method="$1" password="$2"
+    if [[ "$method" == 2022-* ]]; then
+        printf '%s:%s' "$(uri_encode "$method")" "$(uri_encode "$password")"
+    else
+        printf '%s' "${method}:${password}" | base64_nw
+    fi
+}
+
+shadowtls_state_file() {
+    printf '%s/%s.conf' "$SHADOWTLS_STATE_DIR" "$1"
+}
+
+shadowtls_state_save() {
+    local port="$1" up_port="$2" sni="$3" password="$4"
+    mkdir -p "$SHADOWTLS_STATE_DIR" 2>/dev/null || true
+    cat > "$(shadowtls_state_file "$port")" <<EOF
+LISTEN_PORT="$port"
+UPSTREAM_PORT="$up_port"
+SNI="$sni"
+PASSWORD="$password"
+VERSION="3"
+EOF
+    chmod 600 "$(shadowtls_state_file "$port")" 2>/dev/null || true
+}
+
+shadowtls_state_get() {
+    local port="$1" key="$2" file
+    file="$(shadowtls_state_file "$port")"
+    [[ -f "$file" ]] || return 1
+    grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^"//; s/"$//'
+}
+
+shadowtls_parse_field_from_text() {
+    local text="$1" key="$2"
+    case "$key" in
+        UPSTREAM_PORT) printf '%s\n' "$text" | sed -n 's/.*--server 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' | head -n1 ;;
+        SNI) printf '%s\n' "$text" | sed -n 's/.*--tls \([^: ;][^ ;]*\)\(:[0-9][0-9]*\)\?.*/\1/p' | head -n1 ;;
+        PASSWORD) printf '%s\n' "$text" | sed -n 's/.*--password \([^ ]*\).*/\1/p' | head -n1 ;;
+        *) return 1 ;;
+    esac
+}
+
+shadowtls_get_field() {
+    local port="$1" key="$2" v="" unit="/etc/systemd/system/shadowtls-${port}.service" pid cmd
+    v="$(shadowtls_state_get "$port" "$key" 2>/dev/null || true)"
+    if [[ -z "$v" && -f "$unit" ]]; then
+        cmd="$(sed -n 's/^ExecStart=//p' "$unit" | head -n1)"
+        v="$(shadowtls_parse_field_from_text "$cmd" "$key" 2>/dev/null || true)"
+    fi
+    if [[ -z "$v" && -f "/var/run/shadowtls-${port}.pid" ]]; then
+        pid="$(cat "/var/run/shadowtls-${port}.pid" 2>/dev/null || true)"
+        if [[ -n "$pid" && -r "/proc/${pid}/cmdline" ]]; then
+            cmd="$(tr '\\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)"
+            v="$(shadowtls_parse_field_from_text "$cmd" "$key" 2>/dev/null || true)"
+        fi
+    fi
+    [[ -n "$v" ]] && printf '%s' "$v"
+}
+
+shadowtls_detect_ports() {
+    {
+        for f in "$SHADOWTLS_STATE_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            basename "$f" .conf
+        done
+        for f in /etc/systemd/system/shadowtls-*.service /lib/systemd/system/shadowtls-*.service /usr/lib/systemd/system/shadowtls-*.service; do
+            [[ -e "$f" ]] || continue
+            basename "$f" | sed 's/^shadowtls-//; s/\.service$//'
+        done
+        for f in /var/run/shadowtls-*.pid; do
+            [[ -e "$f" ]] || continue
+            basename "$f" | sed 's/^shadowtls-//; s/\.pid$//'
+        done
+    } | awk '/^[0-9]+$/' | sort -n -u
+}
+
+shadowtls_is_active() {
+    local port="$1" pid
+    if service_use_systemd && systemctl is-active --quiet "shadowtls-${port}" 2>/dev/null; then
+        return 0
+    fi
+    if [[ -f "/var/run/shadowtls-${port}.pid" ]]; then
+        pid="$(cat "/var/run/shadowtls-${port}.pid" 2>/dev/null || true)"
+        [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+    fi
+    pgrep -f "/usr/local/bin/shadow-tls --v3 --strict server --listen 0.0.0.0:${port}" >/dev/null 2>&1
+}
+
+shadowtls_make_ss_link() {
+    local listen_port="$1" ip method password st_sni st_pwd plugin_raw plugin_enc userinfo
+    ip="${2:-$(ssr_fetch_public_ip)}"
+    method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
+    password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
+    st_sni="$(shadowtls_get_field "$listen_port" SNI 2>/dev/null || true)"
+    st_pwd="$(shadowtls_get_field "$listen_port" PASSWORD 2>/dev/null || true)"
+    [[ -n "$ip" && -n "$listen_port" && -n "$method" && -n "$password" && -n "$st_sni" && -n "$st_pwd" ]] || return 1
+    userinfo="$(ss_make_userinfo "$method" "$password")"
+    plugin_raw="shadow-tls;host=${st_sni};password=${st_pwd};version=3"
+    plugin_enc="$(uri_encode "$plugin_raw")"
+    printf 'ss://%s@%s:%s/?plugin=%s#SS-Rust-ShadowTLS' "$userinfo" "$ip" "$listen_port" "$plugin_enc"
+}
+
+show_shadowtls_summary() {
+    local listen_port="$1" ip up_port sni pwd link
+    ip=$(ssr_fetch_public_ip)
+    up_port="$(shadowtls_get_field "$listen_port" UPSTREAM_PORT 2>/dev/null || true)"
+    sni="$(shadowtls_get_field "$listen_port" SNI 2>/dev/null || true)"
+    pwd="$(shadowtls_get_field "$listen_port" PASSWORD 2>/dev/null || true)"
+    link="$(shadowtls_make_ss_link "$listen_port" "$ip" 2>/dev/null || true)"
+    echo -e "外层端口: ${GREEN}${listen_port:-未读取}${RESET}"
+    echo -e "上游端口: ${GREEN}${up_port:-未读取}${RESET}"
+    echo -e "SNI: ${GREEN}${sni:-未读取}${RESET}"
+    echo -e "ShadowTLS 密码: ${GREEN}${pwd:-未读取}${RESET}"
+    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}\n${link}"
+}
+
 ssr_fetch_public_ip() {
     curl -s4m8 ip.sb 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || curl -s6m8 ip.sb 2>/dev/null || echo "0.0.0.0"
 }
 
 ssr_make_ss_link() {
-    local ip port method password b64
+    local ip port method password userinfo
     ip="${1:-$(ssr_fetch_public_ip)}"
     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
     method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
     password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
     [[ -n "$ip" && -n "$port" && -n "$method" && -n "$password" ]] || return 1
-    b64=$(printf '%s' "${method}:${password}" | base64_nw)
-    printf 'ss://%s@%s:%s#SS-Rust' "$b64" "$ip" "$port"
+    userinfo=$(ss_make_userinfo "$method" "$password")
+    printf 'ss://%s@%s:%s#SS-Rust' "$userinfo" "$ip" "$port"
 }
 
 show_ss_rust_summary() {
@@ -1925,9 +2064,10 @@ EOF
     if have_cmd firewall-cmd; then firewall-cmd --add-port="$listen_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
 
     meta_set "SHADOWTLS_TAG" "$st_latest"
+    shadowtls_state_save "$listen_port" "$up_port" "$sni_domain" "$pwd"
 
     echo -e "${GREEN}✅ ShadowTLS (${st_latest}) 安装成功！已挂载在 ${up_port} 上层。${RESET}"
-    echo -e "监听端口: ${GREEN}${listen_port}${RESET} | 上游端口: ${GREEN}${up_port}${RESET} | SNI: ${GREEN}${sni_domain}${RESET} | 密码: ${GREEN}${pwd}${RESET}"
+    show_shadowtls_summary "$listen_port"
     rm -rf "$tmpdir"
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
@@ -1946,14 +2086,16 @@ unified_node_manager() {
             local check_port
             check_port=$(basename "$s" | sed 's/shadowtls-//g' | sed 's/.service//g')
             if ! [[ "$check_port" =~ ^[0-9]+$ ]]; then
-                systemctl stop "$(basename "$s")" 2>/dev/null || true
-                systemctl disable "$(basename "$s")" 2>/dev/null || true
+                service_use_systemd && systemctl stop "$(basename "$s")" 2>/dev/null || true
+                service_use_systemd && systemctl disable "$(basename "$s")" 2>/dev/null || true
                 rm -f "$s"
-                systemctl daemon-reload
+                service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
             fi
         done
 
         local has_ss=0 has_vless=0 has_stls=0
+        local shadowtls_ports=()
+        mapfile -t shadowtls_ports < <(shadowtls_detect_ports)
         if [[ -f "/etc/ss-rust/config.json" ]]; then
             echo -e "${GREEN} 1) ⚡ SS-Rust 节点${RESET}"
             has_ss=1
@@ -1968,13 +2110,12 @@ unified_node_manager() {
             echo -e "${RED} 2) ❌ 未部署 VLESS Reality${RESET}"
         fi
 
-        if ls /etc/systemd/system/shadowtls-*.service 1> /dev/null 2>&1; then
-            echo -e "${GREEN} 3) 🛡️ ShadowTLS 防阻断保护实例${RESET}"
+        if [[ ${#shadowtls_ports[@]} -gt 0 ]]; then
+            echo -e "${GREEN} 3) 🛡️ ShadowTLS 防阻断保护实例 (${#shadowtls_ports[@]})${RESET}"
             has_stls=1
         else
             echo -e "${RED} 3) ❌ 未部署 ShadowTLS${RESET}"
         fi
-
         echo -e "${CYAN}--------------------------------------------${RESET}"
         echo -e "${RED} 4) ☢️ 全局强制核爆 (清理任意卡死/幽灵服务)${RESET}"
         echo -e " 0) 返回主菜单"
@@ -2061,34 +2202,40 @@ unified_node_manager() {
                     clear
                     local st_ports=()
                     local idx=1
-                    for s in /etc/systemd/system/shadowtls-*.service; do
-                        [[ -e "$s" ]] || continue
-                        local st_port
-                        st_port=$(basename "$s" | sed 's/shadowtls-//g' | sed 's/.service//g')
-                        st_ports[$idx]=$st_port
+                    mapfile -t st_ports < <(shadowtls_detect_ports)
+                    for st_port in "${st_ports[@]}"; do
+                        [[ -n "$st_port" ]] || continue
                         local st_status
-                        if systemctl is-active --quiet shadowtls-"$st_port" 2>/dev/null; then
+                        if shadowtls_is_active "$st_port"; then
                             st_status="${GREEN}运行中${RESET}"
                         else
                             st_status="${RED}已停止${RESET}"
                         fi
-                        echo -e " ${CYAN}${idx})${RESET} 端口: ${YELLOW}${st_port}${RESET} [${st_status}]"
+                        echo -e " ${CYAN}${idx})${RESET} 外层端口: ${YELLOW}${st_port}${RESET} [${st_status}]"
                         ((idx++))
                     done
                     echo -e "---------------------------------"
-                    echo -e "${RED}1) 序号删除实例${RESET} | ${RED}9) ⚠️ 强制核爆所有残留${RESET} | 0) 返回"
+                    echo -e "${YELLOW}1) 序号查看实例详情${RESET} | ${RED}2) 序号删除实例${RESET} | ${RED}9) ⚠️ 强制核爆所有残留${RESET} | 0) 返回"
                     read -rp "输入操作: " op
                     if [[ "$op" == "1" ]]; then
+                        read -rp "输入实例序号 [1-$((idx-1))]: " view_idx
+                        local view_port="${st_ports[$((view_idx-1))]}"
+                        if [[ -n "$view_port" ]]; then
+                            clear
+                            show_shadowtls_summary "$view_port"
+                            read -n 1 -s -r -p "按任意键返回上一层..."
+                        fi
+                    elif [[ "$op" == "2" ]]; then
                         read -rp "输入实例序号 [1-$((idx-1))]: " del_idx
-                        local del_port=${st_ports[$del_idx]}
-                        if [[ -n "$del_port" && -f "/etc/systemd/system/shadowtls-${del_port}.service" ]]; then
+                        local del_port="${st_ports[$((del_idx-1))]}"
+                        if [[ -n "$del_port" ]]; then
                             remove_firewall_rule "$del_port" "tcp"
-                            systemctl stop shadowtls-"$del_port" 2>/dev/null || true
-                            systemctl disable shadowtls-"$del_port" 2>/dev/null || true
+                            stop_managed_service "shadowtls-${del_port}" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/run/shadowtls-${del_port}.pid"
                             rm -f "/etc/systemd/system/shadowtls-${del_port}.service"
-                            systemctl daemon-reload
-                            if ! ls /etc/systemd/system/shadowtls-*.service 1> /dev/null 2>&1; then
-                                rm -f /usr/local/bin/shadow-tls
+                            rm -f "$(shadowtls_state_file "$del_port")"
+                            service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
+                            if [[ $(shadowtls_detect_ports | wc -l | tr -d ' ') -eq 0 ]]; then
+                                rm -f /usr/local/bin/shadow-tls /var/log/shadowtls.log
                             fi
                             echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
                             sleep 1
@@ -2098,12 +2245,12 @@ unified_node_manager() {
                         for p in "${st_ports[@]}"; do
                             [[ -z "$p" ]] && continue
                             remove_firewall_rule "$p" "tcp"
-                            systemctl stop "shadowtls-$p" 2>/dev/null || true
-                            systemctl disable "shadowtls-$p" 2>/dev/null || true
+                            stop_managed_service "shadowtls-${p}" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/run/shadowtls-${p}.pid"
                             rm -f "/etc/systemd/system/shadowtls-${p}.service"
+                            rm -f "$(shadowtls_state_file "$p")"
                         done
-                        rm -f /usr/local/bin/shadow-tls
-                        systemctl daemon-reload
+                        rm -f /usr/local/bin/shadow-tls /var/log/shadowtls.log
+                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
                         echo -e "${GREEN}✅ 拔除成功！${RESET}"
                         sleep 2
                     fi
