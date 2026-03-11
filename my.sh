@@ -432,7 +432,7 @@ shadowtls_make_ss_link() {
     st_pwd="$(shadowtls_get_field "$listen_port" PASSWORD 2>/dev/null || true)"
     [[ -n "$ip" && -n "$listen_port" && -n "$method" && -n "$password" && -n "$st_sni" && -n "$st_pwd" ]] || return 1
     userinfo="$(ss_make_userinfo "$method" "$password")"
-    plugin_raw="shadow-tls;host=${st_sni};password=${st_pwd};version=3"
+    plugin_raw="shadow-tls;host=;passwd=;v3"
     plugin_enc="$(uri_encode "$plugin_raw")"
     printf 'ss://%s@%s:%s/?plugin=%s#SS-Rust-ShadowTLS' "$userinfo" "$ip" "$listen_port" "$plugin_enc"
 }
