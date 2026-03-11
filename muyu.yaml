@@ -125,12 +125,15 @@ proxy-groups:
   # 3. TG 通讯专用
   - {name: 📲 Telegram, type: select, proxies: [🔯 狮城故转, 🔯 香港故转, 🔯 日本故转, 🛡️ 全局不死, 🚀 默认代理, 🇸🇬 狮城节点, 🇭🇰 香港节点, 🇯🇵 日本节点]}
   
-  # 4. 国内直连防流量消耗通道（苹果、微软、游戏）
+  # 4. 交易所专用通道（默认优先日本/台湾，兼顾币安/Bybit）
+  - {name: 💹 交易所, type: select, proxies: [🔯 日本故转, 🔯 台湾故转, 🇯🇵 日本节点, 🇹🇼 台湾节点, 🚀 默认代理, 🛡️ 全局不死, 直连]}
+
+  # 5. 国内直连防流量消耗通道（苹果、微软、游戏）
   - {name: 🍎 苹果服务, type: select, proxies: [直连, 🚀 默认代理, 🛡️ 全局不死, 🔯 台湾故转, 🔯 香港故转]}
   - {name: 🪟 微软服务, type: select, proxies: [直连, 🚀 默认代理, 🛡️ 全局不死, 🔯 台湾故转, 🔯 日本故转, 🔯 香港故转]}
   - {name: 🎮 游戏平台, type: select, proxies: [🚀 默认代理, 直连, 🛡️ 全局不死, 🔯 台湾故转, 🔯 日本故转]}
   
-  # 5. 兜底规则
+  # 6. 兜底规则
   - {name: 🐟 漏网之鱼, type: select, proxies: [🚀 默认代理, 直连]}
   
   # ==================================
@@ -165,7 +168,12 @@ rules:
   
   - RULE-SET,private_ip,直连,no-resolve
   - RULE-SET,private_domain,直连
-  
+
+  # === 交易所专线 ===
+  - DOMAIN-SUFFIX,binance.com,💹 交易所
+  - DOMAIN-SUFFIX,bnbstatic.com,💹 交易所
+  - DOMAIN-SUFFIX,bybit.com,💹 交易所
+
   # === AI 刚需专线 ===
   - RULE-SET,gemini_domain,🤖 AI 专属
   - RULE-SET,ai,🤖 AI 专属
