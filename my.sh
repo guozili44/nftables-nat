@@ -1177,8 +1177,12 @@ install_ss_rust_native() {
     fi
 
     local arch; arch=$(uname -m)
-    local ss_arch="x86_64-unknown-linux-gnu"
-    [[ "$arch" == "aarch64" ]] && ss_arch="aarch64-unknown-linux-gnu"
+    local ss_arch_primary="x86_64-unknown-linux-musl"
+    local ss_arch_fallback="x86_64-unknown-linux-gnu"
+    if [[ "$arch" == "aarch64" ]]; then
+        ss_arch_primary="aarch64-unknown-linux-musl"
+        ss_arch_fallback="aarch64-unknown-linux-gnu"
+    fi
 
     echo -e "${CYAN}>>> 正在获取 SS-Rust 最新版本信息...${RESET}"
     local ss_latest
@@ -1187,33 +1191,30 @@ install_ss_rust_native() {
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-ssrust.XXXXXX)
     local tarball="${tmpdir}/ss-rust.tar.xz"
-    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/shadowsocks-${ss_latest}.${ss_arch}.tar.xz"
+    local url=""
+    local ss_arch=""
 
-    echo -e "${CYAN}>>> 下载核心: ${ss_latest} (${ss_arch}) ...${RESET}"
-    if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
-        echo -e "${RED}❌ 核心下载或校验失败，请重试。${RESET}"
+    for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
+        url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/shadowsocks-${ss_latest}.${candidate_arch}.tar.xz"
+        echo -e "${CYAN}>>> 下载核心: ${ss_latest} (${candidate_arch}) ...${RESET}"
+        rm -f "$tarball" "${tmpdir}/ssserver" >/dev/null 2>&1 || true
+        if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
+            continue
+        fi
+        tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
+        [[ -x "${tmpdir}/ssserver" ]] || continue
+        if run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1 || run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1; then
+            ss_arch="$candidate_arch"
+            break
+        fi
+    done
+
+    if [[ -z "$ss_arch" || ! -x "${tmpdir}/ssserver" ]]; then
+        echo -e "${RED}❌ SS-Rust 新核心自检失败。已自动尝试 musl/gnu 两种构建，当前环境均无法运行。${RESET}"
+        echo -e "${YELLOW}提示：这通常是 glibc/运行时兼容问题，musl 静态版已优先尝试。${RESET}"
         rm -rf "$tmpdir"
         sleep 3
         return
-    fi
-
-    tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
-    if [[ ! -x "${tmpdir}/ssserver" ]]; then
-        echo -e "${RED}❌ 解压失败：未找到 ssserver。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
-    fi
-
-    # 可运行校验
-    if ! run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1; then
-        # 尝试 -V
-        run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1 || {
-            echo -e "${RED}❌ 新核心自检失败（无法运行）。已中止替换。${RESET}"
-            rm -rf "$tmpdir"
-            sleep 3
-            return
-        }
     fi
 
     safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || {
@@ -1803,8 +1804,12 @@ update_ss_rust_if_needed() {
     [[ -x "/usr/local/bin/ss-rust" ]] || return 1
 
     local arch; arch=$(uname -m)
-    local ss_arch="x86_64-unknown-linux-gnu"
-    [[ "$arch" == "aarch64" ]] && ss_arch="aarch64-unknown-linux-gnu"
+    local ss_arch_primary="x86_64-unknown-linux-musl"
+    local ss_arch_fallback="x86_64-unknown-linux-gnu"
+    if [[ "$arch" == "aarch64" ]]; then
+        ss_arch_primary="aarch64-unknown-linux-musl"
+        ss_arch_fallback="aarch64-unknown-linux-gnu"
+    fi
 
     local latest; latest=$(github_latest_tag "shadowsocks/shadowsocks-rust")
     [[ -z "$latest" ]] && return 2
@@ -1822,19 +1827,24 @@ update_ss_rust_if_needed() {
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-ssrust.XXXXXX)
     local tarball="${tmpdir}/ss-rust.tar.xz"
-    local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${latest}/shadowsocks-${latest}.${ss_arch}.tar.xz"
+    local ss_arch=""
+    local url=""
 
-    if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
-        rm -rf "$tmpdir"
-        return 2
-    fi
+    for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
+        url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${latest}/shadowsocks-${latest}.${candidate_arch}.tar.xz"
+        rm -f "$tarball" "${tmpdir}/ssserver" >/dev/null 2>&1 || true
+        if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
+            continue
+        fi
+        tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
+        [[ -x "${tmpdir}/ssserver" ]] || continue
+        if run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1 || run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1; then
+            ss_arch="$candidate_arch"
+            break
+        fi
+    done
 
-    tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
-    [[ -x "${tmpdir}/ssserver" ]] || { rm -rf "$tmpdir"; return 2; }
-
-    if ! run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1; then
-        run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
-    fi
+    [[ -n "$ss_arch" && -x "${tmpdir}/ssserver" ]] || { rm -rf "$tmpdir"; return 2; }
 
     safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || { rm -rf "$tmpdir"; return 2; }
 
