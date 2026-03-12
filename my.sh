@@ -3,7 +3,7 @@
 # 综合管理脚本：SSR + nftables
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v1.3.0  (build 2026-03-06+acdndd-nginx)
+# 版本：v1.3.1  (build 2026-03-12+corecache)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 # ============================================================
 
@@ -17,7 +17,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # --------------------------
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="1.3.0"
+MY_VERSION="1.3.1"
 
 MY_INSTALL_DIR="/usr/local/lib/my"
 SSR_MODULE_FILE="${MY_INSTALL_DIR}/ssr_module.sh"
@@ -182,6 +182,110 @@ meta_set() {
     fi
 }
 
+readonly CORE_CACHE_DIR="/usr/local/lib/my/cache"
+readonly CORE_TAG_CACHE_DIR="${CORE_CACHE_DIR}/tags"
+readonly CORE_TAG_TTL=259200
+
+core_cache_component_dir() {
+    local comp="$1"
+    echo "${CORE_CACHE_DIR}/${comp}"
+}
+
+core_cache_bin_name() {
+    case "$1" in
+        ss-rust) echo "ss-rust" ;;
+        xray) echo "xray" ;;
+        shadowtls) echo "shadow-tls" ;;
+        *) return 1 ;;
+    esac
+}
+
+cache_current_binary_path() {
+    local comp="$1"
+    local name
+    name=$(core_cache_bin_name "$comp") || return 1
+    echo "$(core_cache_component_dir "$comp")/current/${name}"
+}
+
+cache_tag_binary_path() {
+    local comp="$1" tag="$2"
+    local name
+    name=$(core_cache_bin_name "$comp") || return 1
+    echo "$(core_cache_component_dir "$comp")/${tag}/${name}"
+}
+
+cache_store_binary() {
+    local comp="$1" tag="$2" src="$3"
+    local dir name current_path
+    [[ -n "$comp" && -n "$tag" && -x "$src" ]] || return 1
+    name=$(core_cache_bin_name "$comp") || return 1
+    dir="$(core_cache_component_dir "$comp")/${tag}"
+    current_path="$(cache_current_binary_path "$comp")"
+    mkdir -p "$dir" "$(dirname "$current_path")" 2>/dev/null || return 1
+    install -m 755 "$src" "${dir}/${name}" >/dev/null 2>&1 || return 1
+    install -m 755 "$src" "$current_path" >/dev/null 2>&1 || return 1
+}
+
+cache_restore_binary() {
+    local comp="$1" dest="$2"
+    local current_path
+    current_path="$(cache_current_binary_path "$comp")"
+    [[ -x "$current_path" ]] || return 1
+    safe_install_binary "$current_path" "$dest"
+}
+
+cache_restore_binary_tag() {
+    local comp="$1" tag="$2" dest="$3"
+    local src
+    src="$(cache_tag_binary_path "$comp" "$tag")"
+    [[ -x "$src" ]] || return 1
+    safe_install_binary "$src" "$dest"
+}
+
+cached_latest_tag() {
+    local repo="$1" key="$2" file now mtime tag=""
+    [[ -n "$repo" && -n "$key" ]] || return 1
+    mkdir -p "$CORE_TAG_CACHE_DIR" 2>/dev/null || true
+    file="${CORE_TAG_CACHE_DIR}/${key}.tag"
+    now=$(date +%s)
+    if [[ -s "$file" ]]; then
+        mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+        if [[ -n "$mtime" ]] && (( now - mtime < CORE_TAG_TTL )); then
+            cat "$file"
+            return 0
+        fi
+    fi
+    tag=$(github_latest_tag "$repo" 2>/dev/null || true)
+    if [[ -n "$tag" && "$tag" != "null" ]]; then
+        printf '%s' "$tag" > "$file"
+        echo "$tag"
+        return 0
+    fi
+    [[ -s "$file" ]] && cat "$file"
+}
+
+ss_rust_current_tag() {
+    local v
+    v=$(/usr/local/bin/ss-rust --version 2>/dev/null | grep -oE '([0-9]+\.){2}[0-9]+' | head -n1)
+    [[ -n "$v" ]] && echo "v${v}"
+}
+
+xray_current_tag() {
+    local v
+    v=$(/usr/local/bin/xray version 2>/dev/null | head -n1 | grep -oE '([0-9]+\.){2}[0-9]+' | head -n1)
+    [[ -n "$v" ]] && echo "v${v}"
+}
+
+shadowtls_current_tag() {
+    local v
+    v=$(/usr/local/bin/shadow-tls --version 2>/dev/null | grep -oE '([0-9]+\.){2}[0-9]+' | head -n1)
+    [[ -n "$v" ]] && echo "v${v}"
+}
+
+core_cache_clear_all() {
+    rm -rf "$CORE_CACHE_DIR" 2>/dev/null || true
+}
+
 backup_file_once() {
     local src="$1"; local bak="$2"
     [[ -f "$src" ]] || return 0
@@ -291,7 +395,14 @@ PYPARSE
 
 
 normalize_xray_x25519_output() {
-    printf '%s' "$1" | tr -d '\r' | perl -pe 's/(Private\s*[Kk]ey:|Public\s*[Kk]ey:|Password:|Hash32:)/\n$1/g' | sed '/^[[:space:]]*$/d'
+    printf '%s' "$1" | tr -d '
+' |         sed -E             -e 's/Private[[:space:]]*[Kk]ey:/\
+PrivateKey:/g'             -e 's/Public[[:space:]]*[Kk]ey:/\
+PublicKey:/g'             -e 's/PrivateKey:/\
+PrivateKey:/g'             -e 's/PublicKey:/\
+PublicKey:/g'             -e 's/Password:/\
+Password:/g'             -e 's/Hash32:/\
+Hash32:/g' |         sed '/^[[:space:]]*$/d'
 }
 
 xray_extract_reality_private_key() {
@@ -1688,35 +1799,38 @@ ssh_key_menu() {
 
 # ==============================================================================
 # ==============================================================================
+
 install_ss_rust_native() {
     clear
     echo -e "${CYAN}========= 原生交互安装 SS-Rust =========${RESET}"
-    rm -f /etc/systemd/system/ss-rust.service 2>/dev/null || true
 
-    read -rp "自定义端口 (1-65535) [留空随机]: " custom_port
-    local port=$custom_port
+    read -rp "端口 [留空随机]: " port
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
         port=$((RANDOM % 55535 + 10000))
     fi
 
-    echo -e "\n${CYAN}加密协议:${RESET}"
-    echo -e " 1) 2022-blake3-aes-128-gcm"
-    echo -e " 2) 2022-blake3-aes-256-gcm"
-    echo -e " 3) 2022-blake3-chacha20-poly1305"
-    echo -e " 4) aes-256-gcm"
-    read -rp "选择 [1-4] (默认1): " method_choice
+    local methods=(
+        "2022-blake3-aes-128-gcm"
+        "2022-blake3-aes-256-gcm"
+        "2022-blake3-chacha20-poly1305"
+        "aes-256-gcm"
+    )
+    echo -e "${YELLOW}加密协议:${RESET}"
+    local i=1
+    for m in "${methods[@]}"; do echo " $i) $m"; i=$((i+1)); done
+    read -rp "选择 [1-4] (默认1): " msel
+    [[ "$msel" =~ ^[1-4]$ ]] || msel=1
+    local method="${methods[$((msel-1))]}"
 
-    local method="2022-blake3-aes-128-gcm"
-    local pwd_len=16
-    case "$method_choice" in
-        2) method="2022-blake3-aes-256-gcm"; pwd_len=32 ;;
-        3) method="2022-blake3-chacha20-poly1305"; pwd_len=32 ;;
-        4) method="aes-256-gcm"; pwd_len=0 ;;
+    local pwd_len=0
+    case "$method" in
+        2022-blake3-aes-128-gcm) pwd_len=16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) pwd_len=32 ;;
     esac
 
-    local pwd="" input_pwd=""
+    local pwd=""
     if [[ "$pwd_len" -ne 0 ]]; then
-        read -rp "密码 (留空自动生成安全密钥): " input_pwd
+        read -rp "密码 (留空自动生成，输入时可填 Base64 密钥或原始密钥): " input_pwd
         if [[ -z "$input_pwd" ]]; then
             if have_cmd openssl; then
                 pwd=$(openssl rand "$pwd_len" 2>/dev/null | base64_nw)
@@ -1768,45 +1882,59 @@ install_ss_rust_native() {
             ;;
     esac
 
-    echo -e "${CYAN}>>> 正在获取 SS-Rust 最新版本信息...${RESET}"
-    local ss_latest
-    ss_latest=$(github_latest_tag "shadowsocks/shadowsocks-rust")
-    [[ -z "$ss_latest" ]] && ss_latest="v1.24.0"
+    local ss_latest="" tmpdir="" tarball="" url="" ss_arch=""
 
-    local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-ssrust.XXXXXX)
-    local tarball="${tmpdir}/ss-rust.tar.xz"
-    local url=""
-    local ss_arch=""
+    if [[ -x /usr/local/bin/ss-rust ]] && (run_with_timeout 3 /usr/local/bin/ss-rust --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/ss-rust -V >/dev/null 2>&1); then
+        echo -e "${CYAN}>>> 复用本地已安装 SS-Rust 核心（不重新下载）...${RESET}"
+        ss_latest=$(meta_get "SS_RUST_TAG" || true)
+        [[ -z "$ss_latest" ]] && ss_latest=$(ss_rust_current_tag || true)
+        [[ -n "$ss_latest" ]] && cache_store_binary "ss-rust" "$ss_latest" /usr/local/bin/ss-rust >/dev/null 2>&1 || true
+    elif cache_restore_binary "ss-rust" /usr/local/bin/ss-rust && (run_with_timeout 3 /usr/local/bin/ss-rust --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/ss-rust -V >/dev/null 2>&1); then
+        echo -e "${CYAN}>>> 从本地缓存恢复 SS-Rust 核心（不重新下载）...${RESET}"
+        ss_latest=$(meta_get "SS_RUST_TAG" || true)
+        [[ -z "$ss_latest" ]] && ss_latest=$(ss_rust_current_tag || true)
+    else
+        echo -e "${CYAN}>>> 本地无可用 SS-Rust 核心，开始联网下载...${RESET}"
+        ss_latest=$(cached_latest_tag "shadowsocks/shadowsocks-rust" "ss-rust")
+        [[ -z "$ss_latest" ]] && ss_latest="v1.24.0"
 
-    for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
-        url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/shadowsocks-${ss_latest}.${candidate_arch}.tar.xz"
-        echo -e "${CYAN}>>> 下载核心: ${ss_latest} (${candidate_arch}) ...${RESET}"
-        rm -f "$tarball" "${tmpdir}/ssserver" >/dev/null 2>&1 || true
-        if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
-            continue
+        tmpdir=$(mktemp -d /tmp/ssr-ssrust.XXXXXX)
+        tarball="${tmpdir}/ss-rust.tar.xz"
+
+        for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
+            url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/shadowsocks-${ss_latest}.${candidate_arch}.tar.xz"
+            echo -e "${CYAN}>>> 下载核心: ${ss_latest} (${candidate_arch}) ...${RESET}"
+            rm -f "$tarball" "${tmpdir}/ssserver" >/dev/null 2>&1 || true
+            if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
+                continue
+            fi
+            tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
+            [[ -x "${tmpdir}/ssserver" ]] || continue
+            if run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1 || run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1; then
+                ss_arch="$candidate_arch"
+                break
+            fi
+        done
+
+        if [[ -z "$ss_arch" || ! -x "${tmpdir}/ssserver" ]]; then
+            echo -e "${RED}❌ SS-Rust 新核心自检失败。已自动尝试 musl/gnu 两种构建，当前环境均无法运行。${RESET}"
+            echo -e "${YELLOW}提示：这通常是 glibc/运行时兼容问题，musl 静态版已优先尝试。${RESET}"
+            rm -rf "$tmpdir"
+            sleep 3
+            return
         fi
-        tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
-        [[ -x "${tmpdir}/ssserver" ]] || continue
-        if run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1 || run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1; then
-            ss_arch="$candidate_arch"
-            break
-        fi
-    done
 
-    if [[ -z "$ss_arch" || ! -x "${tmpdir}/ssserver" ]]; then
-        echo -e "${RED}❌ SS-Rust 新核心自检失败。已自动尝试 musl/gnu 两种构建，当前环境均无法运行。${RESET}"
-        echo -e "${YELLOW}提示：这通常是 glibc/运行时兼容问题，musl 静态版已优先尝试。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
+        safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || {
+            echo -e "${RED}❌ 安装失败（写入 /usr/local/bin/ss-rust 失败）。${RESET}"
+            rm -rf "$tmpdir"
+            sleep 3
+            return
+        }
+        cache_store_binary "ss-rust" "$ss_latest" /usr/local/bin/ss-rust >/dev/null 2>&1 || true
     fi
 
-    safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || {
-        echo -e "${RED}❌ 安装失败（写入 /usr/local/bin/ss-rust 失败）。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
-    }
+    [[ -n "$ss_latest" ]] || ss_latest=$(ss_rust_current_tag || true)
+    [[ -n "$ss_latest" ]] && meta_set "SS_RUST_TAG" "$ss_latest"
 
     mkdir -p /etc/ss-rust
     cat > /etc/ss-rust/config.json << EOF
@@ -1848,9 +1976,9 @@ WantedBy=multi-user.target'
         firewall-cmd --reload >/dev/null 2>&1
     fi
 
-    meta_set "SS_RUST_TAG" "$ss_latest"
+    [[ -n "$ss_latest" ]] && meta_set "SS_RUST_TAG" "$ss_latest"
 
-    echo -e "${GREEN}✅ SS-Rust (${ss_latest}) 安装完成！${RESET}"
+    echo -e "${GREEN}✅ SS-Rust (${ss_latest:-local}) 安装完成！${RESET}"
     show_ss_rust_summary
     rm -rf "$tmpdir"
     read -n 1 -s -r -p "按任意键返回上一层..."
@@ -1877,58 +2005,70 @@ install_vless_native() {
         armv7l|armv7|arm) xray_arch="arm32-v7a" ;;
     esac
 
-    echo -e "${CYAN}>>> 正在获取 Xray 最新版本信息...${RESET}"
-    local xray_latest
-    xray_latest=$(github_latest_tag "XTLS/Xray-core")
-    [[ -z "$xray_latest" ]] && xray_latest="v26.2.6"
+    local xray_latest="" tmpdir="" zipf=""
+    if [[ -x /usr/local/bin/xray ]] && run_with_timeout 3 /usr/local/bin/xray version >/dev/null 2>&1 && run_with_timeout 3 /usr/local/bin/xray x25519 >/dev/null 2>&1; then
+        echo -e "${CYAN}>>> 复用本地已安装 Xray 核心（不重新下载）...${RESET}"
+        xray_latest=$(meta_get "XRAY_TAG" || true)
+        [[ -z "$xray_latest" ]] && xray_latest=$(xray_current_tag || true)
+        [[ -n "$xray_latest" ]] && cache_store_binary "xray" "$xray_latest" /usr/local/bin/xray >/dev/null 2>&1 || true
+    elif cache_restore_binary "xray" /usr/local/bin/xray && run_with_timeout 3 /usr/local/bin/xray version >/dev/null 2>&1 && run_with_timeout 3 /usr/local/bin/xray x25519 >/dev/null 2>&1; then
+        echo -e "${CYAN}>>> 从本地缓存恢复 Xray 核心（不重新下载）...${RESET}"
+        xray_latest=$(meta_get "XRAY_TAG" || true)
+        [[ -z "$xray_latest" ]] && xray_latest=$(xray_current_tag || true)
+    else
+        echo -e "${CYAN}>>> 本地无可用 Xray 核心，开始联网下载...${RESET}"
+        xray_latest=$(cached_latest_tag "XTLS/Xray-core" "xray")
+        [[ -z "$xray_latest" ]] && xray_latest="v26.2.6"
 
-    local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-xray.XXXXXX)
-    local zipf="${tmpdir}/xray.zip"
-    local url="https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/Xray-linux-${xray_arch}.zip"
+        tmpdir=$(mktemp -d /tmp/ssr-xray.XXXXXX)
+        zipf="${tmpdir}/xray.zip"
+        local url="https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/Xray-linux-${xray_arch}.zip"
 
-    echo -e "${CYAN}>>> 下载核心: ${xray_latest} (linux-${xray_arch}) ...${RESET}"
-    if ! download_file "$url" "$zipf" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
-        echo -e "${RED}❌ 核心下载或校验失败。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
+        echo -e "${CYAN}>>> 下载核心: ${xray_latest} (linux-${xray_arch}) ...${RESET}"
+        if ! download_file "$url" "$zipf" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
+            echo -e "${RED}❌ 核心下载或校验失败。${RESET}"
+            rm -rf "$tmpdir"
+            sleep 3
+            return
+        fi
+
+        unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
+        if [[ ! -x "${tmpdir}/xray" ]]; then
+            echo -e "${RED}❌ 解压失败：未找到 xray。${RESET}"
+            rm -rf "$tmpdir"
+            sleep 3
+            return
+        fi
+
+        if ! run_with_timeout 3 "${tmpdir}/xray" version >/dev/null 2>&1 || ! run_with_timeout 3 "${tmpdir}/xray" x25519 >/dev/null 2>&1; then
+            echo -e "${RED}❌ 新核心自检失败（无法运行或缺少 x25519）。已中止替换。${RESET}"
+            rm -rf "$tmpdir"
+            sleep 3
+            return
+        fi
+
+        safe_install_binary "${tmpdir}/xray" /usr/local/bin/xray || {
+            echo -e "${RED}❌ 安装失败（写入 /usr/local/bin/xray 失败）。${RESET}"
+            rm -rf "$tmpdir"
+            sleep 3
+            return
+        }
+        cache_store_binary "xray" "$xray_latest" /usr/local/bin/xray >/dev/null 2>&1 || true
     fi
 
-    unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
-    if [[ ! -x "${tmpdir}/xray" ]]; then
-        echo -e "${RED}❌ 解压失败：未找到 xray。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
-    fi
-
-    if ! run_with_timeout 3 "${tmpdir}/xray" version >/dev/null 2>&1; then
-        echo -e "${RED}❌ 新核心自检失败（无法运行）。已中止替换。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
-    fi
-
-    safe_install_binary "${tmpdir}/xray" /usr/local/bin/xray || {
-        echo -e "${RED}❌ 安装失败（写入 /usr/local/bin/xray 失败）。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
-    }
+    [[ -n "$xray_latest" ]] || xray_latest=$(xray_current_tag || true)
+    [[ -n "$xray_latest" ]] && meta_set "XRAY_TAG" "$xray_latest"
 
     mkdir -p /usr/local/etc/xray
     local uuid keys priv pub short_id
-    uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '
-')
-    keys=$(/usr/local/bin/xray x25519 2>&1 | tr -d '
-')
+    uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '\r')
+    keys=$(/usr/local/bin/xray x25519 2>&1 | tr -d '\r')
     priv=$(xray_extract_reality_private_key "$keys")
     pub=$(xray_extract_reality_public_key "$keys")
     if have_cmd openssl; then
         short_id=$(openssl rand -hex 8 2>/dev/null)
     else
-        short_id=$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' 
-')
+        short_id=$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
     fi
     if [[ -z "$uuid" || -z "$priv" || -z "$pub" || -z "$short_id" ]]; then
         echo -e "${RED}❌ Xray 密钥材料生成失败。${RESET}"
@@ -1972,13 +2112,14 @@ WantedBy=multi-user.target'
     if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; fi
     if have_cmd firewall-cmd; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
 
-    meta_set "XRAY_TAG" "$xray_latest"
+    [[ -n "$xray_latest" ]] && meta_set "XRAY_TAG" "$xray_latest"
 
-    echo -e "${GREEN}✅ VLESS Reality (${xray_latest}) 安装成功！${RESET}"
+    echo -e "${GREEN}✅ VLESS Reality (${xray_latest:-local}) 安装成功！${RESET}"
     show_vless_summary
     rm -rf "$tmpdir"
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
+
 
 install_shadowtls_native() {
     clear
@@ -2016,12 +2157,12 @@ install_shadowtls_native() {
 
     local pwd
     if have_cmd openssl; then
-        pwd=$(openssl rand -base64 8 2>/dev/null | tr -d '
-')
+        pwd=$(openssl rand -base64 8 2>/dev/null | tr -d '\n')
     else
         pwd=$(head -c 8 /dev/urandom 2>/dev/null | base64_nw)
     fi
     [[ -n "$pwd" ]] || { echo -e "${RED}❌ ShadowTLS 密码生成失败。${RESET}"; sleep 3; return; }
+
     local arch; arch=$(uname -m)
     local st_arch
     st_arch=$(shadowtls_arch_name "$arch") || {
@@ -2030,44 +2171,58 @@ install_shadowtls_native() {
         return
     }
 
-    echo -e "${CYAN}>>> 正在获取 ShadowTLS 最新版本信息...${RESET}"
-    local st_latest
-    st_latest=$(github_latest_tag "ihciah/shadow-tls")
-    [[ -z "$st_latest" ]] && st_latest="v0.2.25"
+    local st_latest="" tmpdir="" binf=""
+    if [[ -x /usr/local/bin/shadow-tls ]] && (run_with_timeout 3 /usr/local/bin/shadow-tls --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls -V >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls --help >/dev/null 2>&1); then
+        echo -e "${CYAN}>>> 复用本地已安装 ShadowTLS 核心（不重新下载）...${RESET}"
+        st_latest=$(meta_get "SHADOWTLS_TAG" || true)
+        [[ -z "$st_latest" ]] && st_latest=$(shadowtls_current_tag || true)
+        [[ -n "$st_latest" ]] && cache_store_binary "shadowtls" "$st_latest" /usr/local/bin/shadow-tls >/dev/null 2>&1 || true
+    elif cache_restore_binary "shadowtls" /usr/local/bin/shadow-tls && (run_with_timeout 3 /usr/local/bin/shadow-tls --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls -V >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls --help >/dev/null 2>&1); then
+        echo -e "${CYAN}>>> 从本地缓存恢复 ShadowTLS 核心（不重新下载）...${RESET}"
+        st_latest=$(meta_get "SHADOWTLS_TAG" || true)
+        [[ -z "$st_latest" ]] && st_latest=$(shadowtls_current_tag || true)
+    else
+        echo -e "${CYAN}>>> 本地无可用 ShadowTLS 核心，开始联网下载...${RESET}"
+        st_latest=$(cached_latest_tag "ihciah/shadow-tls" "shadowtls")
+        [[ -z "$st_latest" ]] && st_latest="v0.2.25"
 
-    local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-stls.XXXXXX)
-    local binf="${tmpdir}/shadow-tls"
-    local asset_name="shadow-tls-${st_arch}"
-    local official_url="https://github.com/ihciah/shadow-tls/releases/download/${st_latest}/${asset_name}"
-    local api_url=""
-    api_url=$(github_release_asset_url "ihciah/shadow-tls" "$st_latest" "$asset_name" 2>/dev/null || true)
-    local proxy_url="https://ghproxy.net/${official_url}"
+        tmpdir=$(mktemp -d /tmp/ssr-stls.XXXXXX)
+        binf="${tmpdir}/shadow-tls"
+        local asset_name="shadow-tls-${st_arch}"
+        local official_url="https://github.com/ihciah/shadow-tls/releases/download/${st_latest}/${asset_name}"
+        local api_url=""
+        api_url=$(github_release_asset_url "ihciah/shadow-tls" "$st_latest" "$asset_name" 2>/dev/null || true)
+        local proxy_url="https://ghproxy.net/${official_url}"
 
-    echo -e "${CYAN}>>> 下载核心: ${st_latest} (${st_arch}) ...${RESET}"
-    if ! download_file_any "$binf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$binf" ]]; then
-        echo -e "${RED}❌ 下载失败。已尝试 GitHub 直连与代理地址。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
-    fi
-    chmod +x "$binf" >/dev/null 2>&1 || true
+        echo -e "${CYAN}>>> 下载核心: ${st_latest} (${st_arch}) ...${RESET}"
+        if ! download_file_any "$binf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$binf" ]]; then
+            echo -e "${RED}❌ 下载失败。已尝试 GitHub 直连与代理地址。${RESET}"
+            rm -rf "$tmpdir"
+            sleep 3
+            return
+        fi
+        chmod +x "$binf" >/dev/null 2>&1 || true
 
-    # 可运行校验
-    if ! run_with_timeout 3 "$binf" --version >/dev/null 2>&1; then
-        run_with_timeout 3 "$binf" -V >/dev/null 2>&1 || run_with_timeout 3 "$binf" --help >/dev/null 2>&1 || {
-            echo -e "${RED}❌ 新核心自检失败（无法运行）。已中止替换。${RESET}"
+        if ! run_with_timeout 3 "$binf" --version >/dev/null 2>&1; then
+            run_with_timeout 3 "$binf" -V >/dev/null 2>&1 || run_with_timeout 3 "$binf" --help >/dev/null 2>&1 || {
+                echo -e "${RED}❌ 新核心自检失败（无法运行）。已中止替换。${RESET}"
+                rm -rf "$tmpdir"
+                sleep 3
+                return
+            }
+        fi
+
+        safe_install_binary "$binf" /usr/local/bin/shadow-tls || {
+            echo -e "${RED}❌ 安装失败（写入 /usr/local/bin/shadow-tls 失败）。${RESET}"
             rm -rf "$tmpdir"
             sleep 3
             return
         }
+        cache_store_binary "shadowtls" "$st_latest" /usr/local/bin/shadow-tls >/dev/null 2>&1 || true
     fi
 
-    safe_install_binary "$binf" /usr/local/bin/shadow-tls || {
-        echo -e "${RED}❌ 安装失败（写入 /usr/local/bin/shadow-tls 失败）。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
-    }
+    [[ -n "$st_latest" ]] || st_latest=$(shadowtls_current_tag || true)
+    [[ -n "$st_latest" ]] && meta_set "SHADOWTLS_TAG" "$st_latest"
 
     local st_cmd="/usr/local/bin/shadow-tls --v3 --strict server --listen 0.0.0.0:${listen_port} --server 127.0.0.1:${up_port} --tls ${sni_domain}:443 --password ${pwd}"
     local st_cmd_legacy="env MONOIO_FORCE_LEGACY_DRIVER=1 ${st_cmd}"
@@ -2118,7 +2273,7 @@ EOF
             }
         fi
     else
-        restart_managed_service "shadowtls-${listen_port}" "$st_cmd" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/log/shadowtls.log" "/var/run/shadowtls-${listen_port}.pid" ||         restart_managed_service "shadowtls-${listen_port}" "$st_cmd_legacy" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/log/shadowtls.log" "/var/run/shadowtls-${listen_port}.pid" || {
+        restart_managed_service "shadowtls-${listen_port}" "$st_cmd" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/log/shadowtls.log" "/var/run/shadowtls-${listen_port}.pid" || restart_managed_service "shadowtls-${listen_port}" "$st_cmd_legacy" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/log/shadowtls.log" "/var/run/shadowtls-${listen_port}.pid" || {
             echo -e "${RED}❌ ShadowTLS 后台启动失败（无 systemd 环境）。${RESET}"
             rm -rf "$tmpdir"
             sleep 3
@@ -2141,10 +2296,9 @@ EOF
         return
     fi
 
-    meta_set "SHADOWTLS_TAG" "$st_latest"
     shadowtls_state_save "$listen_port" "$up_port" "$sni_domain" "$pwd"
 
-    echo -e "${GREEN}✅ ShadowTLS (${st_latest}) 安装成功！已挂载在 ${up_port} 上层。${RESET}"
+    echo -e "${GREEN}✅ ShadowTLS (${st_latest:-local}) 安装成功！已挂载在 ${up_port} 上层。${RESET}"
     show_shadowtls_summary "$listen_port"
     echo -e "${YELLOW}手动参数:${RESET} 外层端口=${listen_port} | 上游端口=${up_port} | SNI=${sni_domain} | ShadowTLS密码=${pwd}"
     rm -rf "$tmpdir"
@@ -2531,6 +2685,7 @@ auto_clean() {
     [[ "$is_silent" != "silent" ]] && echo -e "${GREEN}✅ 垃圾清理完毕！${RESET}"
 }
 
+
 update_ss_rust_if_needed() {
     [[ -x "/usr/local/bin/ss-rust" ]] || return 1
 
@@ -2548,24 +2703,21 @@ update_ss_rust_if_needed() {
             ;;
     esac
 
-    local latest; latest=$(github_latest_tag "shadowsocks/shadowsocks-rust")
+    local latest; latest=$(cached_latest_tag "shadowsocks/shadowsocks-rust" "ss-rust")
     [[ -z "$latest" ]] && return 2
 
     local current; current=$(meta_get "SS_RUST_TAG" || true)
-
-    if [[ -z "$current" ]]; then
-        # 尝试从二进制版本推断
-        local v
-        v=$(/usr/local/bin/ss-rust --version 2>/dev/null | grep -oE '([0-9]+\.){2}[0-9]+' | head -n 1)
-        [[ -n "$v" ]] && current="v${v}"
-    fi
-
+    [[ -z "$current" ]] && current=$(ss_rust_current_tag || true)
     [[ -n "$current" && "$current" == "$latest" ]] && return 3
 
+    if cache_restore_binary_tag "ss-rust" "$latest" /usr/local/bin/ss-rust && (run_with_timeout 3 /usr/local/bin/ss-rust --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/ss-rust -V >/dev/null 2>&1); then
+        meta_set "SS_RUST_TAG" "$latest"
+        restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
+        return 0
+    fi
+
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-ssrust.XXXXXX)
-    local tarball="${tmpdir}/ss-rust.tar.xz"
-    local ss_arch=""
-    local url=""
+    local tarball="${tmpdir}/ss-rust.tar.xz" url="" ok=""
 
     for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
         url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${latest}/shadowsocks-${latest}.${candidate_arch}.tar.xz"
@@ -2576,20 +2728,20 @@ update_ss_rust_if_needed() {
         tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
         [[ -x "${tmpdir}/ssserver" ]] || continue
         if run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1 || run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1; then
-            ss_arch="$candidate_arch"
+            ok=1
             break
         fi
     done
-
-    [[ -n "$ss_arch" && -x "${tmpdir}/ssserver" ]] || { rm -rf "$tmpdir"; return 2; }
+    [[ -n "$ok" ]] || { rm -rf "$tmpdir"; return 2; }
 
     safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || { rm -rf "$tmpdir"; return 2; }
-
+    cache_store_binary "ss-rust" "$latest" /usr/local/bin/ss-rust >/dev/null 2>&1 || true
     meta_set "SS_RUST_TAG" "$latest"
     restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
     rm -rf "$tmpdir"
     return 0
 }
+
 
 update_xray_if_needed() {
     [[ -x "/usr/local/bin/xray" ]] || return 1
@@ -2601,17 +2753,18 @@ update_xray_if_needed() {
         armv7l|armv7|arm) xray_arch="arm32-v7a" ;;
     esac
 
-    local latest; latest=$(github_latest_tag "XTLS/Xray-core")
+    local latest; latest=$(cached_latest_tag "XTLS/Xray-core" "xray")
     [[ -z "$latest" ]] && return 2
 
     local current; current=$(meta_get "XRAY_TAG" || true)
-    if [[ -z "$current" ]]; then
-        local v
-        v=$(/usr/local/bin/xray version 2>/dev/null | head -n 1 | grep -oE '([0-9]+\.){2}[0-9]+' | head -n 1)
-        [[ -n "$v" ]] && current="v${v}"
-    fi
-
+    [[ -z "$current" ]] && current=$(xray_current_tag || true)
     [[ -n "$current" && "$current" == "$latest" ]] && return 3
+
+    if cache_restore_binary_tag "xray" "$latest" /usr/local/bin/xray && run_with_timeout 3 /usr/local/bin/xray version >/dev/null 2>&1 && run_with_timeout 3 /usr/local/bin/xray x25519 >/dev/null 2>&1; then
+        meta_set "XRAY_TAG" "$latest"
+        restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
+        return 0
+    fi
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-xray.XXXXXX)
     local zipf="${tmpdir}/xray.zip"
@@ -2624,16 +2777,17 @@ update_xray_if_needed() {
 
     unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
     [[ -x "${tmpdir}/xray" ]] || { rm -rf "$tmpdir"; return 2; }
-
     run_with_timeout 3 "${tmpdir}/xray" version >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
+    run_with_timeout 3 "${tmpdir}/xray" x25519 >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
 
     safe_install_binary "${tmpdir}/xray" /usr/local/bin/xray || { rm -rf "$tmpdir"; return 2; }
-
+    cache_store_binary "xray" "$latest" /usr/local/bin/xray >/dev/null 2>&1 || true
     meta_set "XRAY_TAG" "$latest"
     restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
     rm -rf "$tmpdir"
     return 0
 }
+
 
 update_shadowtls_if_needed() {
     [[ -x "/usr/local/bin/shadow-tls" ]] || return 1
@@ -2642,11 +2796,21 @@ update_shadowtls_if_needed() {
     local st_arch
     st_arch=$(shadowtls_arch_name "$arch") || return 2
 
-    local latest; latest=$(github_latest_tag "ihciah/shadow-tls")
+    local latest; latest=$(cached_latest_tag "ihciah/shadow-tls" "shadowtls")
     [[ -z "$latest" ]] && return 2
 
     local current; current=$(meta_get "SHADOWTLS_TAG" || true)
+    [[ -z "$current" ]] && current=$(shadowtls_current_tag || true)
     [[ -n "$current" && "$current" == "$latest" ]] && return 3
+
+    if cache_restore_binary_tag "shadowtls" "$latest" /usr/local/bin/shadow-tls && (run_with_timeout 3 /usr/local/bin/shadow-tls --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls -V >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls --help >/dev/null 2>&1); then
+        meta_set "SHADOWTLS_TAG" "$latest"
+        while read -r svc; do
+            [[ -z "$svc" ]] && continue
+            systemctl restart "$svc" 2>/dev/null || true
+        done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep '^shadowtls-.*\.service$' || true)
+        return 0
+    fi
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-stls.XXXXXX)
     local binf="${tmpdir}/shadow-tls"
@@ -2667,10 +2831,9 @@ update_shadowtls_if_needed() {
     fi
 
     safe_install_binary "$binf" /usr/local/bin/shadow-tls || { rm -rf "$tmpdir"; return 2; }
-
+    cache_store_binary "shadowtls" "$latest" /usr/local/bin/shadow-tls >/dev/null 2>&1 || true
     meta_set "SHADOWTLS_TAG" "$latest"
 
-    # 重启所有 shadowtls-* 服务
     while read -r svc; do
         [[ -z "$svc" ]] && continue
         systemctl restart "$svc" 2>/dev/null || true
@@ -2700,9 +2863,68 @@ hot_update_components() {
     fi
 }
 
+
+report_update_result() {
+    local name="$1" rc="$2"
+    case "$rc" in
+        0) echo -e "${GREEN}✅ ${name} 已更新到最新版本。${RESET}" ;;
+        1) echo -e "${YELLOW}⚠️ ${name} 当前未安装，跳过。${RESET}" ;;
+        2) echo -e "${RED}❌ ${name} 更新失败。${RESET}" ;;
+        3) echo -e "${GREEN}✅ ${name} 已是最新版本。${RESET}" ;;
+        *) echo -e "${YELLOW}⚠️ ${name} 状态未知（返回码 ${rc}）。${RESET}" ;;
+    esac
+}
+
+show_core_cache_status() {
+    local ss_inst="未安装" xr_inst="未安装" st_inst="未安装"
+    local ss_cache="无" xr_cache="无" st_cache="无"
+    [[ -x /usr/local/bin/ss-rust ]] && ss_inst="$(ss_rust_current_tag || echo installed)"
+    [[ -x /usr/local/bin/xray ]] && xr_inst="$(xray_current_tag || echo installed)"
+    [[ -x /usr/local/bin/shadow-tls ]] && st_inst="$(shadowtls_current_tag || echo installed)"
+    [[ -x "$(cache_current_binary_path ss-rust 2>/dev/null)" ]] && ss_cache="有"
+    [[ -x "$(cache_current_binary_path xray 2>/dev/null)" ]] && xr_cache="有"
+    [[ -x "$(cache_current_binary_path shadowtls 2>/dev/null)" ]] && st_cache="有"
+    echo -e "${CYAN}SS-Rust${RESET}    已安装: ${GREEN}${ss_inst}${RESET} | 缓存: ${YELLOW}${ss_cache}${RESET}"
+    echo -e "${CYAN}Xray${RESET}       已安装: ${GREEN}${xr_inst}${RESET} | 缓存: ${YELLOW}${xr_cache}${RESET}"
+    echo -e "${CYAN}ShadowTLS${RESET}  已安装: ${GREEN}${st_inst}${RESET} | 缓存: ${YELLOW}${st_cache}${RESET}"
+    echo -e "${CYAN}说明:${RESET} 创建节点时会优先复用【已安装核心】->【本地缓存】->【联网下载】"
+}
+
+core_cache_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}========= 核心缓存与更新中心 =========${RESET}"
+        show_core_cache_status
+        echo
+        echo -e "${GREEN} 1.${RESET} 更新 SS-Rust 核心"
+        echo -e "${GREEN} 2.${RESET} 更新 Xray 核心"
+        echo -e "${GREEN} 3.${RESET} 更新 ShadowTLS 核心"
+        echo -e "${YELLOW} 4.${RESET} 一键更新全部核心"
+        echo -e "${YELLOW} 5.${RESET} 清理全部核心缓存"
+        echo -e " 0. 返回主菜单"
+        read -rp "输入数字 [0-5]: " cache_num
+        case "$cache_num" in
+            1) update_ss_rust_if_needed; report_update_result "SS-Rust" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
+            2) update_xray_if_needed; report_update_result "Xray" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
+            3) update_shadowtls_if_needed; report_update_result "ShadowTLS" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
+            4)
+                update_ss_rust_if_needed; report_update_result "SS-Rust" "$?"
+                update_xray_if_needed; report_update_result "Xray" "$?"
+                update_shadowtls_if_needed; report_update_result "ShadowTLS" "$?"
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            5)
+                core_cache_clear_all
+                echo -e "${GREEN}✅ 本地核心缓存已清理。${RESET}"
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            0) return ;;
+        esac
+    done
+}
+
 daily_task() {
-    # 例行任务：安全热更（有新版本才更）+ 清理
-    hot_update_components "silent"
+    # 例行任务：仅清理，不自动更新核心（更新已独立到核心缓存与更新中心）
     auto_clean "silent"
 }
 
@@ -2793,6 +3015,7 @@ sys_menu() {
     done
 }
 
+
 main_menu() {
     clear
     echo -e "${CYAN}============================================${RESET}"
@@ -2803,22 +3026,22 @@ main_menu() {
     echo -e "${YELLOW} 3.${RESET} 🛡️ 部署 ShadowTLS (保护传统协议)"
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${GREEN} 4.${RESET} 🔰 统一节点管控中心 (查看 / 删除 / 核爆)"
-    echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (手动常规/NAT + 清理)"
+    echo -e "${GREEN} 6.${RESET} 核心缓存与更新中心"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 返回上级菜单"
-    read -rp "请输入对应数字 [0-5]: " num
+    read -rp "请输入对应数字 [0-6]: " num
     case "$num" in
         1) install_ss_rust_native ;;
         2) install_vless_native ;;
         3) install_shadowtls_native ;;
         4) unified_node_manager ;;
         5) opt_menu ;;
+        6) core_cache_menu ;;
         0) return 1 ;;
         *) echo -e "${RED}请输入正确的选项！${RESET}" ;;
     esac
-    echo -e "
-${CYAN}按任意键返回上一层...${RESET}"
+    echo -e "\n${CYAN}按任意键返回上一层...${RESET}"
     read -n 1 -s -r
 }
 
@@ -4591,6 +4814,7 @@ ensure_global_clean_cron() {
 }
 
 # SSR 自动任务：在进入 SSR 管理后才启用（符合要求 4）
+
 my_enable_ssr_cron_tasks() {
     local my_cmd="/usr/local/bin/${CMD_NAME}"
     local lock_prefix=""
@@ -4598,16 +4822,10 @@ my_enable_ssr_cron_tasks() {
         lock_prefix="flock -n ${SSR_LOCK_FILE}"
     fi
 
-    # 清理旧任务（ssr/旧脚本）
     cron_remove_regex '(^|\s)(/usr/local/bin/ssr|/usr/local/bin/my\s+ssr)\s+(auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)(\s|$)'
 
-    # 守护检查（每分钟）
     cron_add_line_once "* * * * * ${lock_prefix} ${my_cmd} ssr daemon_check > /dev/null 2>&1"
 
-    # 核心组件安全热更（每天 3 点；清理由全局 2 点任务负责）
-    cron_add_line_once "0 3 * * * ${lock_prefix} ${my_cmd} ssr auto_core_update > /dev/null 2>&1"
-
-    # DDNS（存在配置才启用）
     if [[ -f "${SSR_DDNS_CONF}" ]]; then
         cron_add_line_once "*/5 * * * * ${lock_prefix} ${my_cmd} ssr ddns > /dev/null 2>&1"
     else
