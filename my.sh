@@ -289,6 +289,28 @@ PYPARSE
     esac
 }
 
+
+normalize_xray_x25519_output() {
+    printf '%s' "$1" | tr -d '\r' | perl -pe 's/(Private\s*[Kk]ey:|Public\s*[Kk]ey:|Password:|Hash32:)/\n$1/g' | sed '/^[[:space:]]*$/d'
+}
+
+xray_extract_reality_private_key() {
+    local raw norm
+    raw="$1"
+    norm=$(normalize_xray_x25519_output "$raw")
+    printf '%s\n' "$norm" | sed -nE 's/^[[:space:]]*Private([[:space:]]*[Kk]ey|Key):[[:space:]]*//p' | head -n1 | tr -d '[:space:]'
+}
+
+xray_extract_reality_public_key() {
+    local raw norm
+    raw="$1"
+    norm=$(normalize_xray_x25519_output "$raw")
+    {
+        printf '%s\n' "$norm" | sed -nE 's/^[[:space:]]*Public([[:space:]]*[Kk]ey|Key):[[:space:]]*//p'
+        printf '%s\n' "$norm" | sed -nE 's/^[[:space:]]*Password:[[:space:]]*//p'
+    } | head -n1 | tr -d '[:space:]'
+}
+
 json_set_top_value() {
     local file="$1" key="$2" value="$3" kind="$4"
     [[ -f "$file" ]] || return 1
@@ -530,7 +552,7 @@ show_vless_summary() {
     priv=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.privateKey 2>/dev/null)
     sid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.shortIds.0 2>/dev/null)
     if [[ -n "$priv" && -x /usr/local/bin/xray ]]; then
-        pub=$(/usr/local/bin/xray x25519 -i "$priv" 2>/dev/null | awk '/Public/{print $3}' | head -n1)
+        pub=$(xray_extract_reality_public_key "$(/usr/local/bin/xray x25519 -i "$priv" 2>/dev/null || true)")
     fi
     echo -e "IP: ${GREEN}${ip}${RESET}"
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
@@ -1895,29 +1917,13 @@ install_vless_native() {
     }
 
     mkdir -p /usr/local/etc/xray
-    local uuid keys priv pub short_id x25519_out
+    local uuid keys priv pub short_id
     uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '
 ')
-    if ! /usr/local/bin/xray help 2>/dev/null | grep -qE '(^|[[:space:]])x25519([[:space:]]|$)'; then
-        echo -e "${RED}❌ 当前 Xray 不支持 x25519 子命令，无法生成 REALITY 密钥。${RESET}"
-        rm -rf "$tmpdir"
-        sleep 3
-        return
-    fi
-    x25519_out=$(/usr/local/bin/xray x25519 2>&1 | tr -d '
+    keys=$(/usr/local/bin/xray x25519 2>&1 | tr -d '
 ')
-    priv=$(printf '%s
-' "$x25519_out" | sed -n 's/.*Private[[:space:]]*key:[[:space:]]*//p' | head -n1)
-    pub=$(printf '%s
-' "$x25519_out" | sed -n 's/.*Public[[:space:]]*key:[[:space:]]*//p' | head -n1)
-    if [[ -z "$priv" || -z "$pub" ]]; then
-        priv=$(printf '%s
-' "$x25519_out" | awk -F': ' '/Private/{print $NF}' | head -n1)
-        pub=$(printf '%s
-' "$x25519_out" | awk -F': ' '/Public/{print $NF}' | head -n1)
-    fi
-    priv=$(printf '%s' "$priv" | tr -d '[:space:]')
-    pub=$(printf '%s' "$pub" | tr -d '[:space:]')
+    priv=$(xray_extract_reality_private_key "$keys")
+    pub=$(xray_extract_reality_public_key "$keys")
     if have_cmd openssl; then
         short_id=$(openssl rand -hex 8 2>/dev/null)
     else
@@ -1927,8 +1933,7 @@ install_vless_native() {
     if [[ -z "$uuid" || -z "$priv" || -z "$pub" || -z "$short_id" ]]; then
         echo -e "${RED}❌ Xray 密钥材料生成失败。${RESET}"
         echo -e "${YELLOW}x25519 输出:${RESET}"
-        printf '%s
-' "$x25519_out"
+        normalize_xray_x25519_output "$keys"
         rm -rf "$tmpdir"
         sleep 5
         return
