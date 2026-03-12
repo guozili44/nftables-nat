@@ -1,11 +1,9 @@
 #!/bin/bash
-# ============================================================
 # 综合管理脚本：SSR + nftables
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v1.3.1  (build 2026-03-12+corecache-noperl)
+# 版本：v1.3.1  (build 2026-03-12+ss2022-compact-noperl)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
-# ============================================================
 
 set -o pipefail
 
@@ -17,7 +15,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # --------------------------
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="1.3.1"
+MY_VERSION="1.3.2"
 
 MY_INSTALL_DIR="/usr/local/lib/my"
 SSR_MODULE_FILE="${MY_INSTALL_DIR}/ssr_module.sh"
@@ -92,7 +90,6 @@ install_modules() {
     # SSR 模块（已移除脚本自更新/卸载菜单，并适配 my 统一管理）
     cat > "${SSR_MODULE_FILE}" <<'SSR_MODULE_EOF'
 #!/bin/bash
-# ==============================================================================
 # 脚本名称: SSR 综合管理脚本 (稳定优先 + 极致性能 Profiles)
 # 核心特性:
 #   - 节点部署: SS-Rust / SS2022 + v2ray-plugin / SS2022 + obfs-local / VLESS Reality (Xray)
@@ -103,7 +100,6 @@ install_modules() {
 #   - DNS 管理: 检测 /etc/resolv.conf 是否 symlink；提供一键解锁/恢复
 #
 # 命令：ssr regular|nat [stable|extreme] / ssr dns ...
-# ==============================================================================
 
 set -o pipefail
 
@@ -128,7 +124,6 @@ readonly LOCK_FILE="/var/lock/ssr.lock"
 # Meta (用于判断是否有新版本)
 readonly META_DIR="/usr/local/etc/ssr_meta"
 readonly META_FILE="${META_DIR}/versions.conf"
-readonly SHADOWTLS_STATE_DIR="${META_DIR}/shadowtls"
 readonly SS_V2RAY_CONF="/etc/ss-v2ray/config.json"
 readonly SS_V2RAY_STATE="${META_DIR}/ss_v2ray.conf"
 readonly SS_OBFS_CONF="/etc/ss-obfs/config.json"
@@ -145,9 +140,7 @@ readonly RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/ssr-dns.conf"
 
 trap 'echo -e "\n${GREEN}已安全退出脚本。${RESET}"; exit 0' SIGINT
 
-# ==============================================================================
 # 通用工具
-# ==============================================================================
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 base64_nw() {
@@ -199,7 +192,6 @@ core_cache_bin_name() {
     case "$1" in
         ss-rust) echo "ss-rust" ;;
         xray) echo "xray" ;;
-        shadowtls) echo "shadow-tls" ;;
         *) return 1 ;;
     esac
 }
@@ -280,7 +272,6 @@ xray_current_tag() {
     [[ -n "$v" ]] && echo "v${v}"
 }
 
-
 core_cache_clear_all() {
     rm -rf "$CORE_CACHE_DIR" 2>/dev/null || true
 }
@@ -308,7 +299,6 @@ replace_or_append_line() {
         printf '%s\n' "$newline" >> "$file"
     fi
 }
-
 
 write_ssh_auth_dropin() {
     local pass_mode="$1" kb_mode="$2" challenge_mode="$3"
@@ -392,7 +382,6 @@ PYPARSE
     esac
 }
 
-
 normalize_xray_x25519_output() {
     printf '%s' "$1" | tr -d '
 ' |         sed -E             -e 's/Private[[:space:]]*[Kk]ey:/\
@@ -445,7 +434,6 @@ PYPARSE
     fi
 }
 
-
 uri_encode() {
     local raw="$1"
     if have_cmd python3; then
@@ -475,54 +463,29 @@ ss_make_userinfo() {
     fi
 }
 
-
-shadowtls_legacy_ports() {
     {
         for f in "$SHADOWTLS_STATE_DIR"/*.conf; do
             [[ -e "$f" ]] || continue
             basename "$f" .conf
         done
-        for f in /etc/systemd/system/shadowtls-*.service /lib/systemd/system/shadowtls-*.service /usr/lib/systemd/system/shadowtls-*.service; do
             [[ -e "$f" ]] || continue
-            basename "$f" | sed 's/^shadowtls-//; s/\.service$//'
         done
-        for f in /var/run/shadowtls-*.pid; do
             [[ -e "$f" ]] || continue
-            basename "$f" | sed 's/^shadowtls-//; s/\.pid$//'
         done
     } | awk '/^[0-9]+$/' | sort -n -u
 }
 
-cleanup_shadowtls_legacy() {
     local p
     while IFS= read -r p; do
         [[ -n "$p" ]] || continue
         remove_firewall_rule "$p" "tcp"
-        stop_managed_service "shadowtls-${p}" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/run/shadowtls-${p}.pid"
         rm -f \
-            "/etc/systemd/system/shadowtls-${p}.service" \
-            "/lib/systemd/system/shadowtls-${p}.service" \
-            "/usr/lib/systemd/system/shadowtls-${p}.service" \
-            "/var/run/shadowtls-${p}.pid" \
             "${SHADOWTLS_STATE_DIR}/${p}.conf"
-    done < <(shadowtls_legacy_ports)
-
-    pkill -9 -f '/usr/local/bin/shadow-tls' 2>/dev/null || true
-    rm -f /usr/local/bin/shadow-tls /var/log/shadowtls.log
-    rm -rf "$SHADOWTLS_STATE_DIR" /tmp/shadow-tls 2>/dev/null || true
 
     if service_use_systemd; then
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 }
-
-
-
-
-
-
-
-
 
 port_listening_tcp() {
     local port="$1"
@@ -534,8 +497,6 @@ port_listening_tcp() {
         return 1
     fi
 }
-
-
 
 ssr_fetch_public_ip() {
     curl -s4m8 ip.sb 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || curl -s6m8 ip.sb 2>/dev/null || echo "0.0.0.0"
@@ -869,7 +830,6 @@ current_ipv4_for_route() {
     ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
 }
 
-
 detect_machine_tier() {
     local mem cpu
     mem="$(system_memory_mb)"
@@ -1141,7 +1101,6 @@ download_file_any() {
     return 1
 }
 
-
 safe_install_binary() {
     # safe_install_binary NEW_BIN DEST_BIN
     local newbin="$1"; local dest="$2"
@@ -1160,9 +1119,7 @@ safe_install_binary() {
     return 0
 }
 
-# ==============================================================================
 # 环境检查与全局命令安装
-# ==============================================================================
 check_env() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行！${RESET}" && exit 1
 
@@ -1195,9 +1152,7 @@ install_global_command() {
         my_enable_ssr_cron_tasks
     fi
 }
-# ==============================================================================
 # 防火墙/服务清理
-# ==============================================================================
 remove_firewall_rule() {
     local port=$1; local proto=$2
     if have_cmd ufw; then
@@ -1286,8 +1241,6 @@ force_kill_service() {
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
-    if [[ "$target" == shadowtls-* || "$target" == "shadowtls-generic" ]]; then
-        cleanup_shadowtls_legacy
     fi
 
     echo -e "${GREEN}✅ 目标服务 [${target_desc}] 已被强制清理完成！${RESET}"
@@ -1338,8 +1291,6 @@ managed_nuke_build_index() {
     fi
 }
 
-# ==============================================================================
-# ==============================================================================
 dns_backup() {
     mkdir -p "$DNS_BACKUP_DIR"
     local is_symlink=0
@@ -1395,7 +1346,6 @@ EOF
     chmod 644 "$RESOLVED_DROPIN" 2>/dev/null || true
     systemctl restart systemd-resolved 2>/dev/null || true
 }
-
 
 dns_apply_resolvconf_custom() {
     # dns_apply_resolvconf_custom set|lock <dns1> [dns2...]
@@ -1471,8 +1421,6 @@ dns_manual_set() {
     fi
     return 0
 }
-
-
 
 dns_set_or_lock() {
     # dns_set_or_lock set|lock
@@ -1552,8 +1500,6 @@ dns_status() {
     sed -n '1,30p' /etc/resolv.conf 2>/dev/null || true
 }
 
-
-
 dns_menu() {
     while true; do
         clear
@@ -1603,8 +1549,6 @@ dns_menu() {
     done
 }
 
-# ==============================================================================
-# ==============================================================================
 setup_cf_ddns() {
     clear
     echo -e "${CYAN}========= 🌐 原生 Cloudflare DDNS 配置 =========${RESET}"
@@ -1774,8 +1718,6 @@ cf_ddns_menu() {
     done
 }
 
-# ==============================================================================
-# ==============================================================================
 change_ssh_port() {
     read -rp "新的 SSH 端口号 (1-65535): " new_port
     if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
@@ -1914,9 +1856,6 @@ ssh_key_menu() {
     esac
 }
 
-# ==============================================================================
-# ==============================================================================
-
 install_ss_rust_native() {
     clear
     echo -e "${CYAN}========= 原生交互安装 SS-Rust =========${RESET}"
@@ -1964,7 +1903,6 @@ WantedBy=multi-user.target'
     show_ss_rust_summary
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
-
 
 install_vless_native() {
     clear
@@ -2100,8 +2038,6 @@ WantedBy=multi-user.target'
     rm -rf "$tmpdir"
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
-
-
 
 install_ss_v2ray_plugin_native() {
     clear
@@ -2254,9 +2190,7 @@ WantedBy=multi-user.target'
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
 
-# ==============================================================================
 # 统一节点生命周期管控中心
-# ==============================================================================
 unified_node_manager() {
     while true; do
         clear
@@ -2480,11 +2414,9 @@ unified_node_manager() {
     done
 }
 
-# ==============================================================================
 # 网络调优 Profiles（NAT/常规：稳定优先 vs 极致性能）
 #   - NAT: 附带 journald 限制、SSH Keepalive、DNS 设置/锁定（可回滚）
 #   - sysctl: 统一写入专用文件 + sysctl --system (要求)
-# ==============================================================================
 apply_journald_limit() {
     local limit="${1:-50M}"
     [[ -f /etc/systemd/journald.conf ]] || return 0
@@ -2594,8 +2526,6 @@ opt_menu() {
     done
 }
 
-# ==============================================================================
-# ==============================================================================
 run_daemon_check() {
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ss-rust\.service'; then
         systemctl is-active --quiet ss-rust 2>/dev/null || restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
@@ -2620,7 +2550,6 @@ auto_clean() {
     rm -rf /root/.cache/* /tmp/*.tar.xz /tmp/ssserver /tmp/ssr_update.sh /tmp/xray* /tmp/tmp.json /tmp/ssr-v2ray-plugin.* 2>/dev/null || true
     [[ "$is_silent" != "silent" ]] && echo -e "${GREEN}✅ 垃圾清理完毕！${RESET}"
 }
-
 
 update_ss_rust_if_needed() {
     [[ -x "/usr/local/bin/ss-rust" ]] || return 1
@@ -2678,7 +2607,6 @@ update_ss_rust_if_needed() {
     return 0
 }
 
-
 update_xray_if_needed() {
     [[ -x "/usr/local/bin/xray" ]] || return 1
 
@@ -2724,8 +2652,6 @@ update_xray_if_needed() {
     return 0
 }
 
-
-
 hot_update_components() {
     local is_silent=$1
     local updated_any=0
@@ -2744,7 +2670,6 @@ hot_update_components() {
         sleep 2
     fi
 }
-
 
 report_update_result() {
     local name="$1" rc="$2"
@@ -2804,9 +2729,7 @@ daily_task() {
     auto_clean "silent"
 }
 
-# ==============================================================================
 # 完全卸载
-# ==============================================================================
 ssr_cleanup_artifacts() {
     if [[ -f "/etc/ss-rust/config.json" ]]; then
         local sp; sp=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
@@ -2829,7 +2752,6 @@ ssr_cleanup_artifacts() {
     stop_managed_service "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid"
     stop_managed_service "ss-obfs" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/run/ss-obfs.pid"
     stop_managed_service "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"
-    cleanup_shadowtls_legacy
     rm -rf /etc/ss-rust /etc/ss-v2ray /etc/ss-obfs /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service /etc/systemd/system/ss-v2ray.service /etc/systemd/system/ss-obfs.service /var/log/ss-rust.log /var/log/ss-v2ray.log /var/log/ss-obfs.log
     rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service /var/log/xray.log
 
@@ -2864,9 +2786,7 @@ total_uninstall() {
     exit 0
 }
 
-# ==============================================================================
 # 系统菜单
-# ==============================================================================
 sys_menu() {
     while true; do
         clear
@@ -2890,7 +2810,6 @@ sys_menu() {
         esac
     done
 }
-
 
 main_menu() {
     clear
@@ -2929,9 +2848,7 @@ SSR_MODULE_EOF
     cat > "${NFT_MODULE_FILE}" <<'NFT_MODULE_EOF'
 #!/bin/bash
 
-# ==========================================
 # nftables 端口转发管理面板 (Pro 智能优化版)
-# ==========================================
 
 set -o pipefail
 
@@ -2975,7 +2892,6 @@ PROXY_URL_FALLBACK="https://ghproxy.net/https://raw.githubusercontent.com/guozil
 # UPDATE_URL_DIRECT="https://raw.githubusercontent.com/<you>/<repo>/main/nftmgr.sh"
 # UPDATE_URL_PROXY="https://ghproxy.net/https://raw.githubusercontent.com/<you>/<repo>/main/nftmgr.sh"
 
-
 # --------------------------
 # 设置读写（用于持久化模式开关）
 # --------------------------
@@ -3013,14 +2929,12 @@ msg_err()  { echo -e "${RED}$*${PLAIN}"; }
 # 基础工具
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-
 # --------------------------
 # 环境与依赖
 # --------------------------
 require_root() {
     [[ $EUID -ne 0 ]] && msg_err "错误: 必须使用 root 权限运行!" && exit 1
 }
-
 
 # 获取脚本真实路径（兼容不支持 readlink -f 的环境）
 script_realpath() {
@@ -3533,7 +3447,6 @@ EOF
     chmod 600 "$out" 2>/dev/null || true
 }
 
-
 generate_nft_conf() {
     local out="$1"
     local any=0
@@ -3615,7 +3528,6 @@ generate_nft_conf() {
     return 0
 }
 
-
 # --------------------------
 # 原子化应用规则到内核 + 持久化
 # --------------------------
@@ -3652,7 +3564,6 @@ apply_rules_impl() {
         return 1
     fi
 
-
     # 应用（只动自己的表）
     nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
     local apply_err
@@ -3666,7 +3577,6 @@ apply_rules_impl() {
         rm -f "$tmp"
         return 1
     fi
-
 
     # 持久化写入（原子替换）
     mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
@@ -3961,7 +3871,6 @@ ddns_update_impl() {
 
 ddns_update() { with_lock ddns_update_impl; }
 
-
 # --------------------------
 # 定时任务管理（DDNS）
 # --------------------------
@@ -4013,7 +3922,6 @@ manage_cron() {
         *) msg_err "无效选项"; sleep 1 ;;
     esac
 }
-
 
 # --------------------------
 download_to() {
@@ -4730,7 +4638,6 @@ daily_clean() {
     fi
 
     # 清理临时文件/缓存
-    rm -rf /root/.cache/* /tmp/*.tar.xz /tmp/shadow-tls /tmp/ssserver /tmp/ssr_update.sh /tmp/xray* /tmp/tmp.json 2>/dev/null || true
 
     # 清理 ddns / nginx 模块日志与临时文件
     rm -rf /var/lib/my-nginx-proxy/tmp/* 2>/dev/null || true
@@ -4946,7 +4853,6 @@ run_nft_module_menu() {
       done
     )
 }
-
 
 run_nginx_module_menu() {
     (
