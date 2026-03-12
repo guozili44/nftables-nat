@@ -1895,11 +1895,29 @@ install_vless_native() {
     }
 
     mkdir -p /usr/local/etc/xray
-    local uuid keys priv pub short_id
-    uuid=$(/usr/local/bin/xray uuid 2>/dev/null)
-    keys=$(/usr/local/bin/xray x25519 2>/dev/null)
-    priv=$(echo "$keys" | awk '/Private/{print $3}' | head -n1)
-    pub=$(echo "$keys" | awk '/Public/{print $3}' | head -n1)
+    local uuid keys priv pub short_id x25519_out
+    uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '
+')
+    if ! /usr/local/bin/xray help 2>/dev/null | grep -qE '(^|[[:space:]])x25519([[:space:]]|$)'; then
+        echo -e "${RED}❌ 当前 Xray 不支持 x25519 子命令，无法生成 REALITY 密钥。${RESET}"
+        rm -rf "$tmpdir"
+        sleep 3
+        return
+    fi
+    x25519_out=$(/usr/local/bin/xray x25519 2>&1 | tr -d '
+')
+    priv=$(printf '%s
+' "$x25519_out" | sed -n 's/.*Private[[:space:]]*key:[[:space:]]*//p' | head -n1)
+    pub=$(printf '%s
+' "$x25519_out" | sed -n 's/.*Public[[:space:]]*key:[[:space:]]*//p' | head -n1)
+    if [[ -z "$priv" || -z "$pub" ]]; then
+        priv=$(printf '%s
+' "$x25519_out" | awk -F': ' '/Private/{print $NF}' | head -n1)
+        pub=$(printf '%s
+' "$x25519_out" | awk -F': ' '/Public/{print $NF}' | head -n1)
+    fi
+    priv=$(printf '%s' "$priv" | tr -d '[:space:]')
+    pub=$(printf '%s' "$pub" | tr -d '[:space:]')
     if have_cmd openssl; then
         short_id=$(openssl rand -hex 8 2>/dev/null)
     else
@@ -1908,8 +1926,11 @@ install_vless_native() {
     fi
     if [[ -z "$uuid" || -z "$priv" || -z "$pub" || -z "$short_id" ]]; then
         echo -e "${RED}❌ Xray 密钥材料生成失败。${RESET}"
+        echo -e "${YELLOW}x25519 输出:${RESET}"
+        printf '%s
+' "$x25519_out"
         rm -rf "$tmpdir"
-        sleep 3
+        sleep 5
         return
     fi
 
