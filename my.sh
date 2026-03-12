@@ -113,7 +113,7 @@ readonly YELLOW='\033[1;33m'
 readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
 
-readonly SCRIPT_VERSION="21.3-Manual-Tuned"
+readonly SCRIPT_VERSION="21.4-Manual-Tuned"
 
 # Sysctl profile files (互斥写入)
 readonly CONF_FILE="/etc/sysctl.d/99-ssr-net.conf"
@@ -280,11 +280,6 @@ xray_current_tag() {
     [[ -n "$v" ]] && echo "v${v}"
 }
 
-shadowtls_current_tag() {
-    local v
-    v=$(/usr/local/bin/shadow-tls --version 2>/dev/null | grep -oE '([0-9]+\.){2}[0-9]+' | head -n1)
-    [[ -n "$v" ]] && echo "v${v}"
-}
 
 core_cache_clear_all() {
     rm -rf "$CORE_CACHE_DIR" 2>/dev/null || true
@@ -480,58 +475,8 @@ ss_make_userinfo() {
     fi
 }
 
-shadowtls_state_file() {
-    printf '%s/%s.conf' "$SHADOWTLS_STATE_DIR" "$1"
-}
 
-shadowtls_state_save() {
-    local port="$1" up_port="$2" sni="$3" password="$4"
-    mkdir -p "$SHADOWTLS_STATE_DIR" 2>/dev/null || true
-    cat > "$(shadowtls_state_file "$port")" <<EOF
-LISTEN_PORT="$port"
-UPSTREAM_PORT="$up_port"
-SNI="$sni"
-PASSWORD="$password"
-VERSION="3"
-EOF
-    chmod 600 "$(shadowtls_state_file "$port")" 2>/dev/null || true
-}
-
-shadowtls_state_get() {
-    local port="$1" key="$2" file
-    file="$(shadowtls_state_file "$port")"
-    [[ -f "$file" ]] || return 1
-    grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^"//; s/"$//'
-}
-
-shadowtls_parse_field_from_text() {
-    local text="$1" key="$2"
-    case "$key" in
-        UPSTREAM_PORT) printf '%s\n' "$text" | sed -n 's/.*--server 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' | head -n1 ;;
-        SNI) printf '%s\n' "$text" | sed -n 's/.*--tls \([^: ;][^ ;]*\)\(:[0-9][0-9]*\)\?.*/\1/p' | head -n1 ;;
-        PASSWORD) printf '%s\n' "$text" | sed -n 's/.*--password \([^ ]*\).*/\1/p' | head -n1 ;;
-        *) return 1 ;;
-    esac
-}
-
-shadowtls_get_field() {
-    local port="$1" key="$2" v="" unit="/etc/systemd/system/shadowtls-${port}.service" pid cmd
-    v="$(shadowtls_state_get "$port" "$key" 2>/dev/null || true)"
-    if [[ -z "$v" && -f "$unit" ]]; then
-        cmd="$(sed -n 's/^ExecStart=//p' "$unit" | head -n1)"
-        v="$(shadowtls_parse_field_from_text "$cmd" "$key" 2>/dev/null || true)"
-    fi
-    if [[ -z "$v" && -f "/var/run/shadowtls-${port}.pid" ]]; then
-        pid="$(cat "/var/run/shadowtls-${port}.pid" 2>/dev/null || true)"
-        if [[ -n "$pid" && -r "/proc/${pid}/cmdline" ]]; then
-            cmd="$(tr '\\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)"
-            v="$(shadowtls_parse_field_from_text "$cmd" "$key" 2>/dev/null || true)"
-        fi
-    fi
-    [[ -n "$v" ]] && printf '%s' "$v"
-}
-
-shadowtls_detect_ports() {
+shadowtls_legacy_ports() {
     {
         for f in "$SHADOWTLS_STATE_DIR"/*.conf; do
             [[ -e "$f" ]] || continue
@@ -548,28 +493,36 @@ shadowtls_detect_ports() {
     } | awk '/^[0-9]+$/' | sort -n -u
 }
 
-shadowtls_find_ports_by_upstream() {
-    local upstream="$1" p up
-    [[ -n "$upstream" ]] || return 0
+cleanup_shadowtls_legacy() {
+    local p
     while IFS= read -r p; do
         [[ -n "$p" ]] || continue
-        up="$(shadowtls_get_field "$p" UPSTREAM_PORT 2>/dev/null || true)"
-        [[ "$up" == "$upstream" ]] && printf '%s
-' "$p"
-    done < <(shadowtls_detect_ports)
+        remove_firewall_rule "$p" "tcp"
+        stop_managed_service "shadowtls-${p}" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/run/shadowtls-${p}.pid"
+        rm -f \
+            "/etc/systemd/system/shadowtls-${p}.service" \
+            "/lib/systemd/system/shadowtls-${p}.service" \
+            "/usr/lib/systemd/system/shadowtls-${p}.service" \
+            "/var/run/shadowtls-${p}.pid" \
+            "${SHADOWTLS_STATE_DIR}/${p}.conf"
+    done < <(shadowtls_legacy_ports)
+
+    pkill -9 -f '/usr/local/bin/shadow-tls' 2>/dev/null || true
+    rm -f /usr/local/bin/shadow-tls /var/log/shadowtls.log
+    rm -rf "$SHADOWTLS_STATE_DIR" /tmp/shadow-tls 2>/dev/null || true
+
+    if service_use_systemd; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
 }
 
-shadowtls_is_active() {
-    local port="$1" pid
-    if service_use_systemd && systemctl is-active --quiet "shadowtls-${port}" 2>/dev/null; then
-        return 0
-    fi
-    if [[ -f "/var/run/shadowtls-${port}.pid" ]]; then
-        pid="$(cat "/var/run/shadowtls-${port}.pid" 2>/dev/null || true)"
-        [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
-    fi
-    pgrep -f "/usr/local/bin/shadow-tls --v3 --strict server --listen 0.0.0.0:${port}" >/dev/null 2>&1
-}
+
+
+
+
+
+
+
 
 port_listening_tcp() {
     local port="$1"
@@ -582,33 +535,7 @@ port_listening_tcp() {
     fi
 }
 
-shadowtls_make_ss_link() {
-    local listen_port="$1" ip method password st_sni st_pwd plugin_raw plugin_enc userinfo
-    ip="${2:-$(ssr_fetch_public_ip)}"
-    method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
-    password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
-    st_sni="$(shadowtls_get_field "$listen_port" SNI 2>/dev/null || true)"
-    st_pwd="$(shadowtls_get_field "$listen_port" PASSWORD 2>/dev/null || true)"
-    [[ -n "$ip" && -n "$listen_port" && -n "$method" && -n "$password" && -n "$st_sni" && -n "$st_pwd" ]] || return 1
-    userinfo="$(ss_make_userinfo "$method" "$password")"
-    plugin_raw="shadow-tls;host=${st_sni};passwd=${st_pwd};v3"
-    plugin_enc="$(uri_encode "$plugin_raw")"
-    printf 'ss://%s@%s:%s/?plugin=%s#SS-Rust-ShadowTLS' "$userinfo" "$ip" "$listen_port" "$plugin_enc"
-}
 
-show_shadowtls_summary() {
-    local listen_port="$1" ip up_port sni pwd link
-    ip=$(ssr_fetch_public_ip)
-    up_port="$(shadowtls_get_field "$listen_port" UPSTREAM_PORT 2>/dev/null || true)"
-    sni="$(shadowtls_get_field "$listen_port" SNI 2>/dev/null || true)"
-    pwd="$(shadowtls_get_field "$listen_port" PASSWORD 2>/dev/null || true)"
-    link="$(shadowtls_make_ss_link "$listen_port" "$ip" 2>/dev/null || true)"
-    echo -e "外层端口: ${GREEN}${listen_port:-未读取}${RESET}"
-    echo -e "上游端口: ${GREEN}${up_port:-未读取}${RESET}"
-    echo -e "SNI: ${GREEN}${sni:-未读取}${RESET}"
-    echo -e "ShadowTLS 密码: ${GREEN}${pwd:-未读取}${RESET}"
-    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}\n${link}"
-}
 
 ssr_fetch_public_ip() {
     curl -s4m8 ip.sb 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || curl -s6m8 ip.sb 2>/dev/null || echo "0.0.0.0"
@@ -1214,15 +1141,6 @@ download_file_any() {
     return 1
 }
 
-shadowtls_arch_name() {
-    local arch="$1"
-    case "$arch" in
-        x86_64|amd64) echo "x86_64-unknown-linux-musl" ;;
-        aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
-        armv7l|armv7|arm) echo "arm-unknown-linux-musleabi" ;;
-        *) return 1 ;;
-    esac
-}
 
 safe_install_binary() {
     # safe_install_binary NEW_BIN DEST_BIN
@@ -1369,9 +1287,7 @@ force_kill_service() {
     fi
 
     if [[ "$target" == shadowtls-* || "$target" == "shadowtls-generic" ]]; then
-        if ! ls /etc/systemd/system/shadowtls-*.service /lib/systemd/system/shadowtls-*.service /usr/lib/systemd/system/shadowtls-*.service >/dev/null 2>&1; then
-            rm -f /usr/local/bin/shadow-tls
-        fi
+        cleanup_shadowtls_legacy
     fi
 
     echo -e "${GREEN}✅ 目标服务 [${target_desc}] 已被强制清理完成！${RESET}"
@@ -2809,59 +2725,6 @@ update_xray_if_needed() {
 }
 
 
-update_shadowtls_if_needed() {
-    [[ -x "/usr/local/bin/shadow-tls" ]] || return 1
-
-    local arch; arch=$(uname -m)
-    local st_arch
-    st_arch=$(shadowtls_arch_name "$arch") || return 2
-
-    local latest; latest=$(cached_latest_tag "ihciah/shadow-tls" "shadowtls")
-    [[ -z "$latest" ]] && return 2
-
-    local current; current=$(meta_get "SHADOWTLS_TAG" || true)
-    [[ -z "$current" ]] && current=$(shadowtls_current_tag || true)
-    [[ -n "$current" && "$current" == "$latest" ]] && return 3
-
-    if cache_restore_binary_tag "shadowtls" "$latest" /usr/local/bin/shadow-tls && (run_with_timeout 3 /usr/local/bin/shadow-tls --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls -V >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls --help >/dev/null 2>&1); then
-        meta_set "SHADOWTLS_TAG" "$latest"
-        while read -r svc; do
-            [[ -z "$svc" ]] && continue
-            systemctl restart "$svc" 2>/dev/null || true
-        done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep '^shadowtls-.*\.service$' || true)
-        return 0
-    fi
-
-    local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-stls.XXXXXX)
-    local binf="${tmpdir}/shadow-tls"
-    local asset_name="shadow-tls-${st_arch}"
-    local official_url="https://github.com/ihciah/shadow-tls/releases/download/${latest}/${asset_name}"
-    local api_url=""
-    api_url=$(github_release_asset_url "ihciah/shadow-tls" "$latest" "$asset_name" 2>/dev/null || true)
-    local proxy_url="https://ghproxy.net/${official_url}"
-
-    if ! download_file_any "$binf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$binf" ]]; then
-        rm -rf "$tmpdir"
-        return 2
-    fi
-    chmod +x "$binf" >/dev/null 2>&1 || true
-
-    if ! run_with_timeout 3 "$binf" --version >/dev/null 2>&1; then
-        run_with_timeout 3 "$binf" -V >/dev/null 2>&1 || run_with_timeout 3 "$binf" --help >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
-    fi
-
-    safe_install_binary "$binf" /usr/local/bin/shadow-tls || { rm -rf "$tmpdir"; return 2; }
-    cache_store_binary "shadowtls" "$latest" /usr/local/bin/shadow-tls >/dev/null 2>&1 || true
-    meta_set "SHADOWTLS_TAG" "$latest"
-
-    while read -r svc; do
-        [[ -z "$svc" ]] && continue
-        systemctl restart "$svc" 2>/dev/null || true
-    done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep '^shadowtls-.*\.service$' || true)
-
-    rm -rf "$tmpdir"
-    return 0
-}
 
 hot_update_components() {
     local is_silent=$1
@@ -2966,6 +2829,7 @@ ssr_cleanup_artifacts() {
     stop_managed_service "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid"
     stop_managed_service "ss-obfs" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/run/ss-obfs.pid"
     stop_managed_service "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"
+    cleanup_shadowtls_legacy
     rm -rf /etc/ss-rust /etc/ss-v2ray /etc/ss-obfs /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service /etc/systemd/system/ss-v2ray.service /etc/systemd/system/ss-obfs.service /var/log/ss-rust.log /var/log/ss-v2ray.log /var/log/ss-obfs.log
     rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service /var/log/xray.log
 
