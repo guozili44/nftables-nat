@@ -3,7 +3,7 @@
 # 综合管理脚本：SSR + nftables
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v1.3.1  (build 2026-03-12+corecache)
+# 版本：v1.3.1  (build 2026-03-12+corecache-noperl)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 # ============================================================
 
@@ -95,7 +95,7 @@ install_modules() {
 # ==============================================================================
 # 脚本名称: SSR 综合管理脚本 (稳定优先 + 极致性能 Profiles)
 # 核心特性:
-#   - 节点部署: SS-Rust / VLESS Reality (Xray) / ShadowTLS
+#   - 节点部署: SS-Rust / SS2022 + v2ray-plugin / SS2022 + obfs-local / VLESS Reality (Xray)
 #   - 双档位网络调优: 手动选择 常规机器 / NAT 小鸡 => 稳定优先 / 极致优化
 #   - Cloudflare DDNS: 原生 API + 定时守护
 #   - 自动任务互斥: cron 使用 flock 防并发踩踏
@@ -129,6 +129,10 @@ readonly LOCK_FILE="/var/lock/ssr.lock"
 readonly META_DIR="/usr/local/etc/ssr_meta"
 readonly META_FILE="${META_DIR}/versions.conf"
 readonly SHADOWTLS_STATE_DIR="${META_DIR}/shadowtls"
+readonly SS_V2RAY_CONF="/etc/ss-v2ray/config.json"
+readonly SS_V2RAY_STATE="${META_DIR}/ss_v2ray.conf"
+readonly SS_OBFS_CONF="/etc/ss-obfs/config.json"
+readonly SS_OBFS_STATE="${META_DIR}/ss_obfs.conf"
 readonly SWAP_MARK_FILE="${META_DIR}/swap_created_by_ssr"
 readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/99-my-auth.conf"
@@ -622,35 +626,234 @@ ssr_make_ss_link() {
 }
 
 show_ss_rust_summary() {
-    local ip port method password link st_link p found_st=0
-    local protected_ports=()
+    local ip port method password link
     ip=$(ssr_fetch_public_ip)
     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
     method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
     password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
     link=$(ssr_make_ss_link "$ip" 2>/dev/null || true)
-    mapfile -t protected_ports < <(shadowtls_find_ports_by_upstream "$port")
     echo -e "IP: ${GREEN}${ip}${RESET}"
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
     echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
-    if [[ ${#protected_ports[@]} -gt 0 ]]; then
-        echo -e "${GREEN}ShadowTLS 保护:${RESET} 已检测到 ${#protected_ports[@]} 个外层入口"
-        for p in "${protected_ports[@]}"; do
-            [[ -n "$p" ]] || continue
-            st_link="$(shadowtls_make_ss_link "$p" "$ip" 2>/dev/null || true)"
-            echo -e "  - 外层端口: ${GREEN}${p}${RESET}"
-            if [[ -n "$st_link" ]]; then
-                echo -e "${YELLOW}ShadowTLS 链接:${RESET}
-${st_link}"
-                found_st=1
-            else
-                echo -e "${RED}ShadowTLS 链接生成失败，请检查该实例状态。${RESET}"
-            fi
-        done
-        echo -e "${CYAN}说明:${RESET} 以上为优先使用的 ShadowTLS 链接；下方为直连 SS2022 链接（仅在需要直连时使用）。"
+    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
+${link}"
+}
+
+plugin_state_get() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 1
+    grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^"//; s/"$//'
+}
+
+plugin_state_write() {
+    local file="$1"; shift
+    mkdir -p "$META_DIR" 2>/dev/null || true
+    : > "$file"
+    while [[ $# -ge 2 ]]; do
+        printf '%s="%s"
+' "$1" "$2" >> "$file"
+        shift 2
+    done
+    chmod 600 "$file" 2>/dev/null || true
+}
+
+random_token() {
+    local len="${1:-8}"
+    if have_cmd openssl; then
+        openssl rand -hex "$(( (len+1)/2 ))" 2>/dev/null | cut -c1-"$len"
+    else
+        tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c "$len"
     fi
-    [[ -n "$link" ]] && echo -e "${YELLOW}直连 SS-Rust 链接:${RESET}
+}
+
+ss_pick_method_password() {
+    local methods=(
+        "2022-blake3-aes-128-gcm"
+        "2022-blake3-aes-256-gcm"
+        "2022-blake3-chacha20-poly1305"
+        "aes-256-gcm"
+    )
+    echo -e "${YELLOW}加密协议:${RESET}"
+    local i=1 msel input_pwd pwd_len=0 raw_len decoded_len tmp_dec
+    for m in "${methods[@]}"; do echo " $i) $m"; i=$((i+1)); done
+    read -rp "选择 [1-4] (默认1): " msel
+    [[ "$msel" =~ ^[1-4]$ ]] || msel=1
+    SS_PICK_METHOD="${methods[$((msel-1))]}"
+    case "$SS_PICK_METHOD" in
+        2022-blake3-aes-128-gcm) pwd_len=16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) pwd_len=32 ;;
+    esac
+    SS_PICK_PASSWORD=""
+    if [[ "$pwd_len" -ne 0 ]]; then
+        read -rp "密码 (留空自动生成，输入时可填 Base64 密钥或原始密钥): " input_pwd
+        if [[ -z "$input_pwd" ]]; then
+            if have_cmd openssl; then
+                SS_PICK_PASSWORD=$(openssl rand "$pwd_len" 2>/dev/null | base64_nw)
+            else
+                SS_PICK_PASSWORD=$(head -c "$pwd_len" /dev/urandom 2>/dev/null | base64_nw)
+            fi
+        else
+            tmp_dec="/tmp/ssr-key.$$"
+            raw_len=$(printf '%s' "$input_pwd" | wc -c | tr -d ' ')
+            decoded_len=0
+            if printf '%s' "$input_pwd" | base64 -d >"$tmp_dec" 2>/dev/null; then
+                decoded_len=$(wc -c <"$tmp_dec" | tr -d ' ')
+            fi
+            rm -f "$tmp_dec" 2>/dev/null || true
+            if [[ "$decoded_len" == "$pwd_len" ]]; then
+                SS_PICK_PASSWORD="$input_pwd"
+            elif [[ "$raw_len" == "$pwd_len" ]]; then
+                SS_PICK_PASSWORD=$(printf '%s' "$input_pwd" | base64_nw)
+            else
+                echo -e "${RED}❌ 2022 协议密钥长度错误：需要 ${pwd_len} 字节原始密钥，或对应的 Base64 密钥。${RESET}"
+                sleep 3
+                return 1
+            fi
+        fi
+        [[ -n "$SS_PICK_PASSWORD" ]] || { echo -e "${RED}❌ 密钥生成失败。${RESET}"; sleep 3; return 1; }
+    else
+        read -rp "传统密码 (留空随机): " input_pwd
+        if [[ -z "$input_pwd" ]]; then
+            if have_cmd openssl; then
+                SS_PICK_PASSWORD=$(openssl rand -hex 12 2>/dev/null)
+            else
+                SS_PICK_PASSWORD=$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' 
+')
+            fi
+        else
+            SS_PICK_PASSWORD="$input_pwd"
+        fi
+    fi
+}
+
+ensure_ss_rust_binary() {
+    local arch ss_arch_primary="x86_64-unknown-linux-musl" ss_arch_fallback="x86_64-unknown-linux-gnu"
+    local ss_latest="" tmpdir="" tarball="" url="" ss_arch=""
+    arch=$(uname -m)
+    case "$arch" in
+        aarch64|arm64)
+            ss_arch_primary="aarch64-unknown-linux-musl"
+            ss_arch_fallback="aarch64-unknown-linux-gnu"
+            ;;
+        armv7l|armv7|arm)
+            ss_arch_primary="arm-unknown-linux-musleabi"
+            ss_arch_fallback="arm-unknown-linux-gnueabi"
+            ;;
+    esac
+    if [[ -x /usr/local/bin/ss-rust ]] && (run_with_timeout 3 /usr/local/bin/ss-rust --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/ss-rust -V >/dev/null 2>&1); then
+        ENSURED_SS_RUST_TAG=$(meta_get "SS_RUST_TAG" || true)
+        [[ -z "$ENSURED_SS_RUST_TAG" ]] && ENSURED_SS_RUST_TAG=$(ss_rust_current_tag || true)
+        [[ -n "$ENSURED_SS_RUST_TAG" ]] && cache_store_binary "ss-rust" "$ENSURED_SS_RUST_TAG" /usr/local/bin/ss-rust >/dev/null 2>&1 || true
+        return 0
+    fi
+    if cache_restore_binary "ss-rust" /usr/local/bin/ss-rust && (run_with_timeout 3 /usr/local/bin/ss-rust --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/ss-rust -V >/dev/null 2>&1); then
+        ENSURED_SS_RUST_TAG=$(meta_get "SS_RUST_TAG" || true)
+        [[ -z "$ENSURED_SS_RUST_TAG" ]] && ENSURED_SS_RUST_TAG=$(ss_rust_current_tag || true)
+        return 0
+    fi
+    echo -e "${CYAN}>>> 本地无可用 SS-Rust 核心，开始联网下载...${RESET}"
+    ss_latest=$(cached_latest_tag "shadowsocks/shadowsocks-rust" "ss-rust")
+    [[ -z "$ss_latest" ]] && ss_latest="v1.24.0"
+    tmpdir=$(mktemp -d /tmp/ssr-ssrust.XXXXXX)
+    tarball="${tmpdir}/ss-rust.tar.xz"
+    for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
+        url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/shadowsocks-${ss_latest}.${candidate_arch}.tar.xz"
+        rm -f "$tarball" "${tmpdir}/ssserver" >/dev/null 2>&1 || true
+        if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
+            continue
+        fi
+        tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
+        [[ -x "${tmpdir}/ssserver" ]] || continue
+        if run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1 || run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1; then
+            ss_arch="$candidate_arch"
+            break
+        fi
+    done
+    if [[ -z "$ss_arch" || ! -x "${tmpdir}/ssserver" ]]; then
+        echo -e "${RED}❌ SS-Rust 新核心自检失败。已自动尝试 musl/gnu 两种构建，当前环境均无法运行。${RESET}"
+        rm -rf "$tmpdir"
+        sleep 3
+        return 1
+    fi
+    safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || {
+        echo -e "${RED}❌ 安装失败（写入 /usr/local/bin/ss-rust 失败）。${RESET}"
+        rm -rf "$tmpdir"
+        sleep 3
+        return 1
+    }
+    cache_store_binary "ss-rust" "$ss_latest" /usr/local/bin/ss-rust >/dev/null 2>&1 || true
+    meta_set "SS_RUST_TAG" "$ss_latest"
+    ENSURED_SS_RUST_TAG="$ss_latest"
+    rm -rf "$tmpdir"
+    return 0
+}
+
+ss_v2ray_make_link() {
+    local ip port method password host path plugin_raw plugin_enc userinfo
+    ip="${1:-$(ssr_fetch_public_ip)}"
+    port=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
+    method=$(json_get_path "$SS_V2RAY_CONF" method 2>/dev/null)
+    password=$(json_get_path "$SS_V2RAY_CONF" password 2>/dev/null)
+    host=$(plugin_state_get "$SS_V2RAY_STATE" HOST 2>/dev/null || true)
+    path=$(plugin_state_get "$SS_V2RAY_STATE" PATH 2>/dev/null || true)
+    [[ -n "$ip" && -n "$port" && -n "$method" && -n "$password" && -n "$host" && -n "$path" ]] || return 1
+    userinfo=$(ss_make_userinfo "$method" "$password")
+    plugin_raw="v2ray-plugin;mode=websocket;host=${host};path=${path}"
+    plugin_enc=$(uri_encode "$plugin_raw")
+    printf 'ss://%s@%s:%s/?plugin=%s#SS2022-v2ray-plugin' "$userinfo" "$ip" "$port" "$plugin_enc"
+}
+
+show_ss_v2ray_summary() {
+    local ip port method password host path link
+    ip=$(ssr_fetch_public_ip)
+    port=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
+    method=$(json_get_path "$SS_V2RAY_CONF" method 2>/dev/null)
+    password=$(json_get_path "$SS_V2RAY_CONF" password 2>/dev/null)
+    host=$(plugin_state_get "$SS_V2RAY_STATE" HOST 2>/dev/null || true)
+    path=$(plugin_state_get "$SS_V2RAY_STATE" PATH 2>/dev/null || true)
+    link=$(ss_v2ray_make_link "$ip" 2>/dev/null || true)
+    echo -e "IP: ${GREEN}${ip}${RESET}"
+    echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
+    echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
+    echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
+    echo -e "Host: ${GREEN}${host:-未读取}${RESET}"
+    echo -e "Path: ${GREEN}${path:-未读取}${RESET}"
+    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
+${link}"
+}
+
+ss_obfs_make_link() {
+    local ip port method password host obfs plugin_raw plugin_enc userinfo
+    ip="${1:-$(ssr_fetch_public_ip)}"
+    port=$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null)
+    method=$(json_get_path "$SS_OBFS_CONF" method 2>/dev/null)
+    password=$(json_get_path "$SS_OBFS_CONF" password 2>/dev/null)
+    host=$(plugin_state_get "$SS_OBFS_STATE" HOST 2>/dev/null || true)
+    obfs=$(plugin_state_get "$SS_OBFS_STATE" MODE 2>/dev/null || true)
+    [[ -n "$ip" && -n "$port" && -n "$method" && -n "$password" && -n "$host" && -n "$obfs" ]] || return 1
+    userinfo=$(ss_make_userinfo "$method" "$password")
+    plugin_raw="obfs-local;obfs=${obfs};obfs-host=${host}"
+    plugin_enc=$(uri_encode "$plugin_raw")
+    printf 'ss://%s@%s:%s/?plugin=%s#SS2022-obfs' "$userinfo" "$ip" "$port" "$plugin_enc"
+}
+
+show_ss_obfs_summary() {
+    local ip port method password host obfs link
+    ip=$(ssr_fetch_public_ip)
+    port=$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null)
+    method=$(json_get_path "$SS_OBFS_CONF" method 2>/dev/null)
+    password=$(json_get_path "$SS_OBFS_CONF" password 2>/dev/null)
+    host=$(plugin_state_get "$SS_OBFS_STATE" HOST 2>/dev/null || true)
+    obfs=$(plugin_state_get "$SS_OBFS_STATE" MODE 2>/dev/null || true)
+    link=$(ss_obfs_make_link "$ip" 2>/dev/null || true)
+    echo -e "IP: ${GREEN}${ip}${RESET}"
+    echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
+    echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
+    echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
+    echo -e "混淆模式: ${GREEN}${obfs:-未读取}${RESET}"
+    echo -e "伪装域名: ${GREEN}${host:-未读取}${RESET}"
+    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
 ${link}"
 }
 
@@ -1126,17 +1329,21 @@ force_kill_service() {
             rm -rf /usr/local/etc/xray
             rm -f /usr/local/bin/xray /var/log/xray.log
             ;;
-        shadowtls-generic)
-            pkill -9 -f '/usr/local/bin/shadow-tls' 2>/dev/null || true
-            rm -f /usr/local/bin/shadow-tls /var/log/shadowtls.log
-            ;;
-        shadowtls-*)
-            port="${target#shadowtls-}"
+        ss-v2ray)
+            port="$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null || true)"
             [[ "$port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$port" "tcp"
-            pidfile="/var/run/${target}.pid"
-            pkill -9 -f "shadowtls-${port}" 2>/dev/null || true
-            pkill -9 -f '/usr/local/bin/shadow-tls' 2>/dev/null || true
-            rm -f "/var/log/${target}.log"
+            pidfile="/var/run/ss-v2ray.pid"
+            pkill -9 -f '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' 2>/dev/null || true
+            rm -rf /etc/ss-v2ray
+            rm -f /var/log/ss-v2ray.log "$SS_V2RAY_STATE"
+            ;;
+        ss-obfs)
+            port="$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null || true)"
+            [[ "$port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$port" "tcp"
+            pidfile="/var/run/ss-obfs.pid"
+            pkill -9 -f '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' 2>/dev/null || true
+            rm -rf /etc/ss-obfs
+            rm -f /var/log/ss-obfs.log "$SS_OBFS_STATE"
             ;;
         *)
             pkill -9 -f "$target" 2>/dev/null || true
@@ -1183,41 +1390,35 @@ managed_nuke_build_index() {
     NUCLEAR_TARGETS=()
     NUCLEAR_LABELS=()
     NUCLEAR_PORTS=()
-    local idx=1 port unit target
+    local idx=1 port
 
     port="$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null || true)"
-    if [[ -f /etc/ss-rust/config.json || -x /usr/local/bin/ss-rust || -f /etc/systemd/system/ss-rust.service || -f /var/run/ss-rust.pid ]] || pgrep -f '/usr/local/bin/ss-rust' >/dev/null 2>&1; then
+    if [[ -f /etc/ss-rust/config.json || -x /usr/local/bin/ss-rust || -f /etc/systemd/system/ss-rust.service || -f /var/run/ss-rust.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' >/dev/null 2>&1; then
         NUCLEAR_TARGETS[$idx]="ss-rust"
         NUCLEAR_LABELS[$idx]="SS-Rust"
         NUCLEAR_PORTS[$idx]="$port"
         ((idx++))
     fi
-
+    port="$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null || true)"
+    if [[ -f "$SS_V2RAY_CONF" || -f /etc/systemd/system/ss-v2ray.service || -f /var/run/ss-v2ray.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' >/dev/null 2>&1; then
+        NUCLEAR_TARGETS[$idx]="ss-v2ray"
+        NUCLEAR_LABELS[$idx]="SS2022 + v2ray-plugin"
+        NUCLEAR_PORTS[$idx]="$port"
+        ((idx++))
+    fi
+    port="$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null || true)"
+    if [[ -f "$SS_OBFS_CONF" || -f /etc/systemd/system/ss-obfs.service || -f /var/run/ss-obfs.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' >/dev/null 2>&1; then
+        NUCLEAR_TARGETS[$idx]="ss-obfs"
+        NUCLEAR_LABELS[$idx]="SS2022 + obfs-local"
+        NUCLEAR_PORTS[$idx]="$port"
+        ((idx++))
+    fi
     port="$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null || true)"
     if [[ -f /usr/local/etc/xray/config.json || -x /usr/local/bin/xray || -f /etc/systemd/system/xray.service || -f /var/run/xray.pid ]] || pgrep -f '/usr/local/bin/xray' >/dev/null 2>&1; then
         NUCLEAR_TARGETS[$idx]="xray"
         NUCLEAR_LABELS[$idx]="Xray / VLESS Reality"
         NUCLEAR_PORTS[$idx]="$port"
         ((idx++))
-    fi
-
-    for unit in /etc/systemd/system/shadowtls-*.service /lib/systemd/system/shadowtls-*.service /usr/lib/systemd/system/shadowtls-*.service; do
-        [[ -e "$unit" ]] || continue
-        port="$(basename "$unit" | sed 's/^shadowtls-//' | sed 's/\.service$//')"
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-        target="shadowtls-${port}"
-        if ! nuke_index_has_target "$target"; then
-            NUCLEAR_TARGETS[$idx]="$target"
-            NUCLEAR_LABELS[$idx]="ShadowTLS 实例"
-            NUCLEAR_PORTS[$idx]="$port"
-            ((idx++))
-        fi
-    done
-
-    if [[ -x /usr/local/bin/shadow-tls ]] && ! pgrep -f '/usr/local/bin/shadow-tls' >/dev/null 2>&1 && ! ls /etc/systemd/system/shadowtls-*.service /lib/systemd/system/shadowtls-*.service /usr/lib/systemd/system/shadowtls-*.service >/dev/null 2>&1; then
-        NUCLEAR_TARGETS[$idx]="shadowtls-generic"
-        NUCLEAR_LABELS[$idx]="ShadowTLS 残留二进制"
-        NUCLEAR_PORTS[$idx]=""
     fi
 }
 
@@ -1803,153 +2004,23 @@ ssh_key_menu() {
 install_ss_rust_native() {
     clear
     echo -e "${CYAN}========= 原生交互安装 SS-Rust =========${RESET}"
-
     read -rp "端口 [留空随机]: " port
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
         port=$((RANDOM % 55535 + 10000))
     fi
-
-    local methods=(
-        "2022-blake3-aes-128-gcm"
-        "2022-blake3-aes-256-gcm"
-        "2022-blake3-chacha20-poly1305"
-        "aes-256-gcm"
-    )
-    echo -e "${YELLOW}加密协议:${RESET}"
-    local i=1
-    for m in "${methods[@]}"; do echo " $i) $m"; i=$((i+1)); done
-    read -rp "选择 [1-4] (默认1): " msel
-    [[ "$msel" =~ ^[1-4]$ ]] || msel=1
-    local method="${methods[$((msel-1))]}"
-
-    local pwd_len=0
-    case "$method" in
-        2022-blake3-aes-128-gcm) pwd_len=16 ;;
-        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) pwd_len=32 ;;
-    esac
-
-    local pwd=""
-    if [[ "$pwd_len" -ne 0 ]]; then
-        read -rp "密码 (留空自动生成，输入时可填 Base64 密钥或原始密钥): " input_pwd
-        if [[ -z "$input_pwd" ]]; then
-            if have_cmd openssl; then
-                pwd=$(openssl rand "$pwd_len" 2>/dev/null | base64_nw)
-            else
-                pwd=$(head -c "$pwd_len" /dev/urandom 2>/dev/null | base64_nw)
-            fi
-        else
-            local raw_len decoded_len=0 tmp_dec="/tmp/ssr-key.$$"
-            raw_len=$(printf '%s' "$input_pwd" | wc -c | tr -d ' ')
-            if printf '%s' "$input_pwd" | base64 -d >"$tmp_dec" 2>/dev/null; then
-                decoded_len=$(wc -c <"$tmp_dec" | tr -d ' ')
-            fi
-            rm -f "$tmp_dec" 2>/dev/null || true
-            if [[ "$decoded_len" == "$pwd_len" ]]; then
-                pwd="$input_pwd"
-            elif [[ "$raw_len" == "$pwd_len" ]]; then
-                pwd=$(printf '%s' "$input_pwd" | base64_nw)
-            else
-                echo -e "${RED}❌ 2022 协议密钥长度错误：需要 ${pwd_len} 字节原始密钥，或对应的 Base64 密钥。${RESET}"
-                sleep 3
-                return
-            fi
-        fi
-        [[ -n "$pwd" ]] || { echo -e "${RED}❌ 密钥生成失败。${RESET}"; sleep 3; return; }
-    else
-        read -rp "传统密码 (留空随机): " input_pwd
-        if [[ -z "$input_pwd" ]]; then
-            if have_cmd openssl; then
-                pwd=$(openssl rand -hex 12 2>/dev/null)
-            else
-                pwd=$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
-            fi
-        else
-            pwd="$input_pwd"
-        fi
-    fi
-
-    local arch; arch=$(uname -m)
-    local ss_arch_primary="x86_64-unknown-linux-musl"
-    local ss_arch_fallback="x86_64-unknown-linux-gnu"
-    case "$arch" in
-        aarch64|arm64)
-            ss_arch_primary="aarch64-unknown-linux-musl"
-            ss_arch_fallback="aarch64-unknown-linux-gnu"
-            ;;
-        armv7l|armv7|arm)
-            ss_arch_primary="arm-unknown-linux-musleabi"
-            ss_arch_fallback="arm-unknown-linux-gnueabi"
-            ;;
-    esac
-
-    local ss_latest="" tmpdir="" tarball="" url="" ss_arch=""
-
-    if [[ -x /usr/local/bin/ss-rust ]] && (run_with_timeout 3 /usr/local/bin/ss-rust --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/ss-rust -V >/dev/null 2>&1); then
-        echo -e "${CYAN}>>> 复用本地已安装 SS-Rust 核心（不重新下载）...${RESET}"
-        ss_latest=$(meta_get "SS_RUST_TAG" || true)
-        [[ -z "$ss_latest" ]] && ss_latest=$(ss_rust_current_tag || true)
-        [[ -n "$ss_latest" ]] && cache_store_binary "ss-rust" "$ss_latest" /usr/local/bin/ss-rust >/dev/null 2>&1 || true
-    elif cache_restore_binary "ss-rust" /usr/local/bin/ss-rust && (run_with_timeout 3 /usr/local/bin/ss-rust --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/ss-rust -V >/dev/null 2>&1); then
-        echo -e "${CYAN}>>> 从本地缓存恢复 SS-Rust 核心（不重新下载）...${RESET}"
-        ss_latest=$(meta_get "SS_RUST_TAG" || true)
-        [[ -z "$ss_latest" ]] && ss_latest=$(ss_rust_current_tag || true)
-    else
-        echo -e "${CYAN}>>> 本地无可用 SS-Rust 核心，开始联网下载...${RESET}"
-        ss_latest=$(cached_latest_tag "shadowsocks/shadowsocks-rust" "ss-rust")
-        [[ -z "$ss_latest" ]] && ss_latest="v1.24.0"
-
-        tmpdir=$(mktemp -d /tmp/ssr-ssrust.XXXXXX)
-        tarball="${tmpdir}/ss-rust.tar.xz"
-
-        for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
-            url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/shadowsocks-${ss_latest}.${candidate_arch}.tar.xz"
-            echo -e "${CYAN}>>> 下载核心: ${ss_latest} (${candidate_arch}) ...${RESET}"
-            rm -f "$tarball" "${tmpdir}/ssserver" >/dev/null 2>&1 || true
-            if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
-                continue
-            fi
-            tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
-            [[ -x "${tmpdir}/ssserver" ]] || continue
-            if run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1 || run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1; then
-                ss_arch="$candidate_arch"
-                break
-            fi
-        done
-
-        if [[ -z "$ss_arch" || ! -x "${tmpdir}/ssserver" ]]; then
-            echo -e "${RED}❌ SS-Rust 新核心自检失败。已自动尝试 musl/gnu 两种构建，当前环境均无法运行。${RESET}"
-            echo -e "${YELLOW}提示：这通常是 glibc/运行时兼容问题，musl 静态版已优先尝试。${RESET}"
-            rm -rf "$tmpdir"
-            sleep 3
-            return
-        fi
-
-        safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || {
-            echo -e "${RED}❌ 安装失败（写入 /usr/local/bin/ss-rust 失败）。${RESET}"
-            rm -rf "$tmpdir"
-            sleep 3
-            return
-        }
-        cache_store_binary "ss-rust" "$ss_latest" /usr/local/bin/ss-rust >/dev/null 2>&1 || true
-    fi
-
-    [[ -n "$ss_latest" ]] || ss_latest=$(ss_rust_current_tag || true)
-    [[ -n "$ss_latest" ]] && meta_set "SS_RUST_TAG" "$ss_latest"
-
+    ss_pick_method_password || return
+    ensure_ss_rust_binary || return
     mkdir -p /etc/ss-rust
     cat > /etc/ss-rust/config.json << EOF
-{ "server": "::", "server_port": $port, "password": "$pwd", "method": "$method", "mode": "tcp_and_udp", "fast_open": true }
+{ "server": "::", "server_port": $port, "password": "${SS_PICK_PASSWORD}", "method": "${SS_PICK_METHOD}", "mode": "tcp_and_udp", "fast_open": true }
 EOF
-
     run_with_timeout 2 /usr/local/bin/ss-rust -c /etc/ss-rust/config.json >/dev/null 2>&1
     local rc=$?
     if [[ "$rc" -ne 0 && "$rc" -ne 124 && "$rc" -ne 137 ]]; then
         echo -e "${RED}❌ 配置自检失败，已中止启动。${RESET}"
-        rm -rf "$tmpdir"
         sleep 3
         return
     fi
-
     local ss_unit='[Unit]
 Description=Shadowsocks-Rust Server
 After=network.target
@@ -1961,26 +2032,20 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target'
-
     if ! start_managed_service "ss-rust" "$ss_unit" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid"; then
         echo -e "${RED}❌ SS-Rust 启动失败。请检查 /var/log/ss-rust.log${RESET}"
-        rm -rf "$tmpdir"
         sleep 3
         return
     fi
-
     if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; ufw allow "$port"/udp >/dev/null 2>&1; fi
     if have_cmd firewall-cmd; then
         firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1
         firewall-cmd --add-port="$port"/udp --permanent >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
     fi
-
-    [[ -n "$ss_latest" ]] && meta_set "SS_RUST_TAG" "$ss_latest"
-
-    echo -e "${GREEN}✅ SS-Rust (${ss_latest:-local}) 安装完成！${RESET}"
+    [[ -n "$ENSURED_SS_RUST_TAG" ]] && meta_set "SS_RUST_TAG" "$ENSURED_SS_RUST_TAG"
+    echo -e "${GREEN}✅ SS-Rust (${ENSURED_SS_RUST_TAG:-local}) 安装完成！${RESET}"
     show_ss_rust_summary
-    rm -rf "$tmpdir"
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
 
@@ -2121,187 +2186,155 @@ WantedBy=multi-user.target'
 }
 
 
-install_shadowtls_native() {
+
+install_ss_v2ray_plugin_native() {
     clear
-    echo -e "${CYAN}========= 原生安装 ShadowTLS =========${RESET}"
-
-    local ss_port=""
-    if [[ -f "/etc/ss-rust/config.json" ]]; then
-        ss_port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
+    echo -e "${CYAN}========= 自动部署 SS2022 + v2ray-plugin =========${RESET}"
+    read -rp "端口 [留空随机]: " port
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        port=$((RANDOM % 55535 + 10000))
     fi
-
-    local up_port=""
-    if [[ -n "$ss_port" && "$ss_port" != "null" ]]; then
-        echo -e "${YELLOW}检测到本地 SS-Rust，推荐保护：${RESET}"
-        echo -e "${CYAN} 1) 保护 SS-Rust (端口: $ss_port)${RESET}"
-        echo -e "${CYAN} 2) 手动输入自定义端口${RESET}"
-        read -rp "选择 [1-2]: " protect_choice
-        if [[ "$protect_choice" == "1" ]]; then
-            up_port=$ss_port
-        else
-            read -rp "需要保护的上游端口: " up_port
+    ss_pick_method_password || return
+    ensure_ss_rust_binary || return
+    read -rp "伪装域名 Host [默认 www.microsoft.com]: " host
+    [[ -z "$host" ]] && host="www.microsoft.com"
+    read -rp "WebSocket Path [默认随机]: " path
+    [[ -z "$path" ]] && path="/$(random_token 8)"
+    [[ "$path" == /* ]] || path="/${path}"
+    if [[ ! -x /usr/local/bin/v2ray-plugin ]]; then
+        local arch vp_latest tmpdir tarf asset_name official_url api_url proxy_url binf
+        arch=$(uname -m)
+        case "$arch" in
+            x86_64|amd64) asset_name="v2ray-plugin-linux-amd64" ;;
+            aarch64|arm64) asset_name="v2ray-plugin-linux-arm64" ;;
+            armv7l|armv7|arm) asset_name="v2ray-plugin-linux-arm" ;;
+            *) echo -e "${RED}❌ 当前架构暂不支持自动安装 v2ray-plugin: ${arch}${RESET}"; sleep 3; return ;;
+        esac
+        vp_latest=$(cached_latest_tag "shadowsocks/v2ray-plugin" "v2ray-plugin")
+        [[ -z "$vp_latest" ]] && vp_latest="v1.3.2"
+        tmpdir=$(mktemp -d /tmp/ssr-v2ray-plugin.XXXXXX)
+        tarf="${tmpdir}/v2ray-plugin.tar.gz"
+        asset_name="${asset_name}-${vp_latest}.tar.gz"
+        official_url="https://github.com/shadowsocks/v2ray-plugin/releases/download/${vp_latest}/${asset_name}"
+        api_url=$(github_release_asset_url "shadowsocks/v2ray-plugin" "$vp_latest" "$asset_name" 2>/dev/null || true)
+        proxy_url="https://ghproxy.net/${official_url#https://}"
+        echo -e "${CYAN}>>> 正在准备 v2ray-plugin: ${vp_latest} ...${RESET}"
+        if ! download_file_any "$tarf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$tarf" ]] || ! tar -tf "$tarf" >/dev/null 2>&1; then
+            echo -e "${RED}❌ v2ray-plugin 下载失败。${RESET}"
+            rm -rf "$tmpdir"
+            sleep 3
+            return
         fi
-    else
-        read -rp "需要保护的上游端口: " up_port
+        tar -xf "$tarf" -C "$tmpdir" >/dev/null 2>&1 || true
+        binf="$(find "$tmpdir" -maxdepth 1 -type f -name 'v2ray-plugin*' ! -name '*.tar.gz' | head -n1)"
+        [[ -x "$binf" ]] || { echo -e "${RED}❌ v2ray-plugin 解压失败。${RESET}"; rm -rf "$tmpdir"; sleep 3; return; }
+        safe_install_binary "$binf" /usr/local/bin/v2ray-plugin || { echo -e "${RED}❌ v2ray-plugin 安装失败。${RESET}"; rm -rf "$tmpdir"; sleep 3; return; }
+        rm -rf "$tmpdir"
     fi
-
-    [[ -z "$up_port" ]] && echo -e "${RED}端口无效！${RESET}" && sleep 2 && return
-
-    read -rp "ShadowTLS 伪装端口 [留空随机]: " listen_port
-    if ! [[ "$listen_port" =~ ^[0-9]+$ ]] || [ "$listen_port" -lt 1 ] || [ "$listen_port" -gt 65535 ]; then
-        listen_port=$((RANDOM % 55535 + 10000))
-    fi
-
-    read -rp "伪装域名 (SNI) [留空默认 publicassets.cdn-apple.com]: " sni_domain
-    [[ -z "$sni_domain" ]] && sni_domain="publicassets.cdn-apple.com"
-
-    local pwd
-    if have_cmd openssl; then
-        pwd=$(openssl rand -base64 8 2>/dev/null | tr -d '\n')
-    else
-        pwd=$(head -c 8 /dev/urandom 2>/dev/null | base64_nw)
-    fi
-    [[ -n "$pwd" ]] || { echo -e "${RED}❌ ShadowTLS 密码生成失败。${RESET}"; sleep 3; return; }
-
-    local arch; arch=$(uname -m)
-    local st_arch
-    st_arch=$(shadowtls_arch_name "$arch") || {
-        echo -e "${RED}❌ 当前架构暂不支持自动安装 ShadowTLS: ${arch}${RESET}"
+    mkdir -p /etc/ss-v2ray
+    cat > "$SS_V2RAY_CONF" << EOF
+{ "server": "::", "server_port": $port, "password": "${SS_PICK_PASSWORD}", "method": "${SS_PICK_METHOD}", "mode": "tcp_only", "fast_open": true, "plugin": "v2ray-plugin", "plugin_opts": "server;mode=websocket;host=${host};path=${path};loglevel=none" }
+EOF
+    plugin_state_write "$SS_V2RAY_STATE" HOST "$host" PATH "$path"
+    run_with_timeout 3 /usr/local/bin/ss-rust -c "$SS_V2RAY_CONF" >/dev/null 2>&1
+    local rc=$?
+    if [[ "$rc" -ne 0 && "$rc" -ne 124 && "$rc" -ne 137 ]]; then
+        echo -e "${RED}❌ 配置自检失败，已中止启动。${RESET}"
         sleep 3
         return
-    }
-
-    local st_latest="" tmpdir="" binf=""
-    if [[ -x /usr/local/bin/shadow-tls ]] && (run_with_timeout 3 /usr/local/bin/shadow-tls --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls -V >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls --help >/dev/null 2>&1); then
-        echo -e "${CYAN}>>> 复用本地已安装 ShadowTLS 核心（不重新下载）...${RESET}"
-        st_latest=$(meta_get "SHADOWTLS_TAG" || true)
-        [[ -z "$st_latest" ]] && st_latest=$(shadowtls_current_tag || true)
-        [[ -n "$st_latest" ]] && cache_store_binary "shadowtls" "$st_latest" /usr/local/bin/shadow-tls >/dev/null 2>&1 || true
-    elif cache_restore_binary "shadowtls" /usr/local/bin/shadow-tls && (run_with_timeout 3 /usr/local/bin/shadow-tls --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls -V >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/shadow-tls --help >/dev/null 2>&1); then
-        echo -e "${CYAN}>>> 从本地缓存恢复 ShadowTLS 核心（不重新下载）...${RESET}"
-        st_latest=$(meta_get "SHADOWTLS_TAG" || true)
-        [[ -z "$st_latest" ]] && st_latest=$(shadowtls_current_tag || true)
-    else
-        echo -e "${CYAN}>>> 本地无可用 ShadowTLS 核心，开始联网下载...${RESET}"
-        st_latest=$(cached_latest_tag "ihciah/shadow-tls" "shadowtls")
-        [[ -z "$st_latest" ]] && st_latest="v0.2.25"
-
-        tmpdir=$(mktemp -d /tmp/ssr-stls.XXXXXX)
-        binf="${tmpdir}/shadow-tls"
-        local asset_name="shadow-tls-${st_arch}"
-        local official_url="https://github.com/ihciah/shadow-tls/releases/download/${st_latest}/${asset_name}"
-        local api_url=""
-        api_url=$(github_release_asset_url "ihciah/shadow-tls" "$st_latest" "$asset_name" 2>/dev/null || true)
-        local proxy_url="https://ghproxy.net/${official_url}"
-
-        echo -e "${CYAN}>>> 下载核心: ${st_latest} (${st_arch}) ...${RESET}"
-        if ! download_file_any "$binf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$binf" ]]; then
-            echo -e "${RED}❌ 下载失败。已尝试 GitHub 直连与代理地址。${RESET}"
-            rm -rf "$tmpdir"
-            sleep 3
-            return
-        fi
-        chmod +x "$binf" >/dev/null 2>&1 || true
-
-        if ! run_with_timeout 3 "$binf" --version >/dev/null 2>&1; then
-            run_with_timeout 3 "$binf" -V >/dev/null 2>&1 || run_with_timeout 3 "$binf" --help >/dev/null 2>&1 || {
-                echo -e "${RED}❌ 新核心自检失败（无法运行）。已中止替换。${RESET}"
-                rm -rf "$tmpdir"
-                sleep 3
-                return
-            }
-        fi
-
-        safe_install_binary "$binf" /usr/local/bin/shadow-tls || {
-            echo -e "${RED}❌ 安装失败（写入 /usr/local/bin/shadow-tls 失败）。${RESET}"
-            rm -rf "$tmpdir"
-            sleep 3
-            return
-        }
-        cache_store_binary "shadowtls" "$st_latest" /usr/local/bin/shadow-tls >/dev/null 2>&1 || true
     fi
-
-    [[ -n "$st_latest" ]] || st_latest=$(shadowtls_current_tag || true)
-    [[ -n "$st_latest" ]] && meta_set "SHADOWTLS_TAG" "$st_latest"
-
-    local st_cmd="/usr/local/bin/shadow-tls --v3 --strict server --listen 0.0.0.0:${listen_port} --server 127.0.0.1:${up_port} --tls ${sni_domain}:443 --password ${pwd}"
-    local st_cmd_legacy="env MONOIO_FORCE_LEGACY_DRIVER=1 ${st_cmd}"
-    if service_use_systemd; then
-        mkdir -p /etc/systemd/system
-        cat > /etc/systemd/system/shadowtls-${listen_port}.service << EOF
-[Unit]
-Description=ShadowTLS Service on port ${listen_port}
+    local unit='[Unit]
+Description=Shadowsocks-Rust + v2ray-plugin Server
 After=network.target
 
 [Service]
-ExecStart=${st_cmd}
-Restart=always
+ExecStart=/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json
+Restart=on-failure
 LimitNOFILE=1048576
 
 [Install]
-WantedBy=multi-user.target
-EOF
-
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        if ! systemctl enable --now shadowtls-"${listen_port}" >/dev/null 2>&1 || ! systemctl is-active --quiet shadowtls-"${listen_port}" 2>/dev/null; then
-            cat > /etc/systemd/system/shadowtls-${listen_port}.service << EOF
-[Unit]
-Description=ShadowTLS Service on port ${listen_port}
-After=network.target
-
-[Service]
-Environment=MONOIO_FORCE_LEGACY_DRIVER=1
-ExecStart=${st_cmd}
-Restart=always
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            systemctl daemon-reload >/dev/null 2>&1 || true
-            systemctl restart shadowtls-"${listen_port}" >/dev/null 2>&1 || systemctl enable --now shadowtls-"${listen_port}" >/dev/null 2>&1 || {
-                echo -e "${RED}❌ ShadowTLS 服务启动失败。${RESET}"
-                rm -rf "$tmpdir"
-                sleep 3
-                return
-            }
-            systemctl is-active --quiet shadowtls-"${listen_port}" 2>/dev/null || {
-                echo -e "${RED}❌ ShadowTLS 未处于运行状态。${RESET}"
-                rm -rf "$tmpdir"
-                sleep 3
-                return
-            }
-        fi
-    else
-        restart_managed_service "shadowtls-${listen_port}" "$st_cmd" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/log/shadowtls.log" "/var/run/shadowtls-${listen_port}.pid" || restart_managed_service "shadowtls-${listen_port}" "$st_cmd_legacy" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/log/shadowtls.log" "/var/run/shadowtls-${listen_port}.pid" || {
-            echo -e "${RED}❌ ShadowTLS 后台启动失败（无 systemd 环境）。${RESET}"
-            rm -rf "$tmpdir"
-            sleep 3
-            return
-        }
-    fi
-
-    if have_cmd ufw; then ufw allow "$listen_port"/tcp >/dev/null 2>&1; fi
-    if have_cmd firewall-cmd; then firewall-cmd --add-port="$listen_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
-
-    sleep 1
-    if ! shadowtls_is_active "$listen_port" || ! port_listening_tcp "$listen_port"; then
-        echo -e "${RED}❌ ShadowTLS 进程未稳定监听在 ${listen_port}/tcp。${RESET}"
-        if [[ -f /var/log/shadowtls.log ]]; then
-            echo -e "${YELLOW}最近日志:${RESET}"
-            tail -n 20 /var/log/shadowtls.log 2>/dev/null || true
-        fi
-        rm -rf "$tmpdir"
-        sleep 5
+WantedBy=multi-user.target'
+    if ! start_managed_service "ss-v2ray" "$unit" "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/log/ss-v2ray.log" "/var/run/ss-v2ray.pid"; then
+        echo -e "${RED}❌ SS2022 + v2ray-plugin 启动失败。${RESET}"
+        sleep 3
         return
     fi
+    if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; fi
+    if have_cmd firewall-cmd; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+    echo -e "${GREEN}✅ SS2022 + v2ray-plugin 部署完成！${RESET}"
+    show_ss_v2ray_summary
+    read -n 1 -s -r -p "按任意键返回上一层..."
+}
 
-    shadowtls_state_save "$listen_port" "$up_port" "$sni_domain" "$pwd"
+install_ss_obfs_native() {
+    clear
+    echo -e "${CYAN}========= 自动部署 SS2022 + obfs-local =========${RESET}"
+    read -rp "端口 [留空随机]: " port
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        port=$((RANDOM % 55535 + 10000))
+    fi
+    ss_pick_method_password || return
+    ensure_ss_rust_binary || return
+    echo -e "${YELLOW}混淆模式:${RESET}
+ 1) tls
+ 2) http"
+    read -rp "选择 [1-2] (默认1): " obsel
+    [[ "$obsel" == "2" ]] && obfs_mode="http" || obfs_mode="tls"
+    read -rp "伪装域名 [默认 www.bing.com]: " host
+    [[ -z "$host" ]] && host="www.bing.com"
+    if [[ ! -x /usr/local/bin/obfs-server || ! -x /usr/local/bin/obfs-local ]]; then
+        echo -e "${CYAN}>>> 正在准备 simple-obfs (obfs-server / obfs-local)...${RESET}"
+        if have_cmd apt-get; then
+            apt-get update >/dev/null 2>&1 || true
+            apt-get install -y simple-obfs >/dev/null 2>&1 || true
+        elif have_cmd apk; then
+            apk add --no-cache simple-obfs >/dev/null 2>&1 || true
+        elif have_cmd dnf; then
+            dnf install -y simple-obfs >/dev/null 2>&1 || true
+        elif have_cmd yum; then
+            yum install -y epel-release >/dev/null 2>&1 || true
+            yum install -y simple-obfs >/dev/null 2>&1 || true
+        fi
+        for b in /usr/bin/obfs-server /usr/local/bin/obfs-server; do [[ -x "$b" ]] && install -m 755 "$b" /usr/local/bin/obfs-server >/dev/null 2>&1 && break; done
+        for b in /usr/bin/obfs-local /usr/local/bin/obfs-local; do [[ -x "$b" ]] && install -m 755 "$b" /usr/local/bin/obfs-local >/dev/null 2>&1 && break; done
+        if [[ ! -x /usr/local/bin/obfs-server || ! -x /usr/local/bin/obfs-local ]]; then
+            echo -e "${RED}❌ simple-obfs 安装失败或当前系统源未提供 obfs-server / obfs-local。${RESET}"
+            sleep 3
+            return
+        fi
+    fi
+    mkdir -p /etc/ss-obfs
+    cat > "$SS_OBFS_CONF" << EOF
+{ "server": "::", "server_port": $port, "password": "${SS_PICK_PASSWORD}", "method": "${SS_PICK_METHOD}", "mode": "tcp_only", "fast_open": true, "plugin": "obfs-server", "plugin_opts": "obfs=${obfs_mode}" }
+EOF
+    plugin_state_write "$SS_OBFS_STATE" HOST "$host" MODE "$obfs_mode"
+    run_with_timeout 3 /usr/local/bin/ss-rust -c "$SS_OBFS_CONF" >/dev/null 2>&1
+    local rc=$?
+    if [[ "$rc" -ne 0 && "$rc" -ne 124 && "$rc" -ne 137 ]]; then
+        echo -e "${RED}❌ 配置自检失败，已中止启动。${RESET}"
+        sleep 3
+        return
+    fi
+    local unit='[Unit]
+Description=Shadowsocks-Rust + simple-obfs Server
+After=network.target
 
-    echo -e "${GREEN}✅ ShadowTLS (${st_latest:-local}) 安装成功！已挂载在 ${up_port} 上层。${RESET}"
-    show_shadowtls_summary "$listen_port"
-    echo -e "${YELLOW}手动参数:${RESET} 外层端口=${listen_port} | 上游端口=${up_port} | SNI=${sni_domain} | ShadowTLS密码=${pwd}"
-    rm -rf "$tmpdir"
+[Service]
+ExecStart=/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target'
+    if ! start_managed_service "ss-obfs" "$unit" "/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/log/ss-obfs.log" "/var/run/ss-obfs.pid"; then
+        echo -e "${RED}❌ SS2022 + obfs-local 启动失败。${RESET}"
+        sleep 3
+        return
+    fi
+    if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; fi
+    if have_cmd firewall-cmd; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+    echo -e "${GREEN}✅ SS2022 + obfs-local 部署完成！${RESET}"
+    show_ss_obfs_summary
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
 
@@ -2311,59 +2344,26 @@ EOF
 unified_node_manager() {
     while true; do
         clear
-        echo -e "${CYAN}========= 🔰 统一节点生命周期管控中心 =========${RESET}"
-
-        # 清理异常 shadowtls unit 文件（端口名异常）
-        for s in /etc/systemd/system/shadowtls-*.service; do
-            [[ -e "$s" ]] || continue
-            local check_port
-            check_port=$(basename "$s" | sed 's/shadowtls-//g' | sed 's/.service//g')
-            if ! [[ "$check_port" =~ ^[0-9]+$ ]]; then
-                service_use_systemd && systemctl stop "$(basename "$s")" 2>/dev/null || true
-                service_use_systemd && systemctl disable "$(basename "$s")" 2>/dev/null || true
-                rm -f "$s"
-                service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
-            fi
-        done
-
-        local has_ss=0 has_vless=0 has_stls=0
-        local shadowtls_ports=()
-        mapfile -t shadowtls_ports < <(shadowtls_detect_ports)
-        if [[ -f "/etc/ss-rust/config.json" ]]; then
-            echo -e "${GREEN} 1) ⚡ SS-Rust 节点${RESET}"
-            has_ss=1
-        else
-            echo -e "${RED} 1) ❌ 未部署 SS-Rust${RESET}"
-        fi
-
-        if [[ -f "/usr/local/etc/xray/config.json" ]]; then
-            echo -e "${GREEN} 2) 🔮 VLESS Reality 节点${RESET}"
-            has_vless=1
-        else
-            echo -e "${RED} 2) ❌ 未部署 VLESS Reality${RESET}"
-        fi
-
-        if [[ ${#shadowtls_ports[@]} -gt 0 ]]; then
-            echo -e "${GREEN} 3) 🛡️ ShadowTLS 防阻断保护实例 (${#shadowtls_ports[@]})${RESET}"
-            has_stls=1
-        else
-            echo -e "${RED} 3) ❌ 未部署 ShadowTLS${RESET}"
-        fi
-        echo -e "${CYAN}--------------------------------------------${RESET}"
-        echo -e "${RED} 4) ☢️ 全局强制核爆 (清理任意卡死/幽灵服务)${RESET}"
+        local has_ss=0 has_v2=0 has_obfs=0 has_vless=0
+        ([[ -f /etc/ss-rust/config.json || -f /etc/systemd/system/ss-rust.service || -f /var/run/ss-rust.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' >/dev/null 2>&1) && has_ss=1
+        ([[ -f "$SS_V2RAY_CONF" || -f /etc/systemd/system/ss-v2ray.service || -f /var/run/ss-v2ray.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' >/dev/null 2>&1) && has_v2=1
+        ([[ -f "$SS_OBFS_CONF" || -f /etc/systemd/system/ss-obfs.service || -f /var/run/ss-obfs.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' >/dev/null 2>&1) && has_obfs=1
+        ([[ -f /usr/local/etc/xray/config.json || -f /etc/systemd/system/xray.service || -f /var/run/xray.pid ]] || pgrep -f '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' >/dev/null 2>&1) && has_vless=1
+        echo -e "${CYAN}========= 统一节点生命周期管控中心 =========${RESET}"
+        if [[ $has_ss -eq 1 ]]; then echo -e "${GREEN} 1) ⚡ SS-Rust 节点${RESET}"; else echo -e "${RED} 1) ❌ 未部署 SS-Rust${RESET}"; fi
+        if [[ $has_v2 -eq 1 ]]; then echo -e "${GREEN} 2) 🌐 SS2022 + v2ray-plugin${RESET}"; else echo -e "${RED} 2) ❌ 未部署 SS2022 + v2ray-plugin${RESET}"; fi
+        if [[ $has_obfs -eq 1 ]]; then echo -e "${GREEN} 3) ☁️ SS2022 + obfs-local${RESET}"; else echo -e "${RED} 3) ❌ 未部署 SS2022 + obfs-local${RESET}"; fi
+        if [[ $has_vless -eq 1 ]]; then echo -e "${GREEN} 4) 🔮 VLESS Reality 节点${RESET}"; else echo -e "${RED} 4) ❌ 未部署 VLESS Reality${RESET}"; fi
+        echo -e "${RED} 5) ☢️ 全局强制核爆 (清理任意卡死/幽灵服务)${RESET}"
         echo -e " 0) 返回主菜单"
-        read -rp "请选择 [0-4]: " node_choice
-
+        read -rp "请选择 [0-5]: " node_choice
         case "$node_choice" in
             1)
                 if [[ $has_ss -eq 1 ]]; then
                     clear
-                    local port method password link
+                    local port
                     show_ss_rust_summary
                     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
-                    method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
-                    password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
-                    link=$(ssr_make_ss_link 2>/dev/null || true)
                     echo -e "---------------------------------"
                     echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 修改密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
                     read -rp "输入操作: " op
@@ -2373,11 +2373,7 @@ unified_node_manager() {
                             json_set_top_value /etc/ss-rust/config.json server_port "$np" number
                             remove_firewall_rule "$port" "both"
                             if have_cmd ufw; then ufw allow "$np"/tcp >/dev/null 2>&1; ufw allow "$np"/udp >/dev/null 2>&1; fi
-                            if have_cmd firewall-cmd; then
-                                firewall-cmd --add-port="$np"/tcp --permanent >/dev/null 2>&1
-                                firewall-cmd --add-port="$np"/udp --permanent >/dev/null 2>&1
-                                firewall-cmd --reload >/dev/null 2>&1
-                            fi
+                            if have_cmd firewall-cmd; then firewall-cmd --add-port="$np"/tcp --permanent >/dev/null 2>&1; firewall-cmd --add-port="$np"/udp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
                             restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
                             echo -e "${GREEN}✅ 修改成功${RESET}"
                         else
@@ -2402,25 +2398,110 @@ unified_node_manager() {
                 fi
                 ;;
             2)
-                if [[ $has_vless -eq 1 ]]; then
+                if [[ $has_v2 -eq 1 ]]; then
                     clear
-                    local ip port uuid sni
-                    ip=$(curl -s4m8 ip.sb 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || echo "0.0.0.0")
-                    port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
-                    uuid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.settings.clients.0.id 2>/dev/null)
-                    sni=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.serverNames.0 2>/dev/null)
-                    echo -e "IP: ${GREEN}${ip}${RESET}"
-                    echo -e "端口: ${GREEN}${port}${RESET}"
-                    echo -e "UUID: ${GREEN}${uuid}${RESET}"
-                    echo -e "SNI伪装: ${GREEN}${sni}${RESET}"
+                    local port
+                    show_ss_v2ray_summary
+                    port=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
                     echo -e "---------------------------------"
-                    echo -e "${YELLOW}1) 重启节点${RESET} | ${RED}2) 删除节点${RESET} | 0) 返回"
+                    echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 修改密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
                     read -rp "输入操作: " op
                     if [[ "$op" == "1" ]]; then
+                        read -rp "新端口 (1-65535): " np
+                        if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
+                            json_set_top_value "$SS_V2RAY_CONF" server_port "$np" number
+                            remove_firewall_rule "$port" "tcp"
+                            if have_cmd ufw; then ufw allow "$np"/tcp >/dev/null 2>&1; fi
+                            if have_cmd firewall-cmd; then firewall-cmd --add-port="$np"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+                            restart_managed_service "ss-v2ray" "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/log/ss-v2ray.log" "/var/run/ss-v2ray.pid" >/dev/null 2>&1 || true
+                            echo -e "${GREEN}✅ 修改成功${RESET}"
+                        else
+                            echo -e "${RED}❌ 端口无效${RESET}"
+                        fi
+                        sleep 1
+                    elif [[ "$op" == "2" ]]; then
+                        read -rp "新密码: " npwd
+                        [[ -z "$npwd" ]] && { echo -e "${RED}❌ 密码不能为空${RESET}"; sleep 1; continue; }
+                        json_set_top_value "$SS_V2RAY_CONF" password "$npwd" string
+                        restart_managed_service "ss-v2ray" "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/log/ss-v2ray.log" "/var/run/ss-v2ray.pid" >/dev/null 2>&1 || true
+                        echo -e "${GREEN}✅ 修改成功${RESET}"
+                        sleep 1
+                    elif [[ "$op" == "3" ]]; then
+                        remove_firewall_rule "$port" "tcp"
+                        stop_managed_service "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid"
+                        rm -rf /etc/ss-v2ray /etc/systemd/system/ss-v2ray.service /var/log/ss-v2ray.log "$SS_V2RAY_STATE"
+                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
+                        echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
+                        sleep 1
+                    fi
+                fi
+                ;;
+            3)
+                if [[ $has_obfs -eq 1 ]]; then
+                    clear
+                    local port
+                    show_ss_obfs_summary
+                    port=$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null)
+                    echo -e "---------------------------------"
+                    echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 修改密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
+                    read -rp "输入操作: " op
+                    if [[ "$op" == "1" ]]; then
+                        read -rp "新端口 (1-65535): " np
+                        if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
+                            json_set_top_value "$SS_OBFS_CONF" server_port "$np" number
+                            remove_firewall_rule "$port" "tcp"
+                            if have_cmd ufw; then ufw allow "$np"/tcp >/dev/null 2>&1; fi
+                            if have_cmd firewall-cmd; then firewall-cmd --add-port="$np"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+                            restart_managed_service "ss-obfs" "/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/log/ss-obfs.log" "/var/run/ss-obfs.pid" >/dev/null 2>&1 || true
+                            echo -e "${GREEN}✅ 修改成功${RESET}"
+                        else
+                            echo -e "${RED}❌ 端口无效${RESET}"
+                        fi
+                        sleep 1
+                    elif [[ "$op" == "2" ]]; then
+                        read -rp "新密码: " npwd
+                        [[ -z "$npwd" ]] && { echo -e "${RED}❌ 密码不能为空${RESET}"; sleep 1; continue; }
+                        json_set_top_value "$SS_OBFS_CONF" password "$npwd" string
+                        restart_managed_service "ss-obfs" "/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/log/ss-obfs.log" "/var/run/ss-obfs.pid" >/dev/null 2>&1 || true
+                        echo -e "${GREEN}✅ 修改成功${RESET}"
+                        sleep 1
+                    elif [[ "$op" == "3" ]]; then
+                        remove_firewall_rule "$port" "tcp"
+                        stop_managed_service "ss-obfs" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/run/ss-obfs.pid"
+                        rm -rf /etc/ss-obfs /etc/systemd/system/ss-obfs.service /var/log/ss-obfs.log "$SS_OBFS_STATE"
+                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
+                        echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
+                        sleep 1
+                    fi
+                fi
+                ;;
+            4)
+                if [[ $has_vless -eq 1 ]]; then
+                    clear
+                    local port
+                    show_vless_summary
+                    port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
+                    echo -e "---------------------------------"
+                    echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 重启节点${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
+                    read -rp "输入操作: " op
+                    if [[ "$op" == "1" ]]; then
+                        read -rp "新端口 (1-65535): " np
+                        if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
+                            json_set_path /usr/local/etc/xray/config.json inbounds.0.port "$np" number
+                            remove_firewall_rule "$port" "tcp"
+                            if have_cmd ufw; then ufw allow "$np"/tcp >/dev/null 2>&1; fi
+                            if have_cmd firewall-cmd; then firewall-cmd --add-port="$np"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+                            restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
+                            echo -e "${GREEN}✅ 修改成功${RESET}"
+                        else
+                            echo -e "${RED}❌ 端口无效${RESET}"
+                        fi
+                        sleep 1
+                    elif [[ "$op" == "2" ]]; then
                         restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
                         echo -e "${GREEN}✅ 已重启${RESET}"
                         sleep 1
-                    elif [[ "$op" == "2" ]]; then
+                    elif [[ "$op" == "3" ]]; then
                         remove_firewall_rule "$port" "tcp"
                         stop_managed_service "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"
                         rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service /var/log/xray.log
@@ -2430,68 +2511,7 @@ unified_node_manager() {
                     fi
                 fi
                 ;;
-            3)
-                if [[ $has_stls -eq 1 ]]; then
-                    clear
-                    local st_ports=()
-                    local idx=1
-                    mapfile -t st_ports < <(shadowtls_detect_ports)
-                    for st_port in "${st_ports[@]}"; do
-                        [[ -n "$st_port" ]] || continue
-                        local st_status
-                        if shadowtls_is_active "$st_port"; then
-                            st_status="${GREEN}运行中${RESET}"
-                        else
-                            st_status="${RED}已停止${RESET}"
-                        fi
-                        echo -e " ${CYAN}${idx})${RESET} 外层端口: ${YELLOW}${st_port}${RESET} [${st_status}]"
-                        ((idx++))
-                    done
-                    echo -e "---------------------------------"
-                    echo -e "${YELLOW}1) 序号查看实例详情${RESET} | ${RED}2) 序号删除实例${RESET} | ${RED}9) ⚠️ 强制核爆所有残留${RESET} | 0) 返回"
-                    read -rp "输入操作: " op
-                    if [[ "$op" == "1" ]]; then
-                        read -rp "输入实例序号 [1-$((idx-1))]: " view_idx
-                        local view_port="${st_ports[$((view_idx-1))]}"
-                        if [[ -n "$view_port" ]]; then
-                            clear
-                            show_shadowtls_summary "$view_port"
-                            echo
-                            echo -e "${CYAN}提示:${RESET} ShadowTLS 链接必须带 plugin=shadow-tls 参数；如果客户端只看到普通 SS 链接，请优先使用这里显示的 ShadowTLS 链接。"
-                            read -n 1 -s -r -p "按任意键返回上一层..."
-                        fi
-                    elif [[ "$op" == "2" ]]; then
-                        read -rp "输入实例序号 [1-$((idx-1))]: " del_idx
-                        local del_port="${st_ports[$((del_idx-1))]}"
-                        if [[ -n "$del_port" ]]; then
-                            remove_firewall_rule "$del_port" "tcp"
-                            stop_managed_service "shadowtls-${del_port}" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/run/shadowtls-${del_port}.pid"
-                            rm -f "/etc/systemd/system/shadowtls-${del_port}.service"
-                            rm -f "$(shadowtls_state_file "$del_port")"
-                            service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
-                            if [[ $(shadowtls_detect_ports | wc -l | tr -d ' ') -eq 0 ]]; then
-                                rm -f /usr/local/bin/shadow-tls /var/log/shadowtls.log
-                            fi
-                            echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
-                            sleep 1
-                        fi
-                    elif [[ "$op" == "9" ]]; then
-                        echo -e "${RED}执行物理核爆...${RESET}"
-                        for p in "${st_ports[@]}"; do
-                            [[ -z "$p" ]] && continue
-                            remove_firewall_rule "$p" "tcp"
-                            stop_managed_service "shadowtls-${p}" '/usr/local/bin/shadow-tls --v3 --strict server' "/var/run/shadowtls-${p}.pid"
-                            rm -f "/etc/systemd/system/shadowtls-${p}.service"
-                            rm -f "$(shadowtls_state_file "$p")"
-                        done
-                        rm -f /usr/local/bin/shadow-tls /var/log/shadowtls.log
-                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
-                        echo -e "${GREEN}✅ 拔除成功！${RESET}"
-                        sleep 2
-                    fi
-                fi
-                ;;
-            4)
+            5)
                 while true; do
                     clear
                     echo -e "${CYAN}========= ☢️ 全局强制核爆中心 =========${RESET}"
@@ -2664,15 +2684,15 @@ run_daemon_check() {
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ss-rust\.service'; then
         systemctl is-active --quiet ss-rust 2>/dev/null || restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
     fi
-
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ss-v2ray\.service'; then
+        systemctl is-active --quiet ss-v2ray 2>/dev/null || restart_managed_service "ss-v2ray" "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/log/ss-v2ray.log" "/var/run/ss-v2ray.pid" >/dev/null 2>&1 || true
+    fi
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ss-obfs\.service'; then
+        systemctl is-active --quiet ss-obfs 2>/dev/null || restart_managed_service "ss-obfs" "/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/log/ss-obfs.log" "/var/run/ss-obfs.pid" >/dev/null 2>&1 || true
+    fi
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^xray\.service'; then
         systemctl is-active --quiet xray 2>/dev/null || restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
     fi
-
-    while read -r svc; do
-        [[ -z "$svc" ]] && continue
-        systemctl is-active --quiet "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
-    done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep '^shadowtls-.*\.service$' || true)
 }
 
 auto_clean() {
@@ -2681,7 +2701,7 @@ auto_clean() {
         apt-get autoremove -yqq >/dev/null 2>&1 || true
         apt-get clean -qq >/dev/null 2>&1 || true
     fi
-    rm -rf /root/.cache/* /tmp/*.tar.xz /tmp/shadow-tls /tmp/ssserver /tmp/ssr_update.sh /tmp/xray* /tmp/tmp.json 2>/dev/null || true
+    rm -rf /root/.cache/* /tmp/*.tar.xz /tmp/ssserver /tmp/ssr_update.sh /tmp/xray* /tmp/tmp.json /tmp/ssr-v2ray-plugin.* 2>/dev/null || true
     [[ "$is_silent" != "silent" ]] && echo -e "${GREEN}✅ 垃圾清理完毕！${RESET}"
 }
 
@@ -2848,10 +2868,9 @@ hot_update_components() {
     local updated_any=0
 
     update_ss_rust_if_needed; local r1=$?
-    update_shadowtls_if_needed; local r2=$?
     update_xray_if_needed; local r3=$?
 
-    [[ $r1 -eq 0 || $r2 -eq 0 || $r3 -eq 0 ]] && updated_any=1
+    [[ $r1 -eq 0 || $r3 -eq 0 ]] && updated_any=1
 
     if [[ "$is_silent" != "silent" ]]; then
         if [[ $updated_any -eq 1 ]]; then
@@ -2876,17 +2895,14 @@ report_update_result() {
 }
 
 show_core_cache_status() {
-    local ss_inst="未安装" xr_inst="未安装" st_inst="未安装"
-    local ss_cache="无" xr_cache="无" st_cache="无"
+    local ss_inst="未安装" xr_inst="未安装"
+    local ss_cache="无" xr_cache="无"
     [[ -x /usr/local/bin/ss-rust ]] && ss_inst="$(ss_rust_current_tag || echo installed)"
     [[ -x /usr/local/bin/xray ]] && xr_inst="$(xray_current_tag || echo installed)"
-    [[ -x /usr/local/bin/shadow-tls ]] && st_inst="$(shadowtls_current_tag || echo installed)"
     [[ -x "$(cache_current_binary_path ss-rust 2>/dev/null)" ]] && ss_cache="有"
     [[ -x "$(cache_current_binary_path xray 2>/dev/null)" ]] && xr_cache="有"
-    [[ -x "$(cache_current_binary_path shadowtls 2>/dev/null)" ]] && st_cache="有"
     echo -e "${CYAN}SS-Rust${RESET}    已安装: ${GREEN}${ss_inst}${RESET} | 缓存: ${YELLOW}${ss_cache}${RESET}"
     echo -e "${CYAN}Xray${RESET}       已安装: ${GREEN}${xr_inst}${RESET} | 缓存: ${YELLOW}${xr_cache}${RESET}"
-    echo -e "${CYAN}ShadowTLS${RESET}  已安装: ${GREEN}${st_inst}${RESET} | 缓存: ${YELLOW}${st_cache}${RESET}"
     echo -e "${CYAN}说明:${RESET} 创建节点时会优先复用【已安装核心】->【本地缓存】->【联网下载】"
 }
 
@@ -2898,22 +2914,19 @@ core_cache_menu() {
         echo
         echo -e "${GREEN} 1.${RESET} 更新 SS-Rust 核心"
         echo -e "${GREEN} 2.${RESET} 更新 Xray 核心"
-        echo -e "${GREEN} 3.${RESET} 更新 ShadowTLS 核心"
-        echo -e "${YELLOW} 4.${RESET} 一键更新全部核心"
-        echo -e "${YELLOW} 5.${RESET} 清理全部核心缓存"
+        echo -e "${YELLOW} 3.${RESET} 一键更新全部核心"
+        echo -e "${YELLOW} 4.${RESET} 清理全部核心缓存"
         echo -e " 0. 返回主菜单"
-        read -rp "输入数字 [0-5]: " cache_num
+        read -rp "输入数字 [0-4]: " cache_num
         case "$cache_num" in
             1) update_ss_rust_if_needed; report_update_result "SS-Rust" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
             2) update_xray_if_needed; report_update_result "Xray" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
-            3) update_shadowtls_if_needed; report_update_result "ShadowTLS" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
-            4)
+            3)
                 update_ss_rust_if_needed; report_update_result "SS-Rust" "$?"
                 update_xray_if_needed; report_update_result "Xray" "$?"
-                update_shadowtls_if_needed; report_update_result "ShadowTLS" "$?"
                 read -n 1 -s -r -p "按任意键继续..."
                 ;;
-            5)
+            4)
                 core_cache_clear_all
                 echo -e "${GREEN}✅ 本地核心缓存已清理。${RESET}"
                 read -n 1 -s -r -p "按任意键继续..."
@@ -2936,29 +2949,28 @@ ssr_cleanup_artifacts() {
         local sp; sp=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
         [[ -n "$sp" && "$sp" != "null" ]] && remove_firewall_rule "$sp" "both"
     fi
+    if [[ -f "$SS_V2RAY_CONF" ]]; then
+        local vp; vp=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
+        [[ -n "$vp" && "$vp" != "null" ]] && remove_firewall_rule "$vp" "tcp"
+    fi
+    if [[ -f "$SS_OBFS_CONF" ]]; then
+        local op; op=$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null)
+        [[ -n "$op" && "$op" != "null" ]] && remove_firewall_rule "$op" "tcp"
+    fi
     if [[ -f "/usr/local/etc/xray/config.json" ]]; then
         local xp; xp=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
         [[ -n "$xp" && "$xp" != "null" ]] && remove_firewall_rule "$xp" "tcp"
     fi
-    for s in /etc/systemd/system/shadowtls-*.service; do
-        [[ -f "$s" ]] || continue
-        remove_firewall_rule "$(basename "$s" | sed 's/shadowtls-//g' | sed 's/.service//g')" "tcp"
-    done
 
     stop_managed_service "ss-rust" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/run/ss-rust.pid"
+    stop_managed_service "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid"
+    stop_managed_service "ss-obfs" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/run/ss-obfs.pid"
     stop_managed_service "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"
-    rm -rf /etc/ss-rust /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service /var/log/ss-rust.log
+    rm -rf /etc/ss-rust /etc/ss-v2ray /etc/ss-obfs /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service /etc/systemd/system/ss-v2ray.service /etc/systemd/system/ss-obfs.service /var/log/ss-rust.log /var/log/ss-v2ray.log /var/log/ss-obfs.log
     rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service /var/log/xray.log
 
-    while read -r s; do
-        [[ -z "$s" ]] && continue
-        systemctl stop "$s" 2>/dev/null || true
-        systemctl disable "$s" 2>/dev/null || true
-        rm -f "/etc/systemd/system/$s"
-    done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep '^shadowtls-.*\.service$' || true)
-
     [[ -f "$DDNS_CONF" ]] && remove_cf_ddns "force" 2>/dev/null || true
-    rm -f /usr/local/bin/shadow-tls "$CONF_FILE" "$NAT_CONF_FILE" "$DDNS_CONF" "$DDNS_LOG" "$META_FILE"
+    rm -f /usr/local/bin/v2ray-plugin /usr/local/bin/obfs-server /usr/local/bin/obfs-local "$CONF_FILE" "$NAT_CONF_FILE" "$DDNS_CONF" "$DDNS_LOG" "$META_FILE" "$SS_V2RAY_STATE" "$SS_OBFS_STATE"
     rm -f /usr/local/bin/ssr /usr/local/bin/ssr.sh 2>/dev/null || true
     crontab -l 2>/dev/null | grep -vE "/usr/local/bin/ssr (auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)" | crontab - 2>/dev/null || true
     dns_unlock_restore 2>/dev/null || true
@@ -3022,22 +3034,24 @@ main_menu() {
     echo -e "${CYAN}       SSR 综合智能管理脚本 v${SCRIPT_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${YELLOW} 1.${RESET} 原生部署 SS-Rust"
-    echo -e "${YELLOW} 2.${RESET} 原生部署 VLESS Reality"
-    echo -e "${YELLOW} 3.${RESET} 🛡️ 部署 ShadowTLS (保护传统协议)"
+    echo -e "${YELLOW} 2.${RESET} 自动部署 SS2022 + v2ray-plugin"
+    echo -e "${YELLOW} 3.${RESET} 自动部署 SS2022 + obfs-local"
+    echo -e "${YELLOW} 4.${RESET} 原生部署 VLESS Reality"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${GREEN} 4.${RESET} 🔰 统一节点管控中心 (查看 / 删除 / 核爆)"
-    echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (手动常规/NAT + 清理)"
-    echo -e "${GREEN} 6.${RESET} 核心缓存与更新中心"
+    echo -e "${GREEN} 5.${RESET} 🔰 统一节点管控中心 (查看 / 修改端口 / 删除 / 核爆)"
+    echo -e "${YELLOW} 6.${RESET} 网络优化与系统清理 (手动常规/NAT + 清理)"
+    echo -e "${GREEN} 7.${RESET} 核心缓存与更新中心"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 返回上级菜单"
-    read -rp "请输入对应数字 [0-6]: " num
+    read -rp "请输入对应数字 [0-7]: " num
     case "$num" in
         1) install_ss_rust_native ;;
-        2) install_vless_native ;;
-        3) install_shadowtls_native ;;
-        4) unified_node_manager ;;
-        5) opt_menu ;;
-        6) core_cache_menu ;;
+        2) install_ss_v2ray_plugin_native ;;
+        3) install_ss_obfs_native ;;
+        4) install_vless_native ;;
+        5) unified_node_manager ;;
+        6) opt_menu ;;
+        7) core_cache_menu ;;
         0) return 1 ;;
         *) echo -e "${RED}请输入正确的选项！${RESET}" ;;
     esac
