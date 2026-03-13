@@ -777,6 +777,19 @@ restart_managed_service() {
     fi
 }
 
+smooth_handoff_service() {
+    local name="$1" bg_cmd="$2" bg_match="$3" log_file="$4" pid_file="$5"
+    if service_use_systemd; then
+        # 1. 异步发送优雅中止信号，老进程开始处理遗留连接，释放端口锁定
+        systemctl kill -s SIGTERM "$name" 2>/dev/null || true
+        # 2. 毫秒级排队启动新进程，瞬间接管端口，实现零掉线交接
+        systemctl start "$name" >/dev/null 2>&1 || true
+    else
+        # 无 systemd 环境则安全降级为普通重启
+        restart_managed_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"
+    fi
+}
+
 stop_managed_service() {
     local name="$1" bg_match="$2" pid_file="$3"
     if service_use_systemd; then
@@ -2552,7 +2565,7 @@ update_ss_rust_if_needed() {
 
     if cache_restore_binary_tag "ss-rust" "$latest" /usr/local/bin/ss-rust && (run_with_timeout 3 /usr/local/bin/ss-rust --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/ss-rust -V >/dev/null 2>&1); then
         meta_set "SS_RUST_TAG" "$latest"
-        restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
+        smooth_handoff_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
         return 0
     fi
 
@@ -2577,7 +2590,7 @@ update_ss_rust_if_needed() {
     safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || { rm -rf "$tmpdir"; return 2; }
     cache_store_binary "ss-rust" "$latest" /usr/local/bin/ss-rust >/dev/null 2>&1 || true
     meta_set "SS_RUST_TAG" "$latest"
-    restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
+    smooth_handoff_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
     rm -rf "$tmpdir"
     return 0
 }
@@ -2601,7 +2614,7 @@ update_xray_if_needed() {
 
     if cache_restore_binary_tag "xray" "$latest" /usr/local/bin/xray && run_with_timeout 3 /usr/local/bin/xray version >/dev/null 2>&1 && run_with_timeout 3 /usr/local/bin/xray x25519 >/dev/null 2>&1; then
         meta_set "XRAY_TAG" "$latest"
-        restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
+        smooth_handoff_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
         return 0
     fi
 
@@ -2622,7 +2635,7 @@ update_xray_if_needed() {
     safe_install_binary "${tmpdir}/xray" /usr/local/bin/xray || { rm -rf "$tmpdir"; return 2; }
     cache_store_binary "xray" "$latest" /usr/local/bin/xray >/dev/null 2>&1 || true
     meta_set "XRAY_TAG" "$latest"
-    restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
+    smooth_handoff_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
     rm -rf "$tmpdir"
     return 0
 }
