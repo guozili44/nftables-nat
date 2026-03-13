@@ -338,7 +338,8 @@ PYURL
 ss_make_userinfo() {
     if [[ "$1" == 2022-* ]]; then printf '%s:%s' "$(uri_encode "$1")" "$(uri_encode "$2")"
     else printf '%s' "${1}:${2}" | base64_nw; fi
-}port_listening_tcp() {
+}
+port_listening_tcp() {
     local port="$1"
     if have_cmd ss; then ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\])${port}$"
     elif have_cmd netstat; then netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\])${port}$"
