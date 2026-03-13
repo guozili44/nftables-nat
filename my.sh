@@ -1218,8 +1218,6 @@ force_kill_service() {
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
-    fi
-
     echo -e "${GREEN}✅ 目标服务 [${target_desc}] 已被强制清理完成！${RESET}"
     [[ "$from_menu" == "menu" ]] && sleep 2 || exit 0
 }
