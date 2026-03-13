@@ -88,7 +88,7 @@ install_modules() {
     mkdir -p "${MY_INSTALL_DIR}" 2>/dev/null || true
 
     # SSR 模块（已移除脚本自更新/卸载菜单，并适配 my 统一管理）
-    cat > "${SSR_MODULE_FILE}" <<'SSR_MODULE_EOF'
+    cat > "${SSR_MODULE_FILE}.tmp" <<'SSR_MODULE_EOF'
 #!/bin/bash
 # 脚本名称: SSR 综合管理脚本 (稳定优先 + 极致性能 Profiles)
 # 核心特性:
@@ -460,30 +460,6 @@ ss_make_userinfo() {
         printf '%s:%s' "$(uri_encode "$method")" "$(uri_encode "$password")"
     else
         printf '%s' "${method}:${password}" | base64_nw
-    fi
-}
-
-    {
-        for f in "$SHADOWTLS_STATE_DIR"/*.conf; do
-            [[ -e "$f" ]] || continue
-            basename "$f" .conf
-        done
-            [[ -e "$f" ]] || continue
-        done
-            [[ -e "$f" ]] || continue
-        done
-    } | awk '/^[0-9]+$/' | sort -n -u
-}
-
-    local p
-    while IFS= read -r p; do
-        [[ -n "$p" ]] || continue
-        remove_firewall_rule "$p" "tcp"
-        rm -f \
-            "${SHADOWTLS_STATE_DIR}/${p}.conf"
-
-    if service_use_systemd; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 }
 
@@ -987,6 +963,7 @@ net.core.netdev_max_backlog = ${backlog}
 fs.file-max = ${filemax}
 net.ipv4.tcp_fin_timeout = ${fin_timeout}
 net.ipv4.tcp_fastopen = 3
+net.ipv4.ip_local_port_range = 10240 65535
 EOF
 
     if [[ "$env" == "nat" ]]; then
@@ -2843,9 +2820,10 @@ main_menu() {
 }
 
 SSR_MODULE_EOF
+mv -f "${SSR_MODULE_FILE}.tmp" "${SSR_MODULE_FILE}"
 
     # NFT 模块（已移除脚本自更新/卸载菜单，并适配 my 统一管理）
-    cat > "${NFT_MODULE_FILE}" <<'NFT_MODULE_EOF'
+    cat > "${NFT_MODULE_FILE}.tmp" <<'NFT_MODULE_EOF'
 #!/bin/bash
 
 # nftables 端口转发管理面板 (Pro 智能优化版)
@@ -4071,9 +4049,10 @@ main_menu() {
 }
 
 NFT_MODULE_EOF
+mv -f "${NFT_MODULE_FILE}.tmp" "${NFT_MODULE_FILE}"
 
     # Nginx 反向代理模块（并入 my 统一管理，避免与 Certbot/多站点冲突）
-    cat > "${NGX_MODULE_FILE}" <<'NGX_MODULE_EOF'
+    cat > "${NGX_MODULE_FILE}.tmp" <<'NGX_MODULE_EOF'
 #!/bin/bash
 set -o pipefail
 
@@ -4201,6 +4180,7 @@ ngx_site_conf() {
 
 ngx_write_common_conf() {
     mkdir -p /etc/nginx/conf.d "$NGX_WEBROOT" "$NGX_TMP_DIR" "$NGX_META_DIR" 2>/dev/null || true
+    chmod 755 "$NGX_WEBROOT" 2>/dev/null || true
     cat > "$NGX_COMMON_CONF" <<'EOF'
 # managed-by=my-nginx-proxy
 map $http_upgrade $my_proxy_connection_upgrade {
@@ -4562,6 +4542,7 @@ nginx_menu() {
     done
 }
 NGX_MODULE_EOF
+mv -f "${NGX_MODULE_FILE}.tmp" "${NGX_MODULE_FILE}"
 
     chmod 755 "${SSR_MODULE_FILE}" "${NFT_MODULE_FILE}" "${NGX_MODULE_FILE}" 2>/dev/null || true
 }
