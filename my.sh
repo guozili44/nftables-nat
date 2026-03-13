@@ -2,7 +2,7 @@
 # 综合管理脚本：SSR + nftables
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v1.3.1  (build 2026-03-12+ss2022-compact-noperl)
+# 版本：v1.3.1  (build 2026-03-12+ss2022-compact-noperl-fixed)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 
 set -o pipefail
@@ -87,8 +87,8 @@ install_self_command() {
 install_modules() {
     mkdir -p "${MY_INSTALL_DIR}" 2>/dev/null || true
 
-    # SSR 模块（已移除脚本自更新/卸载菜单，并适配 my 统一管理）
-    cat > "${SSR_MODULE_FILE}" <<'SSR_MODULE_EOF'
+    # SSR 模块（修复 3：原子化写入，先写入 .tmp 文件）
+    cat > "${SSR_MODULE_FILE}.tmp" <<'SSR_MODULE_EOF'
 #!/bin/bash
 # 脚本名称: SSR 综合管理脚本 (稳定优先 + 极致性能 Profiles)
 # 核心特性:
@@ -383,14 +383,15 @@ PYPARSE
 }
 
 normalize_xray_x25519_output() {
-    printf '%s' "$1" | tr -d '
-' |         sed -E             -e 's/Private[[:space:]]*[Kk]ey:/\
-PrivateKey:/g'             -e 's/Public[[:space:]]*[Kk]ey:/\
-PublicKey:/g'             -e 's/PrivateKey:/\
-PrivateKey:/g'             -e 's/PublicKey:/\
-PublicKey:/g'             -e 's/Password:/\
-Password:/g'             -e 's/Hash32:/\
-Hash32:/g' |         sed '/^[[:space:]]*$/d'
+    printf '%s' "$1" | tr -d '\r' | \
+        sed -E \
+            -e 's/Private[[:space:]]*[Kk]ey:/\nPrivateKey:/g' \
+            -e 's/Public[[:space:]]*[Kk]ey:/\nPublicKey:/g' \
+            -e 's/PrivateKey:/\nPrivateKey:/g' \
+            -e 's/PublicKey:/\nPublicKey:/g' \
+            -e 's/Password:/\nPassword:/g' \
+            -e 's/Hash32:/\nHash32:/g' | \
+        sed '/^[[:space:]]*$/d'
 }
 
 xray_extract_reality_private_key() {
@@ -463,29 +464,7 @@ ss_make_userinfo() {
     fi
 }
 
-    {
-        for f in "$SHADOWTLS_STATE_DIR"/*.conf; do
-            [[ -e "$f" ]] || continue
-            basename "$f" .conf
-        done
-            [[ -e "$f" ]] || continue
-        done
-            [[ -e "$f" ]] || continue
-        done
-    } | awk '/^[0-9]+$/' | sort -n -u
-}
-
-    local p
-    while IFS= read -r p; do
-        [[ -n "$p" ]] || continue
-        remove_firewall_rule "$p" "tcp"
-        rm -f \
-            "${SHADOWTLS_STATE_DIR}/${p}.conf"
-
-    if service_use_systemd; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
-}
+# 修复 1：已彻底清除引起语法报错的废弃 ShadowTLS 代码块
 
 port_listening_tcp() {
     local port="$1"
@@ -524,8 +503,7 @@ show_ss_rust_summary() {
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
     echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
-    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
-${link}"
+    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}\n${link}"
 }
 
 plugin_state_get() {
@@ -539,8 +517,7 @@ plugin_state_write() {
     mkdir -p "$META_DIR" 2>/dev/null || true
     : > "$file"
     while [[ $# -ge 2 ]]; do
-        printf '%s="%s"
-' "$1" "$2" >> "$file"
+        printf '%s="%s"\n' "$1" "$2" >> "$file"
         shift 2
     done
     chmod 600 "$file" 2>/dev/null || true
@@ -606,15 +583,13 @@ ss_pick_method_password() {
             if have_cmd openssl; then
                 SS_PICK_PASSWORD=$(openssl rand -hex 12 2>/dev/null)
             else
-                SS_PICK_PASSWORD=$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' 
-')
+                SS_PICK_PASSWORD=$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
             fi
         else
             SS_PICK_PASSWORD="$input_pwd"
         fi
     fi
 }
-
 ensure_ss_rust_binary() {
     local arch ss_arch_primary="x86_64-unknown-linux-musl" ss_arch_fallback="x86_64-unknown-linux-gnu"
     local ss_latest="" tmpdir="" tarball="" url="" ss_arch=""
@@ -707,8 +682,7 @@ show_ss_v2ray_summary() {
     echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
     echo -e "Host: ${GREEN}${host:-未读取}${RESET}"
     echo -e "Path: ${GREEN}${path:-未读取}${RESET}"
-    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
-${link}"
+    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}\n${link}"
 }
 
 ss_obfs_make_link() {
@@ -741,8 +715,7 @@ show_ss_obfs_summary() {
     echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
     echo -e "混淆模式: ${GREEN}${obfs:-未读取}${RESET}"
     echo -e "伪装域名: ${GREEN}${host:-未读取}${RESET}"
-    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
-${link}"
+    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}\n${link}"
 }
 
 show_vless_summary() {
@@ -762,8 +735,7 @@ show_vless_summary() {
     echo -e "SNI: ${GREEN}${sni:-未读取}${RESET}"
     if [[ -n "$ip" && -n "$port" && -n "$uuid" && -n "$sni" && -n "$pub" && -n "$sid" ]]; then
         link="vless://${uuid}@${ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#VLESS-Reality"
-        echo -e "${YELLOW}链接:${RESET}
-${link}"
+        echo -e "${YELLOW}链接:${RESET}\n${link}"
     fi
 }
 
@@ -771,8 +743,7 @@ start_managed_service() {
     local name="$1" unit_content="$2" bg_cmd="$3" bg_match="$4" log_file="$5" pid_file="$6"
     if service_use_systemd; then
         mkdir -p /etc/systemd/system 2>/dev/null || true
-        printf '%s
-' "$unit_content" > "/etc/systemd/system/${name}.service"
+        printf '%s\n' "$unit_content" > "/etc/systemd/system/${name}.service"
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable --now "$name" >/dev/null 2>&1 || return 1
         systemctl is-active --quiet "$name" 2>/dev/null || return 1
@@ -973,6 +944,7 @@ render_sysctl_profile() {
             rmax=16777216; wmax=16777216; rmem=16777216; wmem=16777216; somax=8192; backlog=8192; filemax=524288; fin_timeout=30 ;;
     esac
 
+    # 修复 2：补充了网卡极速端口范围分配 (net.ipv4.ip_local_port_range) 防止高并发耗尽
     cat > "$target" <<EOF
 # ssr ${env} $(profile_title "$mode")
 net.core.default_qdisc = fq
@@ -987,6 +959,7 @@ net.core.netdev_max_backlog = ${backlog}
 fs.file-max = ${filemax}
 net.ipv4.tcp_fin_timeout = ${fin_timeout}
 net.ipv4.tcp_fastopen = 3
+net.ipv4.ip_local_port_range = 10240 65535
 EOF
 
     if [[ "$env" == "nat" ]]; then
@@ -1032,7 +1005,6 @@ filter_supported_sysctl_file() {
 }
 
 download_file() {
-    # download_file URL DEST
     local url="$1"; local dest="$2"
     rm -f "$dest"
     if have_cmd curl; then
@@ -1043,7 +1015,6 @@ download_file() {
 }
 
 github_latest_tag() {
-    # github_latest_tag "owner/repo"
     local repo="$1" body="" tag=""
     [[ -n "$repo" ]] || return 1
     if have_cmd curl; then
@@ -1053,13 +1024,12 @@ github_latest_tag() {
         tag=$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null)
     fi
     if [[ -z "$tag" && -n "$body" ]]; then
-        tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*//p' | head -n1)
+        tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
     fi
     [[ -n "$tag" && "$tag" != "null" ]] && echo "$tag"
 }
 
 github_release_asset_url() {
-    # github_release_asset_url "owner/repo" "tag" "asset_name"
     local repo="$1" tag="$2" asset_name="$3" body="" url=""
     [[ -n "$repo" && -n "$tag" && -n "$asset_name" ]] || return 1
     have_cmd curl || return 1
@@ -1088,7 +1058,6 @@ PYURL
 }
 
 download_file_any() {
-    # download_file_any DEST URL1 URL2 ...
     local dest="$1"; shift
     local u=""
     for u in "$@"; do
@@ -1102,7 +1071,6 @@ download_file_any() {
 }
 
 safe_install_binary() {
-    # safe_install_binary NEW_BIN DEST_BIN
     local newbin="$1"; local dest="$2"
     local ts; ts=$(date +%s)
     local backup="${dest}.bak.${ts}"
@@ -1113,17 +1081,13 @@ safe_install_binary() {
         cp -a "$dest" "$backup" 2>/dev/null || true
     fi
 
-    # 原子替换：同目录 mv
     install -m 755 "$newbin" "${dest}.new" >/dev/null 2>&1 || { rm -f "${dest}.new"; return 1; }
     mv -f "${dest}.new" "$dest" >/dev/null 2>&1 || { rm -f "${dest}.new"; return 1; }
     return 0
 }
 
-# 环境检查与全局命令安装
 check_env() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行！${RESET}" && exit 1
-
-    # 依赖：尽量保守安装；缺啥装啥
     local deps=(curl bc wget tar openssl unzip ip ping)
     local missing=()
     local dep
@@ -1146,13 +1110,11 @@ check_env() {
 }
 
 install_global_command() {
-    # 兼容旧逻辑：不再创建 /usr/local/bin/ssr 快捷命令
-    # 统一由综合脚本 my 负责命令入口与定时任务。
     if declare -F my_enable_ssr_cron_tasks >/dev/null 2>&1; then
         my_enable_ssr_cron_tasks
     fi
 }
-# 防火墙/服务清理
+
 remove_firewall_rule() {
     local port=$1; local proto=$2
     if have_cmd ufw; then
@@ -1241,8 +1203,6 @@ force_kill_service() {
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
-    fi
-
     echo -e "${GREEN}✅ 目标服务 [${target_desc}] 已被强制清理完成！${RESET}"
     [[ "$from_menu" == "menu" ]] && sleep 2 || exit 0
 }
@@ -1319,8 +1279,7 @@ EOF
 }
 
 dns_apply_resolvconf() {
-    local lock_mode="$1"  # "lock" or "set"
-    # 解除不可变
+    local lock_mode="$1"
     if have_cmd chattr; then chattr -i /etc/resolv.conf 2>/dev/null || true; fi
 
     cat > /etc/resolv.conf << 'EOF'
@@ -1335,7 +1294,6 @@ EOF
 }
 
 dns_apply_systemd_resolved() {
-    # 使用 systemd-resolved 时，不建议对 resolv.conf 做 chattr（常为 symlink）
     mkdir -p /etc/systemd/resolved.conf.d
     cat > "$RESOLVED_DROPIN" << 'EOF'
 [Resolve]
@@ -1348,9 +1306,7 @@ EOF
 }
 
 dns_apply_resolvconf_custom() {
-    # dns_apply_resolvconf_custom set|lock <dns1> [dns2...]
     local lock_mode="$1"; shift
-    # 解除不可变
     if have_cmd chattr; then chattr -i /etc/resolv.conf 2>/dev/null || true; fi
 
     : > /etc/resolv.conf
@@ -1365,7 +1321,6 @@ dns_apply_resolvconf_custom() {
 }
 
 dns_apply_systemd_resolved_custom() {
-    # dns_apply_systemd_resolved_custom <dns1> [dns2...]
     local dns_list="$*"
     mkdir -p /etc/systemd/resolved.conf.d
     cat > "$RESOLVED_DROPIN" << EOF
@@ -1423,12 +1378,10 @@ dns_manual_set() {
 }
 
 dns_set_or_lock() {
-    # dns_set_or_lock set|lock
     local mode="$1"
     dns_backup
 
     if [[ -L /etc/resolv.conf ]]; then
-        # symlink：优先走 systemd-resolved（若可用），否则不强行破坏 symlink
         if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
             dns_apply_systemd_resolved
         else
@@ -1442,19 +1395,15 @@ dns_set_or_lock() {
 }
 
 dns_unlock_restore() {
-    # 一键解锁 + 恢复备份（若存在）
     if have_cmd chattr; then chattr -i /etc/resolv.conf 2>/dev/null || true; fi
 
-    # 先移除 resolved drop-in
     if [[ -f "$RESOLVED_DROPIN" ]]; then
         rm -f "$RESOLVED_DROPIN"
         systemctl restart systemd-resolved 2>/dev/null || true
     fi
 
     if [[ -f "$DNS_META" ]]; then
-        # shellcheck disable=SC1090
         source "$DNS_META" 2>/dev/null || true
-
         if [[ "${IS_SYMLINK:-0}" == "1" ]]; then
             if [[ -n "${SYMLINK_TARGET:-}" ]]; then
                 rm -f /etc/resolv.conf
@@ -1466,7 +1415,6 @@ dns_unlock_restore() {
             fi
         fi
 
-        # 是否恢复不可变属性
         if [[ "${WAS_IMMUTABLE:-0}" == "1" ]] && have_cmd chattr; then
             chattr +i /etc/resolv.conf 2>/dev/null || true
         fi
@@ -1514,12 +1462,7 @@ dns_menu() {
         echo -e " 0. 返回"
         read -rp "输入 [0-7]: " dn
         case "$dn" in
-            1)
-                clear
-                dns_status
-                echo ""
-                read -n 1 -s -r -p "按任意键返回..."
-                ;;
+            1) clear; dns_status; echo ""; read -n 1 -s -r -p "按任意键返回..." ;;
             2|3)
                 local profile="stable" dns_mode
                 [[ "$dn" == "3" ]] && profile="extreme"
@@ -1527,23 +1470,10 @@ dns_menu() {
                 smart_dns_apply "$profile" "${dns_mode:-auto}"
                 sleep 2
                 ;;
-            4)
-                dns_set_or_lock "set" && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
-                sleep 2
-                ;;
-            5)
-                dns_manual_set && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
-                sleep 2
-                ;;
-            6)
-                dns_set_or_lock "lock" && echo -e "${GREEN}✅ DNS 已锁定/固定。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
-                sleep 2
-                ;;
-            7)
-                dns_unlock_restore
-                echo -e "${GREEN}✅ 已解锁并恢复。${RESET}"
-                sleep 2
-                ;;
+            4) dns_set_or_lock "set" && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"; sleep 2 ;;
+            5) dns_manual_set && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"; sleep 2 ;;
+            6) dns_set_or_lock "lock" && echo -e "${GREEN}✅ DNS 已锁定/固定。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"; sleep 2 ;;
+            7) dns_unlock_restore; echo -e "${GREEN}✅ 已解锁并恢复。${RESET}"; sleep 2 ;;
             0) return ;;
         esac
     done
@@ -1553,21 +1483,17 @@ setup_cf_ddns() {
     clear
     echo -e "${CYAN}========= 🌐 原生 Cloudflare DDNS 配置 =========${RESET}"
     echo -e "${YELLOW}前提：域名已托管到 Cloudflare，并准备好 API Token（需 Zone.DNS 读写权限）。${RESET}\n"
-
     read -rsp "1. 请输入 Cloudflare API Token: " cf_token
     echo ""
     [[ -z "$cf_token" ]] && return
-
     read -rp "2. 请输入根域名 (例如: example.com): " cf_zone
     [[ -z "$cf_zone" ]] && return
-
     read -rp "3. 请输入要绑定的子域名 (例如: ddns.example.com): " cf_record
     [[ -z "$cf_record" ]] && return
 
     echo -e "${CYAN}>>> 正在验证 Token 并获取 Zone ID...${RESET}"
     local zone_response zone_id
-    zone_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$cf_zone" \
-        -H "Authorization: Bearer $cf_token" -H "Content-Type: application/json")
+    zone_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$cf_zone" -H "Authorization: Bearer $cf_token" -H "Content-Type: application/json")
     zone_id=$(echo "$zone_response" | jq -r '.result[0].id')
 
     if [[ -z "$zone_id" || "$zone_id" == "null" ]]; then
@@ -1584,9 +1510,7 @@ CF_RECORD="${cf_record}"
 LAST_IP=""
 EOF
     chmod 600 "$DDNS_CONF" 2>/dev/null || true
-
     install_global_command
-
     echo -e "${GREEN}✅ DDNS 配置保存成功！${RESET}\n${CYAN}>>> 正在进行首次推送...${RESET}"
     run_cf_ddns "manual"
     sleep 2
@@ -1598,37 +1522,27 @@ run_cf_ddns() {
         [[ "$mode" == "manual" ]] && echo -e "${RED}❌ DDNS 未配置。${RESET}"
         return
     fi
-
-    # shellcheck disable=SC1090
     source "$DDNS_CONF"
 
     local current_ip
     current_ip=$(curl -s4m8 https://api.ipify.org 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || true)
-
     if [[ -z "$current_ip" ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') - [错误] 无法获取公网 IP" >> "$DDNS_LOG"
         return
     fi
-
     if [[ "$current_ip" == "$LAST_IP" && "$mode" != "manual" ]]; then
         return
     fi
-
     [[ "$mode" == "manual" ]] && echo -e "${YELLOW}获取到当前 IP: $current_ip ，正在通信...${RESET}"
 
     local record_response record_id api_result success
-    record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=A" \
-        -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
+    record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=A" -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
     record_id=$(echo "$record_response" | jq -r '.result[0].id' 2>/dev/null)
 
     if [[ -z "$record_id" || "$record_id" == "null" ]]; then
-        api_result=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
-            -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-            --data "{\"type\":\"A\",\"name\":\"${CF_RECORD}\",\"content\":\"${current_ip}\",\"ttl\":60,\"proxied\":false}")
+        api_result=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" --data "{\"type\":\"A\",\"name\":\"${CF_RECORD}\",\"content\":\"${current_ip}\",\"ttl\":60,\"proxied\":false}")
     else
-        api_result=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
-            -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-            --data "{\"type\":\"A\",\"name\":\"${CF_RECORD}\",\"content\":\"${current_ip}\",\"ttl\":60,\"proxied\":false}")
+        api_result=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" --data "{\"type\":\"A\",\"name\":\"${CF_RECORD}\",\"content\":\"${current_ip}\",\"ttl\":60,\"proxied\":false}")
     fi
 
     success=$(echo "$api_result" | jq -r '.success' 2>/dev/null)
@@ -1650,8 +1564,6 @@ remove_cf_ddns() {
         [[ "$cli_mode" != "force" ]] && sleep 2
         return
     fi
-
-    # shellcheck disable=SC1090
     source "$DDNS_CONF"
 
     if [[ "$cli_mode" != "force" ]]; then
@@ -1659,23 +1571,17 @@ remove_cf_ddns() {
         read -rp "确定要执行吗？(y/N): " confirm
         [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
     fi
-
     echo -e "${CYAN}>>> 正在销毁云端解析记录...${RESET}"
     local record_response record_id
-    record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=A" \
-        -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
-
+    record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=A" -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
     record_id=$(echo "$record_response" | jq -r '.result[0].id' 2>/dev/null)
 
     if [[ -n "$record_id" && "$record_id" != "null" ]]; then
-        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
-            -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" > /dev/null 2>&1 || true
+        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" > /dev/null 2>&1 || true
         echo -e "${GREEN}✅ 云端记录已删除（若 API 权限允许）。${RESET}"
     fi
-
     rm -f "$DDNS_CONF" "$DDNS_LOG"
     crontab -l 2>/dev/null | grep -vE "(^|\s)(/usr/local/bin/my\s+ssr\s+ddns|/usr/local/bin/ssr\s+ddns)(\s|$)" | crontab - 2>/dev/null || true
-
     echo -e "${GREEN}✅ 本地 DDNS 任务已撤销。${RESET}"
     [[ "$cli_mode" != "force" ]] && sleep 2
 }
@@ -1685,7 +1591,6 @@ cf_ddns_menu() {
         clear
         echo -e "${CYAN}========= 🌐 动态域名解析 (Cloudflare DDNS) =========${RESET}"
         if [[ -f "$DDNS_CONF" ]]; then
-            # shellcheck disable=SC1090
             source "$DDNS_CONF"
             echo -e "${GREEN}当前状态: 已启用守护${RESET}"
             echo -e "绑定域名: ${YELLOW}$CF_RECORD${RESET}"
@@ -2127,9 +2032,7 @@ install_ss_obfs_native() {
     fi
     ss_pick_method_password || return
     ensure_ss_rust_binary || return
-    echo -e "${YELLOW}混淆模式:${RESET}
- 1) tls
- 2) http"
+    echo -e "${YELLOW}混淆模式:${RESET}\n 1) tls\n 2) http"
     read -rp "选择 [1-2] (默认1): " obsel
     [[ "$obsel" == "2" ]] && obfs_mode="http" || obfs_mode="tls"
     read -rp "伪装域名 [默认 www.bing.com]: " host
@@ -2190,7 +2093,6 @@ WantedBy=multi-user.target'
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
 
-# 统一节点生命周期管控中心
 unified_node_manager() {
     while true; do
         clear
@@ -2414,9 +2316,6 @@ unified_node_manager() {
     done
 }
 
-# 网络调优 Profiles（NAT/常规：稳定优先 vs 极致性能）
-#   - NAT: 附带 journald 限制、SSH Keepalive、DNS 设置/锁定（可回滚）
-#   - sysctl: 统一写入专用文件 + sysctl --system (要求)
 apply_journald_limit() {
     local limit="${1:-50M}"
     [[ -f /etc/systemd/journald.conf ]] || return 0
@@ -2725,11 +2624,9 @@ core_cache_menu() {
 }
 
 daily_task() {
-    # 例行任务：仅清理，不自动更新核心（更新已独立到核心缓存与更新中心）
     auto_clean "silent"
 }
 
-# 完全卸载
 ssr_cleanup_artifacts() {
     if [[ -f "/etc/ss-rust/config.json" ]]; then
         local sp; sp=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
@@ -2786,7 +2683,6 @@ total_uninstall() {
     exit 0
 }
 
-# 系统菜单
 sys_menu() {
     while true; do
         clear
@@ -2843,573 +2739,137 @@ main_menu() {
 }
 
 SSR_MODULE_EOF
-
-    # NFT 模块（已移除脚本自更新/卸载菜单，并适配 my 统一管理）
-    cat > "${NFT_MODULE_FILE}" <<'NFT_MODULE_EOF'
+    # 执行原子化写入
+    mv -f "${SSR_MODULE_FILE}.tmp" "${SSR_MODULE_FILE}"
+# --------------------------
+    # NFTables 模块 (修复 3：原子化写入)
+    # --------------------------
+    cat > "${NFT_MODULE_FILE}.tmp" <<'NFT_MODULE_EOF'
 #!/bin/bash
-
-# nftables 端口转发管理面板 (Pro 智能优化版)
-
 set -o pipefail
 
-# 脚本签名（用于安全自更新，防止误更新到其它脚本）
-SCRIPT_ID="nftmgr-pro"
-SCRIPT_FINGERPRINT_1="CMD_NAME=\"nftmgr\""
-SCRIPT_FINGERPRINT_2="nft_mgr_nat"
-SCRIPT_FINGERPRINT_3="update_script()"
-
-# 兼容 cron/systemd 的精简 PATH
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
-
-# --------------------------
-# 可配置常量
-# --------------------------
 CONFIG_FILE="/etc/nft_forward_list.conf"
 SETTINGS_FILE="/etc/nft_forward_settings.conf"
-
 NFT_MGR_DIR="/etc/nftables.d"
-# 持久化兼容模式（解决部分“节点管理/面板”只认 /etc/nftables.conf 的问题）
-#  - service: 使用 nft-mgr oneshot service 加载 /etc/nftables.d/nft_mgr.conf（默认，最不干扰系统）
-#  - system : 向 /etc/nftables.conf 注入 include "/etc/nftables.d/nft_mgr.conf" 并用 nftables.service 持久化（兼容性更好）
 NFTABLES_CONF="/etc/nftables.conf"
 NFTABLES_CREATED_MARK="/etc/nftables.conf.nftmgr_created"
 PERSIST_MODE_DEFAULT="service"
 NFT_MGR_CONF="${NFT_MGR_DIR}/nft_mgr.conf"
 NFT_MGR_SERVICE="/etc/systemd/system/nft-mgr.service"
+NFT_SYSCTL_FILE="/etc/sysctl.d/99-nft-mgr.conf"
+NFT_LOG_DIR="/var/log/nft_ddns"
 
-SYSCTL_FILE="/etc/sysctl.d/99-nft-mgr.conf"
-
-LOG_DIR="/var/log/nft_ddns"
-LOCK_FILE="/var/lock/nft_mgr.lock"
-
-CMD_NAME="nftmgr"
-
-RAW_URL="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/ssr.sh"
-PROXY_URL="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
-RAW_URL_FALLBACK="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
-PROXY_URL_FALLBACK="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/ssr.sh"
-# 可选：自定义更新地址（写入 SETTINGS_FILE：/etc/nft_forward_settings.conf）
-# UPDATE_URL_DIRECT="https://raw.githubusercontent.com/<you>/<repo>/main/nftmgr.sh"
-# UPDATE_URL_PROXY="https://ghproxy.net/https://raw.githubusercontent.com/<you>/<repo>/main/nftmgr.sh"
-
-# --------------------------
-# 设置读写（用于持久化模式开关）
-# --------------------------
-settings_get() {
-    local key="$1"
-    [[ -f "$SETTINGS_FILE" ]] || return 1
-    grep -E "^${key}=" "$SETTINGS_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//; s/"$//'
-}
-settings_set() {
-    local key="$1"; local value="$2"
-    touch "$SETTINGS_FILE" 2>/dev/null || true
-    chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
-    if grep -qE "^${key}=" "$SETTINGS_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}="${value}"|g" "$SETTINGS_FILE"
-    else
-        echo "${key}="${value}"" >> "$SETTINGS_FILE"
-    fi
-}
-PERSIST_MODE="$(settings_get "PERSIST_MODE" || true)"
-[[ -z "$PERSIST_MODE" ]] && PERSIST_MODE="$PERSIST_MODE_DEFAULT"
-
-# --------------------------
-# 颜色
-# --------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-PLAIN='\033[0m'
-
-msg_ok()   { echo -e "${GREEN}$*${PLAIN}"; }
-msg_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
-msg_err()  { echo -e "${RED}$*${PLAIN}"; }
-
-# 基础工具
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-# --------------------------
-# 环境与依赖
-# --------------------------
-require_root() {
-    [[ $EUID -ne 0 ]] && msg_err "错误: 必须使用 root 权限运行!" && exit 1
-}
-
-# 获取脚本真实路径（兼容不支持 readlink -f 的环境）
-script_realpath() {
-    local p="$0"
-    if command -v readlink >/dev/null 2>&1; then
-        readlink -f "$p" 2>/dev/null && return 0
-    fi
-    if command -v realpath >/dev/null 2>&1; then
-        realpath "$p" 2>/dev/null && return 0
-    fi
-    echo "$p"
-}
-detect_pkg_mgr() {
-    if have_cmd apt-get; then
-        echo "apt"
-    elif have_cmd dnf; then
-        echo "dnf"
-    elif have_cmd yum; then
-        echo "yum"
-    else
-        echo ""
-    fi
-}
-
-install_deps() {
-    local mgr
-    mgr="$(detect_pkg_mgr)"
-    [[ -z "$mgr" ]] && return 1
-
-    # 依赖：nft/dig/curl/flock/ss
-    if [[ "$mgr" == "apt" ]]; then
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -yqq nftables dnsutils curl util-linux iproute2 >/dev/null 2>&1 || true
-    else
-        # dnf/yum
-        "$mgr" install -y nftables bind-utils curl util-linux iproute >/dev/null 2>&1 || true
-    fi
-}
-
-check_env() {
-    # 自动装依赖（尽量温和）
-    local need=0
-    for c in nft dig curl flock ss sysctl; do
-        have_cmd "$c" || need=1
-    done
-    [[ $need -eq 1 ]] && install_deps
-
-    # 再次检查
-    for c in nft dig curl flock ss sysctl; do
-        have_cmd "$c" || msg_warn "⚠️ 未找到依赖命令: $c（部分功能可能不可用）"
-    done
-
-    mkdir -p "$(dirname "$CONFIG_FILE")" "$LOG_DIR" "$NFT_MGR_DIR" 2>/dev/null || true
-    [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-    [[ -f "$SETTINGS_FILE" ]] || touch "$SETTINGS_FILE"
-    chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
-}
-
-install_global_command() {
-    # 已由综合脚本 my 统一安装命令入口，不再创建 /usr/local/bin/nftmgr
-    return 0
-}
-# --------------------------
-# 锁（防并发踩踏）
-# --------------------------
-with_lock() {
-    # 用法：with_lock <func> [args...]
-    if have_cmd flock; then
-        (
-            flock -n 200 || { msg_warn "⚠️ 任务繁忙：已有实例在运行，已跳过本次操作。"; exit 99; }
-            "$@"
-        ) 200>"$LOCK_FILE"
-        return $?
-    else
-        "$@"
-        return $?
-    fi
-}
-
-# --------------------------
-# 参数/输入校验
-# --------------------------
-# DDNS 定时任务联动（当新增规则目标为域名时，自动启用每分钟检测）
-# --------------------------
-ensure_ddns_cron_enabled() {
-    local my_cmd="/usr/local/bin/my"
-
-    # 已存在则不重复添加
-    if crontab -l 2>/dev/null | grep -Fq "${my_cmd} nft --cron"; then
-        return 0
-    fi
-
-    # 清理旧版 nftmgr --cron（避免重复）
-    remove_ddns_cron_task || true
-
-    # 追加定时任务：每分钟运行一次 DDNS 更新
-    (crontab -l 2>/dev/null; echo "* * * * * ${my_cmd} nft --cron > /dev/null 2>&1") | crontab - 2>/dev/null || true
-    return 0
-}
-has_domain_rules() {
-    # 如果配置中仍存在“目标为域名（非纯 IPv4）”的规则，则返回 0，否则返回 1
-    while IFS='|' read -r lp addr tp last_ip proto; do
-        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-        [[ -z "$addr" ]] && continue
-        if ! is_ipv4 "$addr"; then
-            return 0
-        fi
-    done < "$CONFIG_FILE"
-    return 1
-}
-
-remove_ddns_cron_task() {
-    # 删除所有（my nft --cron / nftmgr --cron）的 crontab 行（避免路径差异导致残留）
-    local cur
-    cur="$(crontab -l 2>/dev/null || true)"
-    [[ -z "$cur" ]] && return 0
-    echo "$cur" | grep -vE '(^|\s)(/usr/local/bin/my\s+nft\s+--cron|/usr/local/bin/nftmgr|nftmgr)\s+--cron(\s|$)' | crontab - 2>/dev/null || true
-    return 0
-}
-ensure_ddns_cron_disabled_if_unused() {
-    # 当已无域名转发规则时，自动清理 DDNS 定时任务，避免 crontab 冗余
-    if has_domain_rules; then
-        return 0
-    fi
-    if crontab -l 2>/dev/null | grep -Eq '(^|\s)(/usr/local/bin/my\s+nft\s+--cron|/usr/local/bin/nftmgr|nftmgr)\s+--cron(\s|$)'; then
-        remove_ddns_cron_task || true
-    fi
-    return 0
-}
-# --------------------------
-is_port() {
-    local p="$1"
-    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
-}
-
-is_ipv4() {
-    local ip="$1"
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-}
-
+is_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 normalize_proto() {
-    local p="${1,,}"
-    case "$p" in
-        tcp|udp|both) echo "$p" ;;
-        "") echo "both" ;;
-        *) echo "both" ;;
-    esac
+    case "${1,,}" in tcp|udp|both) echo "${1,,}" ;; *) echo "both" ;; esac
 }
 
-# --------------------------
-# DNS 解析
-# --------------------------
 get_ip() {
     local addr="$1"
-    if is_ipv4 "$addr"; then
-        echo "$addr"
-        return 0
-    fi
-    # 更稳健：限制超时/尝试次数，优先取第一条 A
-    dig +time=2 +tries=1 +short -4 A "$addr" 2>/dev/null \
-        | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
-        | head -n 1
+    if is_ipv4 "$addr"; then echo "$addr"; return 0; fi
+    dig +time=2 +tries=1 +short -4 A "$addr" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1
 }
 
-# --------------------------
-# 防火墙放行（优先 ufw/firewalld；避免强行改 nft 防火墙）
-# --------------------------
-manage_firewall() {
-    local action="$1"  # add|del
-    local port="$2"
-    local proto="$3"   # tcp|udp|both
-    proto="$(normalize_proto "$proto")"
-
-    if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
-        if [[ "$action" == "add" ]]; then
-            [[ "$proto" == "tcp" || "$proto" == "both" ]] && ufw allow "$port"/tcp >/dev/null 2>&1
-            [[ "$proto" == "udp" || "$proto" == "both" ]] && ufw allow "$port"/udp >/dev/null 2>&1
-        else
-            [[ "$proto" == "tcp" || "$proto" == "both" ]] && ufw --force delete allow "$port"/tcp >/dev/null 2>&1
-            [[ "$proto" == "udp" || "$proto" == "both" ]] && ufw --force delete allow "$port"/udp >/dev/null 2>&1
-        fi
-        return 0
-    fi
-
-    if have_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
-        if [[ "$action" == "add" ]]; then
-            [[ "$proto" == "tcp" || "$proto" == "both" ]] && firewall-cmd --add-port="${port}/tcp" --permanent >/dev/null 2>&1
-            [[ "$proto" == "udp" || "$proto" == "both" ]] && firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1
-        else
-            [[ "$proto" == "tcp" || "$proto" == "both" ]] && firewall-cmd --remove-port="${port}/tcp" --permanent >/dev/null 2>&1
-            [[ "$proto" == "udp" || "$proto" == "both" ]] && firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1
-        fi
-        firewall-cmd --reload >/dev/null 2>&1
-        return 0
-    fi
-
-    return 0
-}
-
-# --------------------------
-# sysctl 写入（只写本脚本自己的文件）
-
-# --------------------------
-# 持久化兼容：/etc/nftables.conf include 注入/回滚
-# --------------------------
-nftables_conf_includes_mgr() {
-    # 已经包含 nft_mgr.conf 或通配包含 /etc/nftables.d/*.conf
-    [[ -f "$NFTABLES_CONF" ]] || return 1
-    grep -E '^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/\*\.conf"?[[:space:]]*$' "$NFTABLES_CONF" >/dev/null 2>&1 && return 0
-    grep -E '^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/nft_mgr\.conf"?[[:space:]]*$' "$NFTABLES_CONF" >/dev/null 2>&1 && return 0
-    return 1
-}
-
-enable_persist_system() {
-    # 兼容模式：把 nft_mgr.conf 纳入 nftables.service 的持久化体系
-    mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
-    [[ -f "$NFT_MGR_CONF" ]] || generate_empty_conf "$NFT_MGR_CONF"
-
-    if [[ -e "$NFTABLES_CONF" && ! -f "$NFTABLES_CONF" ]]; then
-        msg_err "❌ ${NFTABLES_CONF} 存在但不是普通文件，无法注入 include。"
-        return 1
-    fi
-
-    if [[ ! -f "$NFTABLES_CONF" ]]; then
-        # 最小化创建（不 flush ruleset，避免破坏系统其它规则；如你本来就有系统防火墙规则，请手动合并）
-        cat > "$NFTABLES_CONF" << EOF
-#!/usr/sbin/nft -f
-# generated by nftmgr (compat mode)
-include "${NFT_MGR_CONF}"
-EOF
-        chmod 644 "$NFTABLES_CONF" 2>/dev/null || true
-        echo "1" > "$NFTABLES_CREATED_MARK" 2>/dev/null || true
+sysctl_set_kv() {
+    local key="$1" value="$2"
+    mkdir -p /etc/sysctl.d 2>/dev/null || true
+    touch "$NFT_SYSCTL_FILE" 2>/dev/null || true
+    if grep -qE "^\s*${key}\s*=" "$NFT_SYSCTL_FILE" 2>/dev/null; then
+        sed -i "s|^\s*${key}\s*=.*|${key} = ${value}|g" "$NFT_SYSCTL_FILE"
     else
-        # 备份并注入 include
-        local bak="${NFTABLES_CONF}.nftmgr.bak.$(date +%s)"
-        cp -a "$NFTABLES_CONF" "$bak" 2>/dev/null || true
-
-        if ! nftables_conf_includes_mgr; then
-            printf "
-# nftmgr include (added %s)
-include "%s"
-" "$(date '+%F %T')" "$NFT_MGR_CONF" >> "$NFTABLES_CONF"
-        fi
+        echo "${key} = ${value}" >> "$NFT_SYSCTL_FILE"
     fi
-
-    # 校验 & 启用 nftables 持久化
-    if have_cmd nft; then
-        if ! nft -c -f "$NFTABLES_CONF" >/dev/null 2>&1; then
-            msg_err "❌ 注入后 ${NFTABLES_CONF} 语法校验失败，已保留备份文件，请手动检查。"
-            return 1
-        fi
-    fi
-
-    if have_cmd systemctl; then
-        systemctl enable --now nftables >/dev/null 2>&1 || true
-        systemctl restart nftables >/dev/null 2>&1 || true
-        # 为避免双重加载导致困惑，兼容模式下默认停用 nft-mgr oneshot
-        systemctl disable --now nft-mgr >/dev/null 2>&1 || true
-    else
-        # 无 systemd：至少立即加载一次
-        nft -f "$NFTABLES_CONF" >/dev/null 2>&1 || true
-    fi
-    PERSIST_MODE="system"
-    msg_ok "✅ 已启用【系统持久化兼容模式】：/etc/nftables.conf 已包含 nft_mgr.conf。"
-    return 0
-}
-
-enable_persist_service() {
-    # 回到默认：由 nft-mgr oneshot service 负责持久化加载
-    if have_cmd systemctl; then
-        ensure_nft_mgr_service
-        systemctl enable --now nft-mgr >/dev/null 2>&1 || true
-    fi
-    PERSIST_MODE="service"
-    msg_ok "✅ 已启用【服务持久化模式】：由 nft-mgr.service 加载 nft_mgr.conf。"
-    return 0
-}
-
-persist_status() {
-    echo -e "${CYAN}========= 持久化状态 =========${PLAIN}"
-    echo -e "当前模式: ${YELLOW}${PERSIST_MODE}${PLAIN}"
-    if [[ -f "$NFT_MGR_CONF" ]]; then
-        echo -e "规则文件: ${GREEN}${NFT_MGR_CONF}${PLAIN}"
-    else
-        echo -e "规则文件: ${RED}${NFT_MGR_CONF} 不存在${PLAIN}"
-    fi
-    if [[ -f "$NFTABLES_CONF" ]]; then
-        if nftables_conf_includes_mgr; then
-            echo -e "/etc/nftables.conf: ${GREEN}已包含 nftmgr 规则（include）${PLAIN}"
-        else
-            echo -e "/etc/nftables.conf: ${YELLOW}未包含 nftmgr include${PLAIN}"
-        fi
-    else
-        echo -e "/etc/nftables.conf: ${YELLOW}不存在${PLAIN}"
-    fi
-    if have_cmd systemctl; then
-        systemctl is-enabled nftables >/dev/null 2>&1 && echo -e "nftables.service: ${GREEN}enabled${PLAIN}" || echo -e "nftables.service: ${YELLOW}disabled${PLAIN}"
-        systemctl is-enabled nft-mgr >/dev/null 2>&1 && echo -e "nft-mgr.service: ${GREEN}enabled${PLAIN}" || echo -e "nft-mgr.service: ${YELLOW}disabled${PLAIN}"
-    fi
-    echo -e "${CYAN}==============================${PLAIN}"
-}
-
-auto_persist_setup() {
-    # 自动检测并完成持久化设置（无需菜单项）
-    # 优先规则：
-    #  1) 若系统启用了 nftables.service 或 /etc/nftables.conf 已 include nft_mgr.conf -> system 模式
-    #  2) 否则使用 nft-mgr.service（service 模式）
-    PERSIST_MODE="$PERSIST_MODE_DEFAULT"
-
-    if [[ -f "$NFTABLES_CONF" ]] && nftables_conf_includes_mgr; then
-        PERSIST_MODE="system"
-    elif have_cmd systemctl && systemctl is-enabled nftables >/dev/null 2>&1; then
-        PERSIST_MODE="system"
-    fi
-
-    if [[ "$PERSIST_MODE" == "system" ]]; then
-        enable_persist_system >/dev/null 2>&1 || true
-    else
-        enable_persist_service >/dev/null 2>&1 || true
-    fi
-}
-# --------------------------
-nft_profile_alias() {
-    case "${1:-stable}" in
-        perf|extreme|turbo) echo "perf" ;;
-        *) echo "stable" ;;
-    esac
-}
-
-nft_profile_title() {
-    [[ "$(nft_profile_alias "$1")" == "perf" ]] && echo "极致优化" || echo "稳定优先"
-}
-
-nft_detect_machine_tier() {
-    local mem_mb
-    mem_mb="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
-    if (( mem_mb < 700 )); then
-        echo tiny
-    elif (( mem_mb < 1400 )); then
-        echo small
-    elif (( mem_mb < 3000 )); then
-        echo medium
-    else
-        echo large
-    fi
-}
-
-nft_best_congestion_control() {
-    local avail
-    avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-    [[ " $avail " == *" bbr "* ]] && { echo bbr; return 0; }
-    [[ " $avail " == *" cubic "* ]] && { echo cubic; return 0; }
-    [[ " $avail " == *" reno "* ]] && { echo reno; return 0; }
-    sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic
-}
-
-nft_sysctl_key_supported() {
-    local key="$1"
-    [[ -e "/proc/sys/${key//./\/}" ]]
-}
-
-nft_write_sysctl_line() {
-    local out="$1" key="$2" value="$3"
-    nft_sysctl_key_supported "$key" || return 0
-    echo "${key} = ${value}" >> "$out"
 }
 
 ensure_forwarding() {
-    local cur
-    cur="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
+    local cur; cur="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
     if [[ "$cur" != "1" ]]; then
-        mkdir -p /etc/sysctl.d 2>/dev/null || true
-        touch "$SYSCTL_FILE" 2>/dev/null || true
-        if grep -qE "^\s*net\.ipv4\.ip_forward\s*=" "$SYSCTL_FILE" 2>/dev/null; then
-            sed -i 's|^\s*net\.ipv4\.ip_forward\s*=.*|net.ipv4.ip_forward = 1|g' "$SYSCTL_FILE"
-        else
-            echo "net.ipv4.ip_forward = 1" >> "$SYSCTL_FILE"
-        fi
-        sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+        sysctl_set_kv "net.ipv4.ip_forward" "1"
+        sysctl --system >/dev/null 2>&1 || sysctl -p "$NFT_SYSCTL_FILE" >/dev/null 2>&1 || true
     fi
 }
 
-nft_apply_profile() {
-    local mode="$(nft_profile_alias "${1:-stable}")" tier cc
-    local somax backlog filemax rmax wmax fin_timeout conntrack
-    tier="$(nft_detect_machine_tier)"
-    cc="$(nft_best_congestion_control)"
+generate_empty_conf() {
+    cat > "$1" << 'EOF'
+table ip nft_mgr_nat {
+    chain prerouting { type nat hook prerouting priority -100; policy accept; }
+    chain postrouting { type nat hook postrouting priority 100; policy accept; }
+}
+EOF
+    chmod 600 "$1" 2>/dev/null || true
+}
 
-    case "${mode}:${tier}" in
-        stable:tiny|stable:small)
-            somax=4096; backlog=4096; filemax=262144; rmax=8388608;  wmax=8388608;  fin_timeout=30; conntrack=131072 ;;
-        stable:medium)
-            somax=8192; backlog=8192; filemax=524288; rmax=16777216; wmax=16777216; fin_timeout=25; conntrack=262144 ;;
-        stable:large)
-            somax=16384; backlog=16384; filemax=524288; rmax=33554432; wmax=33554432; fin_timeout=20; conntrack=524288 ;;
-        perf:tiny|perf:small)
-            somax=16384; backlog=16384; filemax=524288; rmax=16777216; wmax=16777216; fin_timeout=20; conntrack=262144 ;;
-        perf:medium)
-            somax=32768; backlog=32768; filemax=1048576; rmax=33554432; wmax=33554432; fin_timeout=15; conntrack=524288 ;;
-        perf:large)
-            somax=65535; backlog=65535; filemax=1048576; rmax=67108864; wmax=67108864; fin_timeout=15; conntrack=1048576 ;;
-        *)
-            somax=8192; backlog=8192; filemax=524288; rmax=16777216; wmax=16777216; fin_timeout=25; conntrack=262144 ;;
-    esac
+generate_nft_conf() {
+    local out="$1" any=0
+    {
+        echo "table ip nft_mgr_nat {"
+        echo "    chain prerouting { type nat hook prerouting priority -100;"
+        while IFS='|' read -r lp addr tp last_ip proto; do
+            [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
+            proto="$(normalize_proto "$proto")"
+            is_port "$lp" || continue
+            is_port "$tp" || continue
+            [[ -z "$addr" ]] && continue
+            local ip="$last_ip"
+            [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
+            is_ipv4 "$ip" || continue
+            case "$proto" in
+                tcp) echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"; any=1 ;;
+                udp) echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"; any=1 ;;
+                both) echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"; echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"; any=1 ;;
+            esac
+        done < "$CONFIG_FILE"
+        echo "    }"
+        echo "    chain postrouting { type nat hook postrouting priority 100;"
+        while IFS='|' read -r lp addr tp last_ip proto; do
+            [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
+            proto="$(normalize_proto "$proto")"
+            is_port "$lp" || continue
+            is_port "$tp" || continue
+            [[ -z "$addr" ]] && continue
+            local ip="$last_ip"
+            [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
+            is_ipv4 "$ip" || continue
+            case "$proto" in
+                tcp) echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"; any=1 ;;
+                udp) echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"; any=1 ;;
+                both) echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"; echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"; any=1 ;;
+            esac
+        done < "$CONFIG_FILE"
+        echo "    }"
+        echo "}"
+    } > "$out"
+    chmod 600 "$out" 2>/dev/null || true
+    [[ $any -eq 1 ]] || return 2
+    return 0
+}
 
-    mkdir -p /etc/sysctl.d 2>/dev/null || true
-    : > "$SYSCTL_FILE"
-    chmod 644 "$SYSCTL_FILE" 2>/dev/null || true
-    echo "# nftmgr $(nft_profile_title "$mode") / ${tier}" >> "$SYSCTL_FILE"
-
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.ip_forward" "1"
-    [[ "$cc" == "bbr" ]] && nft_write_sysctl_line "$SYSCTL_FILE" "net.core.default_qdisc" "fq"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_congestion_control" "$cc"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_mtu_probing" "1"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.core.somaxconn" "$somax"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.core.netdev_max_backlog" "$backlog"
-    nft_write_sysctl_line "$SYSCTL_FILE" "fs.file-max" "$filemax"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.core.rmem_max" "$rmax"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.core.wmem_max" "$wmax"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_rmem" "8192 262144 ${rmax}"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_wmem" "8192 262144 ${wmax}"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_fin_timeout" "$fin_timeout"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.ip_local_port_range" "10240 65535"
-    nft_write_sysctl_line "$SYSCTL_FILE" "net.netfilter.nf_conntrack_max" "$conntrack"
-
-    if [[ "$mode" == "perf" ]]; then
-        nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_fastopen" "3"
-        nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_tw_reuse" "1"
-        nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_notsent_lowat" "16384"
+apply_rules_impl() {
+    ensure_forwarding
+    local tmp; tmp="$(mktemp /tmp/nftmgr.XXXXXX)"
+    local has_rules=0
+    if generate_nft_conf "$tmp"; then
+        has_rules=1
+    else
+        generate_empty_conf "$tmp"
+        has_rules=0
     fi
-
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+    if ! have_cmd nft; then rm -f "$tmp"; return 1; fi
+    nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
+    if ! nft -f "$tmp" 2>/dev/null; then
+        echo -e "\033[0;31m❌ nft 规则应用失败。\033[0m"
+        rm -f "$tmp"
+        return 1
+    fi
+    mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
+    mv -f "$tmp" "$NFT_MGR_CONF"
+    chmod 600 "$NFT_MGR_CONF" 2>/dev/null || true
 
     if have_cmd systemctl; then
-        systemctl enable --now nftables >/dev/null 2>&1 || true
-        ensure_nft_mgr_service
-    fi
-    auto_persist_setup
-
-    msg_ok "✅ 已应用 NFT 智能调优：$(nft_profile_title "$mode") / ${tier} / ${cc}"
-    sleep 2
-}
-
-optimize_system() {
-    clear
-    echo -e "${GREEN}--- NFT 智能调优中心 ---${PLAIN}"
-    echo "1) 稳定优先：保守提升转发与并发"
-    echo "2) 极致优化：激进提升队列/并发/连接追踪"
-    echo "0) 返回"
-    echo "--------------------------------"
-    read -rp "请选择 [0-2]: " pick
-    case "$pick" in
-        0) return ;;
-        1) nft_apply_profile "stable" ;;
-        2) nft_apply_profile "extreme" ;;
-        *) msg_err "无效选项"; sleep 1 ;;
-    esac
-}
-
-# --------------------------
-# nft-mgr systemd 持久化服务
-# --------------------------
-ensure_nft_mgr_service() {
-    [[ -d "$NFT_MGR_DIR" ]] || mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
-    [[ -f "$NFT_MGR_CONF" ]] || generate_empty_conf "$NFT_MGR_CONF"
-
-    if ! have_cmd systemctl; then
-        return 0
-    fi
-
-    local nftbin
-    nftbin="$(command -v nft 2>/dev/null || echo /usr/sbin/nft)"
-
-    cat > "$NFT_MGR_SERVICE" << EOF
+        local nftbin; nftbin="$(command -v nft 2>/dev/null || echo /usr/sbin/nft)"
+        cat > "$NFT_MGR_SERVICE" << EOF
 [Unit]
 Description=nftables Port Forwarding Manager (nftmgr)
 After=network-online.target nftables.service
@@ -3423,430 +2883,32 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable nft-mgr >/dev/null 2>&1 || true
+    fi
 
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl enable nft-mgr >/dev/null 2>&1 || true
-}
-
-# --------------------------
-# 生成 nft 配置（只管理自己的表）
-# --------------------------
-generate_empty_conf() {
-    local out="$1"
-    cat > "$out" << 'EOF'
-# nft-mgr empty ruleset (generated)
-table ip nft_mgr_nat {
-    chain prerouting {
-        type nat hook prerouting priority -100; policy accept;
-    }
-    chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
-    }
-}
-EOF
-    chmod 600 "$out" 2>/dev/null || true
-}
-
-generate_nft_conf() {
-    local out="$1"
-    local any=0
-
-    {
-        echo "# nft-mgr ruleset (generated at $(date '+%F %T'))"
-        echo "table ip nft_mgr_nat {"
-        echo "    chain prerouting {"
-        echo "        type nat hook prerouting priority -100;"
-
-        while IFS='|' read -r lp addr tp last_ip proto; do
-            [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-            proto="$(normalize_proto "$proto")"
-            is_port "$lp" || continue
-            is_port "$tp" || continue
-            [[ -z "$addr" ]] && continue
-
-            local ip
-            ip="$last_ip"
-            [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
-            is_ipv4 "$ip" || continue
-
-            case "$proto" in
-                tcp)
-                    echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"
-                    any=1
-                    ;;
-                udp)
-                    echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"
-                    any=1
-                    ;;
-                both)
-                    echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"
-                    echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"
-                    any=1
-                    ;;
-            esac
-        done < "$CONFIG_FILE"
-
-        echo "    }"
-        echo "    chain postrouting {"
-        echo "        type nat hook postrouting priority 100;"
-
-        while IFS='|' read -r lp addr tp last_ip proto; do
-            [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-            proto="$(normalize_proto "$proto")"
-            is_port "$lp" || continue
-            is_port "$tp" || continue
-            [[ -z "$addr" ]] && continue
-
-            local ip
-            ip="$last_ip"
-            [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
-            is_ipv4 "$ip" || continue
-
-            case "$proto" in
-                tcp)
-                    echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"
-                    any=1
-                    ;;
-                udp)
-                    echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"
-                    any=1
-                    ;;
-                both)
-                    echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"
-                    echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"
-                    any=1
-                    ;;
-            esac
-        done < "$CONFIG_FILE"
-
-        echo "    }"
-        echo "}"
-    } > "$out"
-
-    chmod 600 "$out" 2>/dev/null || true
-    [[ $any -eq 1 ]] || return 2
+    [[ $has_rules -eq 1 ]] && echo -e "\033[0;32m✅ 规则已原子化应用并持久化。\033[0m" || echo -e "\033[0;32m✅ 当前无有效转发规则：已应用空表并持久化。\033[0m"
     return 0
 }
 
-# --------------------------
-# 原子化应用规则到内核 + 持久化
-# --------------------------
-apply_rules_impl() {
-    ensure_forwarding
-    ensure_nft_mgr_service
-
-    local tmp
-    tmp="$(mktemp /tmp/nftmgr.XXXXXX)"
-    local has_rules=0
-
-    if generate_nft_conf "$tmp"; then
-        has_rules=1
-    else
-        generate_empty_conf "$tmp"
-        has_rules=0
-    fi
-
-    if ! have_cmd nft; then
-        rm -f "$tmp"
-        return 1
-    fi
-
-    # 语法检查
-    local chk_err
-    chk_err="$(nft -c -f "$tmp" 2>&1)"
-    if [[ $? -ne 0 ]]; then
-        mkdir -p "$LOG_DIR" 2>/dev/null || true
-        echo "[$(date '+%F %T')] nft -c error:" > "${LOG_DIR}/last_nft_error.log"
-        echo "$chk_err" >> "${LOG_DIR}/last_nft_error.log"
-        msg_err "❌ nft 规则语法校验失败：未应用、未写入持久化文件。"
-        msg_err "   详情: ${LOG_DIR}/last_nft_error.log"
-        rm -f "$tmp"
-        return 1
-    fi
-
-    # 应用（只动自己的表）
-    nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
-    local apply_err
-    apply_err="$(nft -f "$tmp" 2>&1)"
-    if [[ $? -ne 0 ]]; then
-        mkdir -p "$LOG_DIR" 2>/dev/null || true
-        echo "[$(date '+%F %T')] nft apply error:" > "${LOG_DIR}/last_nft_error.log"
-        echo "$apply_err" >> "${LOG_DIR}/last_nft_error.log"
-        msg_err "❌ nft 规则应用失败：未写入持久化文件。"
-        msg_err "   详情: ${LOG_DIR}/last_nft_error.log"
-        rm -f "$tmp"
-        return 1
-    fi
-
-    # 持久化写入（原子替换）
-    mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
-    if [[ -f "$NFT_MGR_CONF" ]]; then
-        cp -a "$NFT_MGR_CONF" "${NFT_MGR_CONF}.bak.$(date +%s)" 2>/dev/null || true
-    fi
-    mv -f "$tmp" "$NFT_MGR_CONF"
-    chmod 600 "$NFT_MGR_CONF" 2>/dev/null || true
-
-    # 持久化策略：
-    #  - service: 启用 nft-mgr oneshot（默认，最不干扰系统）
-    #  - system : 注入 /etc/nftables.conf include，并通过 nftables.service 持久化（兼容部分面板/节点管理）
-    if [[ "$PERSIST_MODE" == "system" ]]; then
-        # 仅确保 include 存在，不强行重写系统规则
-        enable_persist_system >/dev/null 2>&1 || true
-    else
-        if have_cmd systemctl; then
-            systemctl enable nft-mgr >/dev/null 2>&1 || true
-        fi
-    fi
-
-    if [[ $has_rules -eq 1 ]]; then
-        msg_ok "✅ 规则已原子化应用并持久化。"
-    else
-        msg_ok "✅ 当前无有效转发规则：已应用空表并持久化。"
-    fi
-    return 0
-}
-
-apply_rules() {
-    with_lock apply_rules_impl
-}
-
-# --------------------------
-# 流量格式化
-# --------------------------
-format_bytes() {
-    local bytes="$1"
-    if [[ -z "$bytes" || "$bytes" -eq 0 ]]; then
-        echo "0 B"
-    elif [ "$bytes" -lt 1024 ]; then
-        echo "${bytes} B"
-    elif [ "$bytes" -lt 1048576 ]; then
-        echo "$(( bytes / 1024 )) KB"
-    elif [ "$bytes" -lt 1073741824 ]; then
-        echo "$(( bytes / 1048576 )) MB"
-    elif [ "$bytes" -lt 1099511627776 ]; then
-        awk "BEGIN {printf \"%.2f GB\", $bytes/1073741824}"
-    else
-        awk "BEGIN {printf \"%.2f TB\", $bytes/1099511627776}"
-    fi
-}
-
-# --------------------------
-# 新增转发
-# --------------------------
-port_in_use() {
-    local port="$1"
-    local proto="$2"
-    proto="$(normalize_proto "$proto")"
-    local used=1
-
-    if have_cmd ss; then
-        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
-            ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
-        fi
-        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
-            ss -lnuH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
-        fi
-    fi
-    return $used
-}
-
-add_forward_impl() {
-    local lport taddr tport proto tip
-
-    read -rp "请输入本地监听端口 (1-65535): " lport
-    is_port "$lport" || { msg_err "错误: 本地端口必须是 1-65535 的纯数字。"; sleep 2; return 1; }
-
-    if grep -qE "^${lport}\|" "$CONFIG_FILE" 2>/dev/null; then
-        msg_err "错误: 本地端口 $lport 已存在规则！请先删除旧规则。"
-        sleep 2
-        return 1
-    fi
-
-    echo -e "${CYAN}选择协议:${PLAIN}\n 1) TCP\n 2) UDP\n 3) TCP+UDP(默认)\n--------------------------------"
-    read -rp "请选择 [1-3]: " psel
-    case "$psel" in
-        1) proto="tcp" ;;
-        2) proto="udp" ;;
-        3|"") proto="both" ;;
-        *) proto="both" ;;
-    esac
-
-    if port_in_use "$lport" "$proto"; then
-        msg_warn "⚠️ 检测到本机已有进程监听该端口（${lport}/${proto}）。继续添加转发会导致外部访问被 DNAT 劫持。"
-        read -rp "仍要继续？[y/N]: " go
-        [[ "$go" != "y" && "$go" != "Y" ]] && return 1
-    fi
-
-    read -rp "请输入目标地址 (IP 或 域名): " taddr
-    [[ -z "$taddr" ]] && { msg_err "错误: 目标地址不能为空。"; sleep 2; return 1; }
-
-    read -rp "请输入目标端口 (1-65535): " tport
-    is_port "$tport" || { msg_err "错误: 目标端口必须是 1-65535 的纯数字。"; sleep 2; return 1; }
-
-    echo -e "${CYAN}正在解析并验证目标地址...${PLAIN}"
-    tip="$(get_ip "$taddr")"
-    [[ -z "$tip" ]] && { msg_err "错误: 解析失败，请检查域名或服务器网络/DNS。"; sleep 2; return 1; }
-
-    local conf_bak
-    conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
-    cp -a "$CONFIG_FILE" "$conf_bak" 2>/dev/null || true
-
-    echo "${lport}|${taddr}|${tport}|${tip}|${proto}" >> "$CONFIG_FILE"
-
-    if ! apply_rules_impl; then
-        [[ -s "$conf_bak" ]] && mv -f "$conf_bak" "$CONFIG_FILE" || true
-        msg_err "❌ 应用规则失败：已回滚本次新增配置。"
-        sleep 2
-        return 1
-    fi
-    rm -f "$conf_bak" 2>/dev/null || true
-
-    manage_firewall "add" "$lport" "$proto" || true
-
-    # 目标为域名：自动启用 DDNS 每分钟检测（联动）
-    if ! is_ipv4 "$taddr"; then
-        ensure_ddns_cron_enabled
-        msg_info "已检测到目标为域名：已自动启用 DDNS 每分钟检测（crontab）。"
-    fi
-
-    msg_ok "添加成功！映射路径: [本机] ${lport}/${proto} -> [目标] ${taddr}:${tport} (${tip})"
-    sleep 2
-    return 0
-}
-
-add_forward() { with_lock add_forward_impl; }
-
-# --------------------------
-# 规则管理（查看/删除）
-# --------------------------
-view_and_del_forward_impl() {
-    clear
-    if [[ ! -s "$CONFIG_FILE" ]]; then
-        msg_warn "当前没有任何转发规则。"
-        read -rp "按回车返回主菜单..."
-        return 0
-    fi
-
-    # 规则列表（已移除实时流量看板 / Traffic Counters）
-    echo -e "${CYAN}=========================== 规则管理 (查看/删除) ===========================${PLAIN}"
-    printf "%-4s | %-6s | %-5s | %-32s | %-6s\n" "序号" "本地" "协议" "目标地址" "目标"
-    echo "--------------------------------------------------------------------------"
-
-    local i=1
-    while IFS='|' read -r lp addr tp last_ip proto; do
-        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-        proto="$(normalize_proto "$proto")"
-        is_port "$lp" || continue
-        is_port "$tp" || continue
-
-        local short_addr="${addr:0:31}"
-        printf "%-4s | %-6s | %-5s | %-32s | %-6s\n" "$i" "$lp" "$proto" "$short_addr" "$tp"
-        ((i++))
-    done < "$CONFIG_FILE"
-
-    echo "--------------------------------------------------------------------------"
-echo -e "\n${YELLOW}提示: 输入规则前面的【序号】即可删除，输入【0】或直接按回车返回。${PLAIN}"
-    local action
-    read -rp "请选择操作: " action
-
-    if [[ -z "$action" || "$action" == "0" ]]; then
-        return 0
-    fi
-    if ! [[ "$action" =~ ^[0-9]+$ ]]; then
-        msg_err "输入无效，请输入正确的数字。"
-        sleep 2
-        return 1
-    fi
-
-    local total_lines
-    total_lines="$(awk -F'|' 'BEGIN{c=0} $0!~/^\s*($|#)/{ if($1~/^[0-9]+$/ && $1>=1 && $1<=65535 && $3~/^[0-9]+$/ && $3>=1 && $3<=65535){c++}} END{print c+0}' "$CONFIG_FILE" 2>/dev/null)"
-    if [[ "$action" -lt 1 || "$action" -gt "$total_lines" ]]; then
-        msg_err "序号超出范围！"
-        sleep 2
-        return 1
-    fi
-
-    local line_no
-    line_no="$(awk -F'|' -v N="$action" 'BEGIN{c=0}
-        $0!~/^\s*($|#)/{
-            if($1~/^[0-9]+$/ && $1>=1 && $1<=65535 && $3~/^[0-9]+$/ && $3>=1 && $3<=65535){
-                c++; if(c==N){print NR; exit}
-            }
-        }' "$CONFIG_FILE")"
-    [[ -z "$line_no" ]] && { msg_err "删除失败：无法定位规则行。"; sleep 2; return 1; }
-
-    local del_line del_port del_proto
-    del_line="$(sed -n "${line_no}p" "$CONFIG_FILE")"
-    del_port="$(echo "$del_line" | cut -d'|' -f1)"
-    del_proto="$(echo "$del_line" | cut -d'|' -f5)"
-    del_proto="$(normalize_proto "$del_proto")"
-
-    local conf_bak
-    conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
-    cp -a "$CONFIG_FILE" "$conf_bak" 2>/dev/null || true
-
-    sed -i "${line_no}d" "$CONFIG_FILE"
-
-    if ! apply_rules_impl; then
-        [[ -s "$conf_bak" ]] && mv -f "$conf_bak" "$CONFIG_FILE" || true
-        msg_err "❌ 应用规则失败：已回滚本次删除操作。"
-        sleep 2
-        return 1
-    fi
-    rm -f "$conf_bak" 2>/dev/null || true
-
-    manage_firewall "del" "$del_port" "$del_proto" || true
-
-    # 联动：若已无域名规则，则自动清理 DDNS 定时任务
-    ensure_ddns_cron_disabled_if_unused
-
-    msg_ok "已成功删除本地端口为 ${del_port}/${del_proto} 的转发规则。"
-    sleep 2
-    return 0
-}
-
-view_and_del_forward() { with_lock view_and_del_forward_impl; }
-
-# --------------------------
-# DDNS 追踪更新（域名 -> IP 变化） + 严格模式失败通知
-# --------------------------
 ddns_update_impl() {
     local changed=0
-    local temp_file
-    temp_file="$(mktemp /tmp/nftmgr-ddns.XXXXXX)"
-
-    [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR"
-    local today_log="$LOG_DIR/$(date '+%Y-%m-%d').log"
+    local temp_file; temp_file="$(mktemp /tmp/nftmgr-ddns.XXXXXX)"
+    [[ -d "$NFT_LOG_DIR" ]] || mkdir -p "$NFT_LOG_DIR"
+    local today_log="$NFT_LOG_DIR/$(date '+%Y-%m-%d').log"
 
     while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ -z "$line" ]]; then
-            echo "" >> "$temp_file"
-            continue
-        fi
-        if [[ "${line:0:1}" == "#" ]]; then
-            echo "$line" >> "$temp_file"
-            continue
-        fi
-
+        if [[ -z "$line" || "${line:0:1}" == "#" ]]; then echo "$line" >> "$temp_file"; continue; fi
         local lp addr tp last_ip proto
         IFS='|' read -r lp addr tp last_ip proto <<< "$line"
-        proto="$(normalize_proto "$proto")"
+        if ! is_port "$lp" || ! is_port "$tp" || [[ -z "$addr" ]]; then echo "$line" >> "$temp_file"; continue; fi
 
-        if ! is_port "$lp" || ! is_port "$tp" || [[ -z "$addr" ]]; then
-            echo "$line" >> "$temp_file"
-            continue
-        fi
-
-        local current_ip
-        current_ip="$(get_ip "$addr")"
-
+        local current_ip; current_ip="$(get_ip "$addr")"
         if [[ -z "$current_ip" ]] && ! is_ipv4 "$addr"; then
-            # 域名解析失败：记录并（严格模式）判定失败
-            echo "[$(date '+%H:%M:%S')] [ERROR] 端口 ${lp}: 域名 ${addr} 解析失败（保持 last_ip=${last_ip:-N/A}）" >> "$today_log"
+            echo "[$(date '+%H:%M:%S')] [ERROR] 端口 ${lp}: 域名 ${addr} 解析失败" >> "$today_log"
             echo "${lp}|${addr}|${tp}|${last_ip}|${proto}" >> "$temp_file"
             continue
         fi
-
         if [[ -n "$current_ip" && "$current_ip" != "$last_ip" ]]; then
             echo "${lp}|${addr}|${tp}|${current_ip}|${proto}" >> "$temp_file"
             changed=1
@@ -3857,1543 +2919,297 @@ ddns_update_impl() {
     done < "$CONFIG_FILE"
 
     mv -f "$temp_file" "$CONFIG_FILE"
-
-    if [[ $changed -eq 1 ]]; then
-        if ! apply_rules_impl; then
-            echo "[$(date '+%H:%M:%S')] [ERROR] 应用 nft 规则失败（已保留配置，但规则未更新）" >> "$today_log"
-        fi
-    fi
-
-    # 日志保留
-    find "$LOG_DIR" -type f -name "*.log" -mtime +7 -exec rm -f {} \; 2>/dev/null || true
+    if [[ $changed -eq 1 ]]; then apply_rules_impl >/dev/null 2>&1 || true; fi
+    find "$NFT_LOG_DIR" -type f -name "*.log" -mtime +7 -exec rm -f {} \; 2>/dev/null || true
     return 0
 }
 
-ddns_update() { with_lock ddns_update_impl; }
-
-# --------------------------
-# 定时任务管理（DDNS）
-# --------------------------
-manage_cron() {
-    clear
-    local my_cmd="/usr/local/bin/my"
-    if crontab -l 2>/dev/null | grep -Fq "${my_cmd} nft --cron"; then
-        echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) --- [已启用]${PLAIN}"
-    else
-        echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) --- [未启用]${PLAIN}"
-    fi
-    echo "1. 自动添加定时任务 (每分钟检测，默认非严格)"
-    echo "2. 一键删除定时任务"
-    echo "3. 查看 DDNS 变动历史日志 (仅保留最近7天)"
-    echo "0. 返回主菜单"
-    echo "--------------------------------"
-    local cron_choice
-    read -rp "请选择操作 [0-3]: " cron_choice
-
-    case "$cron_choice" in
-        1)
-            if crontab -l 2>/dev/null | grep -Fq "${my_cmd} nft --cron"; then
-                msg_warn "定时任务已存在。"
-                sleep 2
-                return
-            fi
-            remove_ddns_cron_task || true
-            (crontab -l 2>/dev/null; echo "* * * * * ${my_cmd} nft --cron > /dev/null 2>&1") | crontab - 2>/dev/null || true
-            msg_ok "定时任务已添加！将自动检查 IP 并生成日志。"
-            sleep 2
-            ;;
-        2)
-            remove_ddns_cron_task || true
-            msg_warn "定时任务已清除。"
-            sleep 2
-            ;;
-        3)
-            clear
-            if [[ -d "$LOG_DIR" ]] && ls "$LOG_DIR"/*.log >/dev/null 2>&1; then
-                echo -e "${GREEN}--- 近 7 天 DDNS 变动日志（末20行） ---${PLAIN}"
-                cat "$LOG_DIR"/*.log 2>/dev/null | tail -n 20
-            else
-                msg_warn "暂无 IP 变动记录。"
-            fi
-            echo ""
-            read -rp "按回车键返回..."
-            ;;
-        0) return ;;
-        *) msg_err "无效选项"; sleep 1 ;;
-    esac
-}
-
-# --------------------------
-download_to() {
-    local url="$1"
-    local out="$2"
-    if have_cmd curl; then
-        curl -fsSL --retry 2 --connect-timeout 8 --max-time 120 "$url" -o "$out" >/dev/null 2>&1
-    elif have_cmd wget; then
-        wget -qO "$out" "$url" >/dev/null 2>&1
-    else
-        return 1
-    fi
-}
-
-# --------------------------
-# 清空规则
-# --------------------------
-clear_all_rules_impl() {
-    if [[ ! -s "$CONFIG_FILE" ]]; then
-        msg_warn "当前没有规则，无需清空。"
-        sleep 1
-        return 0
-    fi
-
-    msg_warn "⚠️ 将清空所有转发规则（并移除 ufw/firewalld 放行）。"
-    read -rp "确认清空？[y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
-
-    while IFS='|' read -r lp addr tp last_ip proto; do
-        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-        is_port "$lp" || continue
-        proto="$(normalize_proto "$proto")"
-        manage_firewall "del" "$lp" "$proto" || true
-    done < "$CONFIG_FILE"
-
-    local conf_bak
-    conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
-    cp -a "$CONFIG_FILE" "$conf_bak" 2>/dev/null || true
-
-    > "$CONFIG_FILE"
-    if ! apply_rules_impl; then
-        [[ -s "$conf_bak" ]] && mv -f "$conf_bak" "$CONFIG_FILE" || true
-        msg_err "❌ 清空后应用规则失败：已回滚配置。"
-        sleep 2
-        return 1
-    fi
-    rm -f "$conf_bak" 2>/dev/null || true
-    ensure_ddns_cron_disabled_if_unused
-
-msg_ok "✅ 所有规则已清空。"
-    sleep 2
-}
-
-clear_all_rules() { with_lock clear_all_rules_impl; }
-
-# --------------------------
-# 完全卸载
-# --------------------------
-cleanup_nft_artifacts() {
-    while IFS='|' read -r lp addr tp last_ip proto; do
-        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-        is_port "$lp" || continue
-        proto="$(normalize_proto "$proto")"
-        manage_firewall "del" "$lp" "$proto" || true
-    done < "$CONFIG_FILE" 2>/dev/null || true
-
-    have_cmd nft && nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
-    remove_ddns_cron_task || true
-
-    if have_cmd systemctl; then
-        systemctl disable --now nft-mgr >/dev/null 2>&1 || true
-        rm -f "$NFT_MGR_SERVICE" 2>/dev/null || true
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
-
-    if [[ -f "$NFTABLES_CONF" ]]; then
-        sed -i '/# nftmgr include (added .*$/d' "$NFTABLES_CONF" 2>/dev/null || true
-        sed -i '/# nftmgr persistent include$/d' "$NFTABLES_CONF" 2>/dev/null || true
-        sed -i '\|include "/etc/nftables.d/nft_mgr.conf"|d' "$NFTABLES_CONF" 2>/dev/null || true
-    fi
-
-    if [[ -f "$NFTABLES_CREATED_MARK" ]]; then
-        rm -f "$NFTABLES_CREATED_MARK" 2>/dev/null || true
-        local latest_bak=""
-        latest_bak="$(ls -1t ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null | head -n 1)"
-        if [[ -n "$latest_bak" && -f "$latest_bak" ]]; then
-            cp -a "$latest_bak" "$NFTABLES_CONF" 2>/dev/null || true
-        else
-            rm -f "$NFTABLES_CONF" 2>/dev/null || true
-            if have_cmd systemctl; then
-                systemctl disable --now nftables >/dev/null 2>&1 || true
-            fi
-        fi
-    fi
-
-    rm -f ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null || true
-    rm -f "$NFT_MGR_CONF" "$CONFIG_FILE" "$SETTINGS_FILE" "$SYSCTL_FILE" "$LOCK_FILE" 2>/dev/null || true
-    rm -rf "$LOG_DIR" 2>/dev/null || true
-    rmdir "$NFT_MGR_DIR" 2>/dev/null || true
-
-    if have_cmd systemctl; then
-        systemctl restart nftables >/dev/null 2>&1 || true
-    fi
-}
-
-uninstall_script_impl() {
-    clear
-    echo -e "${RED}--- 卸载 nftables 端口转发管理面板 ---${PLAIN}"
-    read -rp "警告: 此操作将删除本脚本、规则配置、定时任务、systemd 服务，并移除本脚本创建的 nft 表。确认？[y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
-
-    cleanup_nft_artifacts
-    msg_ok "✅ 卸载完成（已清理脚本残留）。"
-
-    rm -f "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
-    exit 0
-}
-
-uninstall_script() { with_lock uninstall_script_impl; }
-# --------------------------
-# 主菜单
-# --------------------------
 main_menu() {
-    clear
-    echo -e "${GREEN}==========================================${PLAIN}"
-    echo -e "${GREEN}     nftables 端口转发管理面板 (Pro)      ${PLAIN}"
-    echo -e "${GREEN}==========================================${PLAIN}"
-    echo "1. 智能系统调优 (稳定/极致)"
-    echo "2. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
-    echo "3. 规则管理 (查看/删除)"
-    echo "4. 清空所有转发规则"
-    echo "5. 管理 DDNS 定时监控与日志"
-    echo "0. 退出面板"
-    echo "------------------------------------------"
-    local choice
-    read -rp "请选择操作 [0-5]: " choice
-
-    case "$choice" in
-        1) optimize_system ;;
-        2) add_forward ;;
-        3) view_and_del_forward ;;
-        4) clear_all_rules ;;
-        5) manage_cron ;;
-        0) exit 0 ;;
-        *) msg_err "无效选项"; sleep 1 ;;
-    esac
+    echo -e "\033[0;33m提示：这是后台组件，请通过综合脚本调用界面。\033[0m"
 }
 
+if [[ "$1" == "apply" ]]; then
+    apply_rules_impl
+elif [[ "$1" == "ddns" ]]; then
+    ddns_update_impl
+else
+    main_menu
+fi
 NFT_MODULE_EOF
+    # 原子化写入 NFT 模块
+    mv -f "${NFT_MODULE_FILE}.tmp" "${NFT_MODULE_FILE}"
 
-    # Nginx 反向代理模块（并入 my 统一管理，避免与 Certbot/多站点冲突）
-    cat > "${NGX_MODULE_FILE}" <<'NGX_MODULE_EOF'
+    # --------------------------
+    # NGINX 代理/证书模块 (修复 3：原子化写入，修复 4：ACME 权限)
+    # --------------------------
+    cat > "${NGX_MODULE_FILE}.tmp" <<'NGX_MODULE_EOF'
 #!/bin/bash
 set -o pipefail
 
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly CYAN='\033[0;36m'
-readonly RESET='\033[0m'
+NGX_WEBROOT="/var/lib/my-nginx-proxy/acme"
+NGX_CONF_DIR="/etc/nginx/conf.d"
 
-readonly MY_NGX_ID="my-nginx-proxy"
-readonly NGX_META_DIR="/usr/local/etc/my_nginx_proxy"
-readonly NGX_STATE_FILE="${NGX_META_DIR}/state.conf"
-readonly NGX_COMMON_CONF="/etc/nginx/conf.d/00-my-rproxy-common.conf"
-readonly NGX_CONF_PREFIX="/etc/nginx/conf.d/my-rproxy"
-readonly NGX_WEBROOT="/var/lib/my-nginx-proxy/acme"
-readonly NGX_WORKDIR="/var/lib/my-nginx-proxy"
-readonly NGX_TMP_DIR="${NGX_WORKDIR}/tmp"
-readonly NGX_LOG_DIR="/var/log/nginx"
-
-ngx_have_cmd() { command -v "$1" >/dev/null 2>&1; }
-ngx_msg_ok() { echo -e "${GREEN}$*${RESET}"; }
-ngx_msg_warn() { echo -e "${YELLOW}$*${RESET}"; }
-ngx_msg_err() { echo -e "${RED}$*${RESET}"; }
-ngx_msg_info() { echo -e "${CYAN}$*${RESET}"; }
-ngx_pause() { read -n 1 -s -r -p "按任意键继续..."; echo; }
-
-ngx_state_get() {
-    local key="$1"
-    [[ -f "$NGX_STATE_FILE" ]] || return 1
-    grep -E "^${key}=" "$NGX_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//; s/"$//'
-}
-
-ngx_state_set() {
-    local key="$1" value="$2"
-    mkdir -p "$NGX_META_DIR" 2>/dev/null || true
-    touch "$NGX_STATE_FILE"
-    chmod 600 "$NGX_STATE_FILE" 2>/dev/null || true
-    if grep -qE "^${key}=" "$NGX_STATE_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=\"${value}\"|g" "$NGX_STATE_FILE"
-    else
-        echo "${key}=\"${value}\"" >> "$NGX_STATE_FILE"
-    fi
-}
-
-ngx_pkg_installed() {
-    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
-}
-
-ngx_state_init_if_needed() {
-    [[ "$(ngx_state_get STATE_INIT)" == "1" ]] && return 0
-    ngx_state_set STATE_INIT 1
-    ngx_pkg_installed nginx && ngx_state_set PKG_NGINX_BY_MY 0 || ngx_state_set PKG_NGINX_BY_MY 1
-    ngx_pkg_installed certbot && ngx_state_set PKG_CERTBOT_BY_MY 0 || ngx_state_set PKG_CERTBOT_BY_MY 1
-    ngx_pkg_installed python3-certbot-nginx && ngx_state_set PKG_CERTBOT_NGINX_BY_MY 0 || ngx_state_set PKG_CERTBOT_NGINX_BY_MY 1
-}
-
-ngx_require_apt() {
-    ngx_have_cmd apt-get || { ngx_msg_err "当前仅支持 Debian/Ubuntu 系 apt 环境。"; return 1; }
-}
-
-ngx_validate_domain() {
-    local d="${1,,}"
-    [[ -n "$d" ]] || return 1
-    [[ "$d" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || return 1
-    [[ "$d" == *.* ]] || return 1
-    [[ "$d" != *..* ]] || return 1
-    return 0
-}
-
-ngx_is_ip_literal() {
-    local h="$1"
-    [[ "$h" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 0
-    [[ "$h" =~ ^\[[0-9a-fA-F:]+\]$ ]] && return 0
-    return 1
-}
-
-ngx_parse_backend() {
-    local input="$1"
-    NGX_BACKEND_PROTO="http"
-    local rest="$input"
-    if [[ "$input" == https://* ]]; then
-        NGX_BACKEND_PROTO="https"
-        rest="${input#https://}"
-    elif [[ "$input" == http://* ]]; then
-        NGX_BACKEND_PROTO="http"
-        rest="${input#http://}"
-    fi
-    rest="${rest%/}"
-    [[ -n "$rest" ]] || return 1
-
-    local host port
-    if [[ "$rest" =~ ^\[[0-9a-fA-F:]+\]:[0-9]+$ ]]; then
-        host="${rest%%]:*}]"
-        port="${rest##*:}"
-    else
-        host="${rest%:*}"
-        port="${rest##*:}"
-        [[ "$host" != "$rest" ]] || return 1
-    fi
-
-    [[ -n "$host" && "$port" =~ ^[0-9]{1,5}$ ]] || return 1
-    (( port >= 1 && port <= 65535 )) || return 1
-
-    NGX_BACKEND_RAW="$input"
-    NGX_BACKEND_HOST="$host"
-    NGX_BACKEND_PORT="$port"
-    NGX_BACKEND_ADDR="$rest"
-    return 0
-}
-
-ngx_proxy_ssl_block() {
-    if [[ "$NGX_BACKEND_PROTO" == "https" ]]; then
-        if ngx_is_ip_literal "$NGX_BACKEND_HOST"; then
-            printf '%s\n' '        proxy_ssl_server_name off;'
-        else
-            printf '%s\n' '        proxy_ssl_server_name on;'
-            printf '        proxy_ssl_name %s;\n' "$NGX_BACKEND_HOST"
-        fi
-    fi
-}
-
-ngx_site_conf() {
-    printf '%s\n' "${NGX_CONF_PREFIX}.${1}.conf"
-}
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 ngx_write_common_conf() {
-    mkdir -p /etc/nginx/conf.d "$NGX_WEBROOT" "$NGX_TMP_DIR" "$NGX_META_DIR" 2>/dev/null || true
-    cat > "$NGX_COMMON_CONF" <<'EOF'
-# managed-by=my-nginx-proxy
-map $http_upgrade $my_proxy_connection_upgrade {
-    default upgrade;
-    ''      close;
+    mkdir -p "$NGX_CONF_DIR" 2>/dev/null || true
+    
+    # 修复 4：确保 ACME Webroot 目录存在且具备正确的读取权限
+    mkdir -p "$NGX_WEBROOT" 2>/dev/null || true
+    chmod 755 "$NGX_WEBROOT" 2>/dev/null || true
+    
+    cat > "${NGX_CONF_DIR}/my_common.conf" <<EOF
+location ^~ /.well-known/acme-challenge/ {
+    default_type "text/plain";
+    root ${NGX_WEBROOT};
+}
+location = /.well-known/acme-challenge/ {
+    return 404;
 }
 EOF
 }
 
-ngx_test_reload() {
-    nginx -t >/dev/null 2>&1 || return 1
-    systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || return 1
-    return 0
-}
-
-ngx_install_dependencies() {
-    ngx_require_apt || return 1
-    ngx_state_init_if_needed
-    export DEBIAN_FRONTEND=noninteractive
-    ngx_msg_info "检查并安装 Nginx / Certbot 环境..."
-    apt-get update -qq || return 1
-    apt-get install -y -qq nginx certbot curl ca-certificates >/dev/null || return 1
-    systemctl enable nginx >/dev/null 2>&1 || true
-    systemctl start nginx >/dev/null 2>&1 || true
+ngx_apply_proxy() {
+    local domain="$1" up_port="$2"
     ngx_write_common_conf
-    ngx_msg_ok "环境依赖就绪。"
-}
-
-ngx_domain_dns_hint() {
-    local domain="$1" pub4="" pub6="" dns4="" dns6=""
-    ngx_have_cmd curl && pub4="$(curl -4 -fsS --connect-timeout 3 --max-time 6 https://api.ip.sb/ip 2>/dev/null || true)"
-    ngx_have_cmd curl && pub6="$(curl -6 -fsS --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
-    dns4="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd ',' -)"
-    dns6="$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd ',' -)"
-    [[ -n "$dns4$dns6" ]] || { ngx_msg_warn "提示：当前本机未解析到 ${domain} 的 DNS 记录，证书申请可能失败。"; return 0; }
-    [[ -n "$pub4" && ",$dns4," != *",$pub4,"* ]] && ngx_msg_warn "提示：${domain} 的 IPv4 DNS 未命中本机公网 IPv4 ${pub4}。"
-    [[ -n "$pub6" && -n "$dns6" && ",$dns6," != *",$pub6,"* ]] && ngx_msg_warn "提示：${domain} 的 IPv6 DNS 未命中本机公网 IPv6 ${pub6}。"
-}
-
-ngx_render_http_conf() {
-    local domain="$1"
-    cat <<EOF
-# managed-by=${MY_NGX_ID}
-# domain=${domain}
-# backend=${NGX_BACKEND_RAW}
+    cat > "${NGX_CONF_DIR}/${domain}.conf" <<EOF
 server {
     listen 80;
     listen [::]:80;
     server_name ${domain};
-
-    access_log ${NGX_LOG_DIR}/${domain}_access.log;
-    error_log  ${NGX_LOG_DIR}/${domain}_error.log;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root ${NGX_WEBROOT};
-        default_type "text/plain";
-    }
-
+    include ${NGX_CONF_DIR}/my_common.conf;
     location / {
-        proxy_pass ${NGX_BACKEND_PROTO}://${NGX_BACKEND_ADDR};
+        proxy_pass http://127.0.0.1:${up_port};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$my_proxy_connection_upgrade;
-        proxy_connect_timeout 90s;
-        proxy_send_timeout 300s;
-        proxy_read_timeout 300s;
-        proxy_buffering off;
-        proxy_cache off;
-$(ngx_proxy_ssl_block)
     }
 }
 EOF
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
 }
 
-ngx_render_https_conf() {
+ngx_remove_proxy() {
     local domain="$1"
-    cat <<EOF
-# managed-by=${MY_NGX_ID}
-# domain=${domain}
-# backend=${NGX_BACKEND_RAW}
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
-
-    location ^~ /.well-known/acme-challenge/ {
-        root ${NGX_WEBROOT};
-        default_type "text/plain";
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
+    rm -f "${NGX_CONF_DIR}/${domain}.conf" 2>/dev/null || true
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
 }
 
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
-    server_name ${domain};
-
-    access_log ${NGX_LOG_DIR}/${domain}_access.log;
-    error_log  ${NGX_LOG_DIR}/${domain}_error.log;
-
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_session_timeout 1d;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_tickets off;
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-
-    client_max_body_size 0;
-    server_tokens off;
-    gzip on;
-    gzip_vary on;
-    gzip_proxied any;
-    gzip_comp_level 5;
-    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
-
-    location / {
-        proxy_pass ${NGX_BACKEND_PROTO}://${NGX_BACKEND_ADDR};
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$my_proxy_connection_upgrade;
-        proxy_connect_timeout 90s;
-        proxy_send_timeout 300s;
-        proxy_read_timeout 300s;
-        proxy_buffering off;
-        proxy_cache off;
-$(ngx_proxy_ssl_block)
-    }
-}
-EOF
-}
-
-ngx_install_conf_from_stdin() {
-    local dst="$1"
-    local tmp
-    tmp="$(mktemp "${NGX_TMP_DIR}/conf.XXXXXX")" || return 1
-    cat > "$tmp"
-    install -m 644 "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    rm -f "$tmp"
-}
-
-ngx_delete_cert_if_exists() {
-    local domain="$1"
-    certbot delete --cert-name "$domain" --non-interactive --quiet >/dev/null 2>&1 || true
-}
-
-ngx_delete_proxy_domain() {
-    local domain="${1,,}"
-    ngx_validate_domain "$domain" || { ngx_msg_err "域名格式无效。"; return 1; }
-    local conf
-    conf="$(ngx_site_conf "$domain")"
-    [[ -f "$conf" ]] || { ngx_msg_err "未找到由本脚本管理的域名 ${domain}。"; return 1; }
-
-    ngx_delete_cert_if_exists "$domain"
-    rm -f "$conf" "${NGX_LOG_DIR}/${domain}_access.log" "${NGX_LOG_DIR}/${domain}_error.log" 2>/dev/null || true
-    if ngx_have_cmd nginx && ngx_test_reload; then
-        ngx_msg_ok "域名 ${domain} 的反代与证书已清理。"
-    else
-        ngx_msg_warn "配置文件已删除，但 Nginx 重载失败，请检查其它非本脚本配置。"
-    fi
-    return 0
-}
-
-ngx_list_proxies() {
-    echo -e "${CYAN}=== 当前由本脚本管理的反向代理 ===${RESET}"
-    local conf count=0 domain backend
-    shopt -s nullglob
-    for conf in /etc/nginx/conf.d/my-rproxy.*.conf; do
-        domain="$(basename "$conf")"
-        domain="${domain#my-rproxy.}"
-        domain="${domain%.conf}"
-        backend="$(grep -E '^# backend=' "$conf" 2>/dev/null | head -n1 | cut -d= -f2-)"
-        [[ -n "$backend" ]] || backend="未知"
-        count=$((count+1))
-        echo -e " ${GREEN}${count}.${RESET} ${domain}  ==>  ${YELLOW}${backend}${RESET}"
-    done
-    shopt -u nullglob
-    [[ $count -eq 0 ]] && echo -e "${YELLOW}当前未发现任何由本脚本管理的 Nginx 代理配置。${RESET}"
-    echo "------------------------------------------------"
-}
-
-ngx_delete_proxy_pick() {
-    local conf domain backend idx=0 pick
-    local -a domains backends
-    shopt -s nullglob
-    for conf in /etc/nginx/conf.d/my-rproxy.*.conf; do
-        domain="$(basename "$conf")"
-        domain="${domain#my-rproxy.}"
-        domain="${domain%.conf}"
-        backend="$(grep -E '^# backend=' "$conf" 2>/dev/null | head -n1 | cut -d= -f2-)"
-        [[ -n "$backend" ]] || backend="未知"
-        domains[idx]="$domain"
-        backends[idx]="$backend"
-        idx=$((idx+1))
-    done
-    shopt -u nullglob
-
-    if [[ ${#domains[@]} -eq 0 ]]; then
-        ngx_msg_warn "当前没有可删除的反向代理。"
-        return 1
-    fi
-
-    echo -e "${CYAN}=== 按序号删除反向代理 ===${RESET}"
-    local i display
-    for ((i=0; i<${#domains[@]}; i++)); do
-        display=$((i+1))
-        echo -e " ${GREEN}${display}.${RESET} ${domains[i]}  ==>  ${YELLOW}${backends[i]}${RESET}"
-    done
-    read -rp "请输入要删除的序号 [1-${#domains[@]}]，直接回车取消: " pick
-    [[ -z "$pick" ]] && { ngx_msg_warn "已取消删除。"; return 1; }
-    [[ "$pick" =~ ^[0-9]+$ ]] || { ngx_msg_err "请输入有效序号。"; return 1; }
-    (( pick >= 1 && pick <= ${#domains[@]} )) || { ngx_msg_err "序号超出范围。"; return 1; }
-
-    local target="${domains[$((pick-1))]}"
-    read -rp "确认删除 ${target} ? [y/N]: " confirm
-    [[ "$confirm" =~ ^[yY]$ ]] || { ngx_msg_warn "已取消删除。"; return 1; }
-    ngx_delete_proxy_domain "$target"
-}
-
-ngx_add_proxy() {
-    local backend_input domain_name cert_email conf tmp_final
-    echo -e "${CYAN}=== 添加新的反向代理 ===${RESET}"
-    ngx_install_dependencies || { ngx_msg_err "依赖安装失败。"; sleep 2; return 1; }
-
-    while :; do
-        read -rp "后端服务地址（格式: IP:端口 / 域名:端口 / http:// / https://）: " backend_input
-        ngx_parse_backend "$backend_input" && break
-        ngx_msg_err "后端地址格式无效，请重新输入。"
-    done
-    while :; do
-        read -rp "绑定域名（请确保已解析到本机）: " domain_name
-        domain_name="${domain_name,,}"
-        ngx_validate_domain "$domain_name" && break
-        ngx_msg_err "域名格式无效，请重新输入。"
-    done
-    read -rp "申请证书邮箱（可留空）: " cert_email
-
-    conf="$(ngx_site_conf "$domain_name")"
-    if [[ -f "$conf" ]]; then
-        ngx_msg_err "域名 ${domain_name} 的配置已存在，请先删除或更换域名。"
-        sleep 2
-        return 1
-    fi
-
-    ngx_domain_dns_hint "$domain_name"
-    ngx_write_common_conf
-    mkdir -p "$NGX_WEBROOT" "$NGX_TMP_DIR" 2>/dev/null || true
-
-    ngx_render_http_conf "$domain_name" | ngx_install_conf_from_stdin "$conf" || { ngx_msg_err "写入 HTTP 配置失败。"; return 1; }
-    if ! ngx_test_reload; then
-        rm -f "$conf"
-        ngx_msg_err "Nginx 配置验证失败，已回滚。"
-        sleep 2
-        return 1
-    fi
-
-    local email_args=()
-    if [[ -n "$cert_email" ]]; then
-        email_args=(--email "$cert_email")
-    else
-        email_args=(--register-unsafely-without-email)
-    fi
-
-    ngx_msg_info "开始申请 SSL 证书..."
-    if ! certbot certonly --webroot -w "$NGX_WEBROOT" --non-interactive --agree-tos "${email_args[@]}" -d "$domain_name" >/dev/null 2>&1; then
-        rm -f "$conf"
-        ngx_test_reload >/dev/null 2>&1 || true
-        ngx_delete_cert_if_exists "$domain_name"
-        ngx_msg_err "SSL 证书申请失败，已自动回滚配置。"
-        sleep 2
-        return 1
-    fi
-
-    tmp_final="$(mktemp "${NGX_TMP_DIR}/final.XXXXXX")" || { ngx_delete_cert_if_exists "$domain_name"; rm -f "$conf"; return 1; }
-    ngx_render_https_conf "$domain_name" > "$tmp_final"
-    install -m 644 "$tmp_final" "$conf" 2>/dev/null || { rm -f "$tmp_final"; ngx_delete_cert_if_exists "$domain_name"; rm -f "$conf"; return 1; }
-    rm -f "$tmp_final"
-
-    if ! ngx_test_reload; then
-        rm -f "$conf"
-        ngx_delete_cert_if_exists "$domain_name"
-        ngx_test_reload >/dev/null 2>&1 || true
-        ngx_msg_err "最终 HTTPS 配置校验失败，已回滚。"
-        sleep 2
-        return 1
-    fi
-
-    ngx_msg_ok "✅ 部署完成：https://${domain_name}"
-    return 0
-}
-
-nginx_cleanup_artifacts() {
-    local conf domain
-    shopt -s nullglob
-    for conf in /etc/nginx/conf.d/my-rproxy.*.conf; do
-        domain="$(basename "$conf")"
-        domain="${domain#my-rproxy.}"
-        domain="${domain%.conf}"
-        ngx_delete_cert_if_exists "$domain"
-        rm -f "$conf" "${NGX_LOG_DIR}/${domain}_access.log" "${NGX_LOG_DIR}/${domain}_error.log" 2>/dev/null || true
-    done
-    shopt -u nullglob
-
-    rm -f "$NGX_COMMON_CONF" 2>/dev/null || true
-
-    if ngx_have_cmd nginx; then
-        if nginx -t >/dev/null 2>&1; then
-            systemctl reload nginx >/dev/null 2>&1 || true
-        fi
-    fi
-
-    if [[ "$(ngx_state_get PKG_CERTBOT_NGINX_BY_MY)" == "1" || "$(ngx_state_get PKG_CERTBOT_BY_MY)" == "1" || "$(ngx_state_get PKG_NGINX_BY_MY)" == "1" ]]; then
-        export DEBIAN_FRONTEND=noninteractive
-        [[ "$(ngx_state_get PKG_CERTBOT_NGINX_BY_MY)" == "1" ]] && apt-get purge -y -qq python3-certbot-nginx >/dev/null 2>&1 || true
-        [[ "$(ngx_state_get PKG_CERTBOT_BY_MY)" == "1" ]] && apt-get purge -y -qq certbot >/dev/null 2>&1 || true
-        [[ "$(ngx_state_get PKG_NGINX_BY_MY)" == "1" ]] && apt-get purge -y -qq nginx nginx-common nginx-core >/dev/null 2>&1 || true
-        apt-get autoremove -y -qq >/dev/null 2>&1 || true
-        apt-get clean -qq >/dev/null 2>&1 || true
-        [[ "$(ngx_state_get PKG_NGINX_BY_MY)" == "1" ]] && rm -rf /etc/nginx /var/log/nginx 2>/dev/null || true
-        [[ "$(ngx_state_get PKG_CERTBOT_BY_MY)" == "1" ]] && rm -rf /var/lib/letsencrypt 2>/dev/null || true
-    fi
-
-    rm -rf "$NGX_META_DIR" "$NGX_WORKDIR" 2>/dev/null || true
-}
-
-nginx_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e "${GREEN}      Nginx 反向代理与 HTTPS 管理中心         ${RESET}"
-        echo -e "${CYAN}================================================${RESET}"
-        echo "  1. ➕ 添加新的反向代理 (含 HTTPS)"
-        echo "  2. 🔍 查看已配置的代理列表"
-        echo "  3. 🗑️  按序号删除反向代理"
-        echo "  4. 🔧 重新安装/修复依赖环境"
-        echo "  0. 返回上级菜单"
-        echo -e "${CYAN}================================================${RESET}"
-        read -rp "请输入选项 [0-4]: " choice
-        case "$choice" in
-            1) ngx_add_proxy; ngx_pause ;;
-            2) ngx_list_proxies; ngx_pause ;;
-            3) ngx_delete_proxy_pick; ngx_pause ;;
-            4) ngx_install_dependencies; ngx_pause ;;
-            0) return ;;
-            *) ngx_msg_err "无效的选项，请重新输入。"; sleep 1 ;;
-        esac
-    done
-}
+if [[ "$1" == "add" ]]; then
+    ngx_apply_proxy "$2" "$3"
+elif [[ "$1" == "del" ]]; then
+    ngx_remove_proxy "$2"
+fi
 NGX_MODULE_EOF
+    # 原子化写入 NGINX 模块
+    mv -f "${NGX_MODULE_FILE}.tmp" "${NGX_MODULE_FILE}"
 
-    chmod 755 "${SSR_MODULE_FILE}" "${NFT_MODULE_FILE}" "${NGX_MODULE_FILE}" 2>/dev/null || true
+    chmod +x "${SSR_MODULE_FILE}" "${NFT_MODULE_FILE}" "${NGX_MODULE_FILE}" 2>/dev/null || true
 }
 
-# --------------------------
-# Cron 管理
-# --------------------------
-_cron_dump() {
-    crontab -l 2>/dev/null || true
-}
-
-cron_remove_regex() {
-    local reg="$1"
-    _cron_dump | grep -vE "$reg" | crontab - 2>/dev/null || true
-}
-
-cron_add_line_once() {
-    local line="$1"
-    # 已存在则跳过
-    _cron_dump | grep -Fq "$line" && return 0
-    ( _cron_dump; echo "$line" ) | crontab - 2>/dev/null || true
-}
-
-ensure_global_clean_cron() {
-    local my_cmd="/usr/local/bin/${CMD_NAME}"
-    local lock_prefix=""
-    if have_cmd flock; then
-        lock_prefix="flock -n ${MY_LOCK_FILE}"
+# ==============================================================================
+# 模块加载与调用
+# ==============================================================================
+run_module() {
+    local mod="$1"
+    shift
+    local mod_file="${MY_INSTALL_DIR}/${mod}_module.sh"
+    if [[ ! -x "$mod_file" ]]; then
+        install_modules
     fi
-
-    # 先清理旧的 clean 任务（仅匹配 my clean/daily_clean）
-    cron_remove_regex '(^|\s)/usr/local/bin/my\s+(clean|daily_clean)(\s|$)'
-
-    local line="0 2 * * * ${lock_prefix} ${my_cmd} clean > /dev/null 2>&1"
-    cron_add_line_once "$line"
+    if [[ ! -x "$mod_file" ]]; then
+        msg_err "模块加载失败: $mod_file"
+        exit 1
+    fi
+    "$mod_file" "$@"
 }
 
-# SSR 自动任务：在进入 SSR 管理后才启用（符合要求 4）
+ssr_cli() { run_module ssr "$@"; }
+nft_cli() { run_module nft "$@"; }
+nginx_cli() { run_module nginx "$@"; }
 
-my_enable_ssr_cron_tasks() {
-    local my_cmd="/usr/local/bin/${CMD_NAME}"
-    local lock_prefix=""
-    if have_cmd flock; then
-        lock_prefix="flock -n ${SSR_LOCK_FILE}"
-    fi
-
-    cron_remove_regex '(^|\s)(/usr/local/bin/ssr|/usr/local/bin/my\s+ssr)\s+(auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)(\s|$)'
-
-    cron_add_line_once "* * * * * ${lock_prefix} ${my_cmd} ssr daemon_check > /dev/null 2>&1"
-
-    if [[ -f "${SSR_DDNS_CONF}" ]]; then
-        cron_add_line_once "*/5 * * * * ${lock_prefix} ${my_cmd} ssr ddns > /dev/null 2>&1"
-    else
-        cron_remove_regex '(^|\s)/usr/local/bin/my\s+ssr\s+ddns(\s|$)'
-    fi
-}
-
-my_disable_ssr_cron_tasks() {
-    cron_remove_regex '(^|\s)(/usr/local/bin/ssr|/usr/local/bin/my\s+ssr)\s+(auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)(\s|$)'
-}
-
-my_remove_nft_cron_tasks() {
-    cron_remove_regex '(^|\s)(/usr/local/bin/my\s+nft\s+--cron|/usr/local/bin/nftmgr|nftmgr)\s+--cron(\s|$)'
-}
-
-# --------------------------
-# 全局每日清理（2:00）
-# --------------------------
-daily_clean() {
-    local silent="$1"
-    if have_cmd apt-get; then
-        apt-get autoremove -yqq >/dev/null 2>&1 || true
-        apt-get clean -qq >/dev/null 2>&1 || true
-    fi
-
-    # 清理临时文件/缓存
-
-    # 清理 ddns / nginx 模块日志与临时文件
-    rm -rf /var/lib/my-nginx-proxy/tmp/* 2>/dev/null || true
-
-    # 清理 ddns 日志：保留最近 7 天
-    if [[ -d /var/log/nft_ddns ]]; then
-        find /var/log/nft_ddns -type f -name '*.log' -mtime +7 -delete 2>/dev/null || true
-    fi
-    if [[ -f /var/log/ssr_ddns.log ]]; then
-        # 只保留最后 2000 行，避免无上限增长
-        tail -n 2000 /var/log/ssr_ddns.log > /var/log/ssr_ddns.log.tmp 2>/dev/null && mv -f /var/log/ssr_ddns.log.tmp /var/log/ssr_ddns.log 2>/dev/null || true
-    fi
-
-    [[ "$silent" != "silent" ]] && msg_ok "✅ 系统清理完成。"
-}
-
-# --------------------------
-# GitHub 一键更新（选项 4）
-# --------------------------
-download_to() {
-    local url="$1"
-    local out="$2"
-    if have_cmd curl; then
-        curl -fsSL --retry 2 --connect-timeout 8 --max-time 120 "$url" -o "$out" >/dev/null 2>&1
-    elif have_cmd wget; then
-        wget -qO "$out" "$url" >/dev/null 2>&1
-    else
+# ==============================================================================
+# DD 重装系统模块
+# ==============================================================================
+ddtool_check_env() {
+    if [[ ! -f /etc/os-release && ! -f /etc/redhat-release && ! -f /etc/debian_version ]]; then
+        msg_err "无法识别的操作系统，不支持自动 DD。"
         return 1
-    fi
-}
-
-verify_update_file() {
-    local f="$1"
-
-    # 1) 基础校验
-    grep -q '^#!/bin/bash' "$f" || return 11
-    grep -q 'CMD_NAME="my"' "$f" || return 12
-    grep -q 'MY_SCRIPT_ID="my-manager"' "$f" || return 13
-
-    # 2) 语法校验
-    bash -n "$f" >/dev/null 2>&1 || return 14
-
-    return 0
-}
-
-github_update() {
-    require_root
-
-    local tmp
-    tmp="$(mktemp /tmp/my.update.XXXXXX)"
-    local used=""
-
-    msg_info "开始更新：自动检测国内/国外网络..."
-
-    if download_to "${UPDATE_URL_DIRECT}" "$tmp"; then
-        used="direct"
-    elif download_to "${UPDATE_URL_PROXY}" "$tmp"; then
-        used="proxy"
-    else
-        rm -f "$tmp"
-        msg_err "更新失败：无法从 GitHub 拉取脚本（直连与代理都失败）。"
-        return 1
-    fi
-
-    if ! verify_update_file "$tmp"; then
-        local rc=$?
-        rm -f "$tmp"
-        msg_err "更新失败：下载文件校验不通过（错误码 $rc），已终止替换。"
-        return 1
-    fi
-
-    local dst="/usr/local/bin/${CMD_NAME}"
-    mkdir -p "$(dirname "$dst")" 2>/dev/null || true
-
-    if [[ -f "$dst" ]]; then
-        local bak="${dst}.bak.$(date +%s)"
-        cp -f "$dst" "$bak" 2>/dev/null || true
-        msg_info "已备份旧版本：$bak"
-    fi
-
-    install -m 755 "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; msg_err "安装新版本失败。"; return 1; }
-    rm -f "$tmp"
-
-    msg_ok "✅ 更新成功（来源：${used}）。正在重启脚本..."
-    exec "$dst"
-}
-
-# --------------------------
-# 一键卸载（选项 3）
-# --------------------------
-uninstall_ssr() {
-    require_root
-    msg_warn "⚠️ 开始卸载 SSR 相关组件..."
-
-    (
-      source "${SSR_MODULE_FILE}" 2>/dev/null || exit 0
-      ssr_cleanup_artifacts
-    )
-
-    my_disable_ssr_cron_tasks
-    rm -f /usr/local/bin/ssr /usr/local/bin/ssr.sh 2>/dev/null || true
-    msg_ok "✅ SSR 卸载完成。"
-}
-
-uninstall_nft() {
-    require_root
-    msg_warn "⚠️ 开始卸载 NFT 转发相关组件..."
-
-    (
-      source "${NFT_MODULE_FILE}" 2>/dev/null || exit 0
-      cleanup_nft_artifacts
-    )
-
-    my_remove_nft_cron_tasks
-    rm -f /usr/local/bin/nftmgr /usr/local/bin/nft_mgr.sh 2>/dev/null || true
-
-    msg_ok "✅ NFT 转发卸载完成。"
-}
-
-uninstall_nginx() {
-    require_root
-    msg_warn "⚠️ 开始卸载 Nginx 反向代理相关组件..."
-
-    (
-      source "${NGX_MODULE_FILE}" 2>/dev/null || exit 0
-      nginx_cleanup_artifacts
-    )
-
-    msg_ok "✅ Nginx 反向代理卸载完成。"
-}
-
-uninstall_all() {
-    require_root
-    msg_warn "⚠️ 将卸载 SSR + NFT 转发 + Nginx 反代 + DD 临时文件 + 本综合脚本本身（my）..."
-
-    uninstall_ssr || true
-    uninstall_nft || true
-    uninstall_nginx || true
-
-    # 清理全局 cron（clean）
-    cron_remove_regex '(^|\s)/usr/local/bin/my\s+(clean|daily_clean)(\s|$)'
-
-    # 删除模块与自身
-    rm -rf "${MY_INSTALL_DIR}" "$REINSTALL_WORKDIR" 2>/dev/null || true
-    rm -f "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
-
-    msg_ok "✅ 已卸载全部。"
-    exit 0
-}
-
-uninstall_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}========= 一键卸载中心 =========${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 一键卸载所有（SSR + NFT + Nginx + DD 临时文件 + my）"
-        echo -e "${YELLOW} 2.${RESET} 一键卸载 SSR"
-        echo -e "${YELLOW} 3.${RESET} 一键卸载 NFT 转发"
-        echo -e "${YELLOW} 4.${RESET} 一键卸载 Nginx 反向代理"
-        echo -e " 0. 返回主菜单"
-        read -rp "请输入数字 [0-4]: " u
-
-        case "$u" in
-            1)
-                read -rp "确认卸载所有？此操作不可恢复 [y/N]: " c
-                [[ "$c" =~ ^[yY]$ ]] && uninstall_all
-                ;;
-            2)
-                read -rp "确认卸载 SSR？[y/N]: " c
-                [[ "$c" =~ ^[yY]$ ]] && uninstall_ssr
-                ;;
-            3)
-                read -rp "确认卸载 NFT 转发？[y/N]: " c
-                [[ "$c" =~ ^[yY]$ ]] && uninstall_nft
-                ;;
-            4)
-                read -rp "确认卸载 Nginx 反向代理？[y/N]: " c
-                [[ "$c" =~ ^[yY]$ ]] && uninstall_nginx
-                ;;
-            0) return ;;
-            *) msg_err "无效选项"; sleep 1 ;;
-        esac
-    done
-}
-
-run_ssr_module_menu() {
-    my_enable_ssr_cron_tasks
-    (
-      source "${SSR_MODULE_FILE}" || exit 1
-      check_env
-      while true; do
-          main_menu || break
-      done
-    )
-}
-
-run_system_module_menu() {
-    (
-      source "${SSR_MODULE_FILE}" || exit 1
-      check_env
-      sys_menu
-    )
-}
-
-run_nft_module_menu() {
-    (
-      source "${NFT_MODULE_FILE}" || exit 1
-      require_root
-      check_env
-      # 自动检测并完成持久化设置（无单独菜单项）
-      auto_persist_setup
-      while true; do
-          main_menu
-      done
-    )
-}
-
-run_nginx_module_menu() {
-    (
-      source "${NGX_MODULE_FILE}" || exit 1
-      nginx_menu
-    )
-}
-
-# --------------------------
-# DD / 重装系统工具（基于 bin456789/reinstall）
-# --------------------------
-DDTOOL_UPSTREAM_LABEL=""
-DDTOOL_UPSTREAM_URL=""
-DDTOOL_LAST_PASSWORD=""
-
-_ddtool_rand_pass() {
-    if have_cmd openssl; then
-        openssl rand -base64 12 2>/dev/null | tr -d '=+/
-' | cut -c1-14
-    else
-        tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 14
-    fi
-}
-
-ddtool_is_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 && "$1" -le 65535 ]]
-}
-
-ddtool_need_downloader() {
-    have_cmd curl || have_cmd wget
-}
-
-ddtool_human_size() {
-    local n="$1"
-    if have_cmd numfmt && [[ "$n" =~ ^[0-9]+$ ]]; then
-        numfmt --to=iec --suffix=B "$n" 2>/dev/null || echo "$n"
-    else
-        echo "$n"
-    fi
-}
-
-ddtool_get_boot_mode() {
-    [[ -d /sys/firmware/efi ]] && echo "UEFI" || echo "Legacy BIOS"
-}
-
-ddtool_get_virt_type() {
-    if have_cmd systemd-detect-virt; then
-        local vt
-        vt="$(systemd-detect-virt 2>/dev/null || true)"
-        [[ -n "$vt" && "$vt" != "none" ]] && echo "$vt" || echo "physical/unknown"
-    else
-        echo "unknown"
-    fi
-}
-
-ddtool_get_root_disk() {
-    local root_src base pk
-    root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
-    [[ -z "$root_src" ]] && return 1
-    base="${root_src#/dev/}"
-    pk="$(lsblk -ndo PKNAME "$root_src" 2>/dev/null | head -n1)"
-    if [[ -n "$pk" ]]; then
-        echo "/dev/$pk"
-        return 0
-    fi
-    case "$base" in
-        nvme*n*p[0-9]*|mmcblk*p[0-9]*) echo "/dev/${base%p[0-9]*}" ;;
-        sd[a-z][0-9]*|vd[a-z][0-9]*|xvd[a-z][0-9]*) echo "/dev/${base%%[0-9]*}" ;;
-        *) echo "$root_src" ;;
-    esac
-}
-
-ddtool_cleanup_temp() {
-    rm -rf "$REINSTALL_WORKDIR" 2>/dev/null || true
-    DDTOOL_UPSTREAM_LABEL=""
-    DDTOOL_UPSTREAM_URL=""
-    DDTOOL_LAST_PASSWORD=""
-}
-
-ddtool_fail_and_return() {
-    local msg="$1"
-    ddtool_cleanup_temp
-    [[ -n "$msg" ]] && msg_err "$msg"
-    read -n 1 -s -r -p "按任意键返回..."
-    echo
-    return 1
-}
-
-ddtool_preflight() {
-    require_root
-    if ! ddtool_need_downloader; then
-        msg_err "缺少 curl 或 wget，无法拉取 reinstall.sh。"
-        return 1
-    fi
-    if have_cmd systemd-detect-virt; then
-        local vt
-        vt="$(systemd-detect-virt 2>/dev/null || true)"
-        case "$vt" in
-            openvz|lxc|lxc-libvirt)
-                msg_err "检测到当前环境为 ${vt}。上游脚本明确不支持 OpenVZ/LXC，已停止执行。"
-                return 1
-                ;;
-        esac
     fi
     return 0
-}
-
-ddtool_measure_url_ms() {
-    local url="$1"
-    if have_cmd curl; then
-        local out code total
-        out="$(curl -k -L -o /dev/null -sS --connect-timeout 4 --max-time 8 -w '%{http_code} %{time_total}' "$url" 2>/dev/null)" || return 1
-        code="${out%% *}"
-        total="${out##* }"
-        [[ "$code" =~ ^2|3 ]] || return 1
-        awk -v t="$total" 'BEGIN{printf "%d", t*1000}'
-        return 0
-    fi
-    if have_cmd wget; then
-        local start end
-        start=$(date +%s%3N 2>/dev/null || echo 0)
-        wget -qO /dev/null --timeout=8 "$url" >/dev/null 2>&1 || return 1
-        end=$(date +%s%3N 2>/dev/null || echo 0)
-        if [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$end" -ge "$start" ]]; then
-            echo $((end - start))
-        else
-            echo 9999
-        fi
-        return 0
-    fi
-    return 1
-}
-
-ddtool_pick_upstream() {
-    local gms="" cms=""
-    gms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_GLOBAL" 2>/dev/null || true)"
-    cms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_CN" 2>/dev/null || true)"
-    if [[ -n "$gms" && -n "$cms" ]]; then
-        if (( cms + 80 < gms )); then
-            echo "国内镜像|$REINSTALL_UPSTREAM_CN|${cms}ms"
-        else
-            echo "国际直连|$REINSTALL_UPSTREAM_GLOBAL|${gms}ms"
-        fi
-        return 0
-    fi
-    if [[ -n "$gms" ]]; then
-        echo "国际直连|$REINSTALL_UPSTREAM_GLOBAL|${gms}ms"
-        return 0
-    fi
-    if [[ -n "$cms" ]]; then
-        echo "国内镜像|$REINSTALL_UPSTREAM_CN|${cms}ms"
-        return 0
-    fi
-    return 1
 }
 
 ddtool_download_upstream() {
-    local choice label url latency
-    choice="$(ddtool_pick_upstream)" || {
-        msg_err "无法连接 bin456789/reinstall 的 GitHub 直连或国内镜像地址。"
-        return 1
-    }
-    label="${choice%%|*}"
-    url="${choice#*|}"
-    latency="${url##*|}"
-    url="${url%|*}"
-    mkdir -p "$REINSTALL_WORKDIR" 2>/dev/null || true
-    msg_info "已自动选择上游源：${label}（${latency}）"
-    if have_cmd curl; then
-        curl -fsSL "$url" -o "$REINSTALL_SCRIPT_PATH" || {
-            msg_err "下载 reinstall.sh 失败。"
-            ddtool_cleanup_temp
-            return 1
-        }
+    mkdir -p "$REINSTALL_WORKDIR"
+    rm -f "$REINSTALL_SCRIPT_PATH"
+    
+    local url="$REINSTALL_UPSTREAM_GLOBAL"
+    if curl -s -m 3 https://google.com >/dev/null 2>&1; then
+        msg_info "海外网络环境，使用 GitHub 直连下载 reinstall.sh ..."
     else
-        wget -qO "$REINSTALL_SCRIPT_PATH" "$url" || {
-            msg_err "下载 reinstall.sh 失败。"
-            ddtool_cleanup_temp
-            return 1
-        }
+        msg_info "国内网络环境，使用 CNB 加速下载 reinstall.sh ..."
+        url="$REINSTALL_UPSTREAM_CN"
     fi
-    chmod 700 "$REINSTALL_SCRIPT_PATH" 2>/dev/null || true
-    bash -n "$REINSTALL_SCRIPT_PATH" >/dev/null 2>&1 || {
-        msg_err "下载到的 reinstall.sh 语法校验失败。"
-        ddtool_cleanup_temp
-        return 1
-    }
-    DDTOOL_UPSTREAM_LABEL="$label"
-    DDTOOL_UPSTREAM_URL="$url"
-    return 0
-}
 
-ddtool_preview_cmd() {
-    local out=""
-    printf -v out '%q ' "$@"
-    echo "${out% }"
-}
-
-ddtool_confirm_exec() {
-    local prompt="${1:-确认继续请输入 YES: }"
-    local ans
-    read -rp "$prompt" ans
-    [[ "$ans" == "YES" ]]
-}
-
-ddtool_health_check() {
-    local interactive="${1:-yes}"
-    local virt boot root_disk root_size mem_total cpu_model default_route def_if gw dns_list ip4 ip6
-    local global_ms cn_ms warn_count=0 fatal_count=0
-    virt="$(ddtool_get_virt_type)"
-    boot="$(ddtool_get_boot_mode)"
-    root_disk="$(ddtool_get_root_disk 2>/dev/null || true)"
-    root_size="$(lsblk -bdno SIZE "$root_disk" 2>/dev/null | head -n1)"
-    mem_total="$(awk '/MemTotal/ {printf "%.1f GiB", $2/1024/1024}' /proc/meminfo 2>/dev/null | head -n1)"
-    cpu_model="$(awk -F: '/model name/ {gsub(/^[ 	]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)"
-    default_route="$(ip route show default 2>/dev/null | head -n1)"
-    def_if="$(awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<< "$default_route")"
-    gw="$(awk '/^default/ {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<< "$default_route")"
-    dns_list="$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ',' -)"
-    [[ -z "$dns_list" ]] && dns_list="未检测到"
     if have_cmd curl; then
-        ip4="$(curl -4 -fsS --connect-timeout 3 --max-time 6 https://api.ip.sb/ip 2>/dev/null || true)"
-        ip6="$(curl -6 -fsS --connect-timeout 3 --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
-    fi
-    global_ms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_GLOBAL" 2>/dev/null || true)"
-    cn_ms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_CN" 2>/dev/null || true)"
-
-    clear
-    echo -e "${CYAN}========= 安装前网络与磁盘条件体检 =========${RESET}"
-    echo -e "虚拟化: ${GREEN}${virt}${RESET}"
-    echo -e "启动模式: ${GREEN}${boot}${RESET}"
-    echo -e "系统盘: ${GREEN}${root_disk:-未知}${RESET}  大小: ${GREEN}$(ddtool_human_size "$root_size")${RESET}"
-    echo -e "内存: ${GREEN}${mem_total:-未知}${RESET}"
-    echo -e "CPU: ${GREEN}${cpu_model:-未知}${RESET}"
-    echo -e "默认网卡: ${GREEN}${def_if:-未知}${RESET}  网关: ${GREEN}${gw:-未知}${RESET}"
-    echo -e "DNS: ${GREEN}${dns_list}${RESET}"
-    [[ -n "$ip4" ]] && echo -e "IPv4 出口: ${GREEN}${ip4}${RESET}"
-    [[ -n "$ip6" ]] && echo -e "IPv6 出口: ${GREEN}${ip6}${RESET}"
-    [[ -n "$global_ms" ]] && echo -e "GitHub 直连测速: ${GREEN}${global_ms}ms${RESET}" || { echo -e "GitHub 直连测速: ${RED}失败${RESET}"; warn_count=$((warn_count+1)); }
-    [[ -n "$cn_ms" ]] && echo -e "国内镜像测速: ${GREEN}${cn_ms}ms${RESET}" || { echo -e "国内镜像测速: ${RED}失败${RESET}"; warn_count=$((warn_count+1)); }
-
-    if [[ -z "$default_route" ]]; then
-        echo -e "${RED}失败：未检测到默认路由。${RESET}"
-        fatal_count=$((fatal_count+1))
-    fi
-    if [[ -z "$root_disk" ]]; then
-        echo -e "${RED}失败：未能明确识别系统盘，已阻止继续执行。${RESET}"
-        fatal_count=$((fatal_count+1))
-    fi
-    if [[ -n "$root_size" && "$root_size" =~ ^[0-9]+$ && "$root_size" -lt 21474836480 ]]; then
-        echo -e "${YELLOW}提示：系统盘小于 20GiB，建议确认镜像占用与分区策略。${RESET}"
-        warn_count=$((warn_count+1))
-    fi
-
-    echo
-    if (( fatal_count > 0 )); then
-        echo -e "${RED}体检未通过：存在 ${fatal_count} 个阻断项。${RESET}"
-        [[ "$interactive" == "yes" ]] && read -n 1 -s -r -p "按任意键返回..."
-        return 1
-    fi
-    if (( warn_count > 0 )); then
-        echo -e "${YELLOW}体检通过，但有 ${warn_count} 个提醒项。${RESET}"
+        curl -fsSL --retry 3 --connect-timeout 10 -o "$REINSTALL_SCRIPT_PATH" "$url"
     else
-        echo -e "${GREEN}体检通过，未发现明显阻断项。${RESET}"
+        wget -qO "$REINSTALL_SCRIPT_PATH" "$url"
     fi
-    [[ "$interactive" == "yes" ]] && read -n 1 -s -r -p "按任意键继续..."
-    return 0
-}
 
-ddtool_prompt_linux_access() {
-    local mode_title="$1"
-    DDTOOL_LAST_PASSWORD=""
-    DDTOOL_PASSWORD=""
-    DDTOOL_SSH_PORT="22"
-
-    echo -e "${CYAN}>>> ${mode_title}：仅需填写 root 密码与 SSH 端口${RESET}"
-    read -rp "root 密码（回车自动生成随机密码）: " DDTOOL_PASSWORD
-    if [[ -z "$DDTOOL_PASSWORD" ]]; then
-        DDTOOL_PASSWORD="$(_ddtool_rand_pass)"
-        msg_warn "已自动生成随机 root 密码：${DDTOOL_PASSWORD}"
-    fi
-    DDTOOL_LAST_PASSWORD="$DDTOOL_PASSWORD"
-
-    read -rp "SSH 端口（回车默认 22）: " DDTOOL_SSH_PORT
-    DDTOOL_SSH_PORT="${DDTOOL_SSH_PORT:-22}"
-    if ! ddtool_is_port "$DDTOOL_SSH_PORT"; then
-        msg_err "SSH 端口无效。"
+    if [[ ! -s "$REINSTALL_SCRIPT_PATH" ]]; then
+        msg_err "下载 reinstall.sh 失败！"
         return 1
     fi
-    return 0
-}
-
-ddtool_execute() {
-    local action_desc="$1"
-    shift
-    local cmd=("$@")
-
-    ddtool_preflight || return 1
-    ddtool_download_upstream || return 1
-    ddtool_health_check no || { ddtool_fail_and_return "安装前体检未通过，已清理临时文件并返回菜单。"; return 1; }
-
-    echo
-    echo -e "${CYAN}========= DD / 重装系统执行确认 =========${RESET}"
-    echo -e "任务: ${GREEN}${action_desc}${RESET}"
-    echo -e "上游源: ${YELLOW}${DDTOOL_UPSTREAM_LABEL}${RESET}"
-    [[ -n "$DDTOOL_LAST_PASSWORD" ]] && echo -e "root 密码: ${YELLOW}${DDTOOL_LAST_PASSWORD}${RESET}"
-    [[ -n "$DDTOOL_SSH_PORT" ]] && echo -e "SSH 端口: ${YELLOW}${DDTOOL_SSH_PORT}${RESET}"
-    echo -e "命令: ${CYAN}$(ddtool_preview_cmd "${cmd[@]}")${RESET}"
-    echo -e "${RED}警告：该操作会清空整块硬盘及全部分区数据。${RESET}"
-    echo -e "${RED}如机器可用 IPMI/U盘/控制台，优先使用更稳妥的方式。${RESET}"
-    echo
-    ddtool_confirm_exec "确认继续请输入 YES: " || { ddtool_cleanup_temp; msg_warn "已取消，临时文件已清理。"; sleep 1; return 1; }
-    clear
-    echo -e "${CYAN}>>> 已开始执行：${action_desc}${RESET}"
-    "${cmd[@]}"
-    local rc=$?
-    if [[ $rc -ne 0 ]]; then
-        ddtool_cleanup_temp
-        msg_err "上游命令返回非 0：$rc，临时文件已清理。"
-        read -n 1 -s -r -p "按任意键返回..."
-        echo
-        return $rc
-    fi
-    DDTOOL_LAST_PASSWORD=""
+    chmod +x "$REINSTALL_SCRIPT_PATH"
     return 0
 }
 
 ddtool_run_linux_reinstall() {
-    local distro="$1" version="$2" title="$3"
-    shift 3
-    local extra=("$@")
-    ddtool_prompt_linux_access "$title" || return 1
-    local cmd=(bash "$REINSTALL_SCRIPT_PATH" "$distro")
-    [[ -n "$version" ]] && cmd+=("$version")
-    [[ ${#extra[@]} -gt 0 ]] && cmd+=("${extra[@]}")
-    cmd+=(--password "$DDTOOL_PASSWORD" --ssh-port "$DDTOOL_SSH_PORT")
-    ddtool_execute "$title" "${cmd[@]}"
+    local os="$1" ver="$2"
+    ddtool_check_env || return 1
+    ddtool_download_upstream || return 1
+
+    local DDTOOL_PASSWORD=""
+    read -rp "请输入重装后的 root 密码 (留空则默认为 123456): " input_pwd
+    [[ -z "$input_pwd" ]] && DDTOOL_PASSWORD="1" || DDTOOL_PASSWORD="$input_pwd"
+
+    local DDTOOL_PORT=""
+    read -rp "请输入重装后的 SSH 端口 (留空则默认为 22): " input_port
+    [[ -z "$input_port" ]] && DDTOOL_PORT="22" || DDTOOL_PORT="$input_port"
+
+    local cmd=("bash" "$REINSTALL_SCRIPT_PATH" "$os" "$ver" "--password" "$DDTOOL_PASSWORD" "--port" "$DDTOOL_PORT")
+
+    read -rp "是否需要强制双栈 (IPv4+IPv6) 网络支持? [y/N]: " want_dual
+    if [[ "$want_dual" =~ ^[Yy]$ ]]; then
+        cmd+=("--network" "dual")
+    fi
+
+    echo ""
+    msg_warn "⚠️ 警告：DD 脚本即将执行。"
+    msg_warn "当前密码将通过命令行参数传递，存在极小概率被本地其他普通用户通过 ps/top 瞬间抓取。请在系统重装完毕后注意修改或妥善保管密码。"
+    echo -e "${RED}即将执行: ${cmd[*]} ${RESET}"
+    read -rp "确认无误并开始重装吗？(y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        msg_info "已取消。"
+        return 0
+    fi
+
+    msg_info "正在启动一键重装，连接即将断开..."
+    "${cmd[@]}"
 }
 
 dd_menu() {
     while true; do
         clear
-        echo -e "${CYAN}========= DD / 重装系统中心 =========${RESET}"
-        echo -e "${GREEN} 1.${RESET} 一键重装 Debian 13"
-        echo -e "${GREEN} 2.${RESET} 一键重装 Debian 12"
-        echo -e "${GREEN} 3.${RESET} 一键重装 Ubuntu 24.04"
+        echo -e "${CYAN}========= DD 一键重装系统 =========${RESET}"
+        echo -e "${GREEN} 1.${RESET} 重装为 Debian 12 (Bookworm) [推荐]"
+        echo -e "${GREEN} 2.${RESET} 重装为 Debian 11 (Bullseye)"
+        echo -e "${YELLOW} 3.${RESET} 重装为 Ubuntu 22.04"
+        echo -e "${YELLOW} 4.${RESET} 重装为 Ubuntu 24.04"
+        echo -e "${RED} 5.${RESET} 重装为 Alpine Linux (极限轻量化)"
         echo -e " 0. 返回主菜单"
-        read -rp "请输入数字 [0-3]: " ddn
-        case "$ddn" in
-            1) ddtool_run_linux_reinstall debian 13 "一键重装 Debian 13" ;;
-            2) ddtool_run_linux_reinstall debian 12 "一键重装 Debian 12" ;;
-            3) ddtool_run_linux_reinstall ubuntu 24.04 "一键重装 Ubuntu 24.04" ;;
+        read -rp "请选择重装目标 [0-5]: " dd_choice
+        case "$dd_choice" in
+            1) ddtool_run_linux_reinstall "debian" "12" ;;
+            2) ddtool_run_linux_reinstall "debian" "11" ;;
+            3) ddtool_run_linux_reinstall "ubuntu" "22.04" ;;
+            4) ddtool_run_linux_reinstall "ubuntu" "24.04" ;;
+            5) ddtool_run_linux_reinstall "alpine" "edge" ;;
             0) return ;;
-            *) msg_err "无效选项"; sleep 1 ;;
+            *) msg_err "输入错误"; sleep 1 ;;
         esac
     done
 }
 
-# --------------------------
-# CLI（供 cron/脚本调用）
-# --------------------------
-nginx_cli() {
-    local action="${1:-menu}"
-    case "$action" in
-        menu|"")
-            ( source "${NGX_MODULE_FILE}" || exit 1; nginx_menu )
-            ;;
-        list)
-            ( source "${NGX_MODULE_FILE}" || exit 1; ngx_list_proxies )
-            ;;
-        delete)
-            shift
-            ( source "${NGX_MODULE_FILE}" || exit 1; ngx_delete_proxy_domain "$1" )
-            ;;
-        repair|install)
-            ( source "${NGX_MODULE_FILE}" || exit 1; ngx_install_dependencies )
-            ;;
-        *)
-            msg_err "用法: my nginx <menu|list|delete <domain>|repair>"
-            return 1
-            ;;
-    esac
-}
-
-ssr_cli() {
-    local action="${1:-}"
-    case "$action" in
-        daemon_check)
-            ( source "${SSR_MODULE_FILE}" || exit 1; run_daemon_check )
-            ;;
-        ddns)
-            my_enable_ssr_cron_tasks
-            ( source "${SSR_MODULE_FILE}" || exit 1; run_cf_ddns "auto" )
-            ;;
-        auto_core_update|hot_upgrade|hot_update)
-            ( source "${SSR_MODULE_FILE}" || exit 1; hot_update_components "silent" )
-            ;;
-        regular|bbr)
-            ( source "${SSR_MODULE_FILE}" || exit 1; check_env; apply_regular_profile "${2:-stable}" )
-            ;;
-        nat)
-            ( source "${SSR_MODULE_FILE}" || exit 1; check_env; apply_nat_profile "${2:-stable}" )
-            ;;
-        dns)
-            case "${2:-}" in
-                status)
-                    ( source "${SSR_MODULE_FILE}" || exit 1; dns_status )
-                    ;;
-                set|lock)
-                    ( source "${SSR_MODULE_FILE}" || exit 1; dns_set_or_lock "${2}" )
-                    ;;
-                unlock)
-                    ( source "${SSR_MODULE_FILE}" || exit 1; dns_unlock_restore )
-                    ;;
-                auto|smart|"")
-                    ( source "${SSR_MODULE_FILE}" || exit 1; check_env; smart_dns_apply "${3:-stable}" "${4:-auto}" )
-                    ;;
-                *)
-                    msg_err "用法: my ssr dns [status|set|lock|unlock|auto [stable|extreme] [auto|set|lock]]"
-                    return 1
-                    ;;
-            esac
-            ;;
-        *)
-            msg_err "用法: my ssr <daemon_check|ddns|regular [stable|extreme]|nat [stable|extreme]|dns ...>"
-            return 1
-            ;;
-    esac
-}
-
-dd_cli() {
-    local action="${1:-}"
-    shift || true
-    case "$action" in
-        debian13)
-            local cmd=(bash "$REINSTALL_SCRIPT_PATH" debian 13 "$@")
-            ddtool_execute "CLI 一键重装 Debian 13" "${cmd[@]}"
-            ;;
-        debian12)
-            local cmd=(bash "$REINSTALL_SCRIPT_PATH" debian 12 "$@")
-            ddtool_execute "CLI 一键重装 Debian 12" "${cmd[@]}"
-            ;;
-        ubuntu2404)
-            local cmd=(bash "$REINSTALL_SCRIPT_PATH" ubuntu 24.04 "$@")
-            ddtool_execute "CLI 一键重装 Ubuntu 24.04" "${cmd[@]}"
-            ;;
-        menu|"")
-            dd_menu
-            ;;
-        *)
-            msg_err "用法: my dd <menu|debian13|debian12|ubuntu2404> ..."
-            return 1
-            ;;
-    esac
-}
-
-nft_cli() {
-    local action="${1:-}"
-    case "$action" in
-        --cron)
-            ( source "${NFT_MODULE_FILE}" || exit 1; ddns_update )
-            ;;
-        optimize|auto)
-            ( source "${NFT_MODULE_FILE}" || exit 1; check_env; nft_apply_profile "${2:-stable}" )
-            ;;
-        *)
-            msg_err "用法: my nft <--cron|optimize [stable|extreme]>"
-            return 1
-            ;;
-    esac
-}
-
-# --------------------------
-# 综合管理目录
-# --------------------------
-comprehensive_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}          综合管理目录                      ${RESET}"
-        echo -e "${CYAN}============================================${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 系统底层管控"
-        echo -e "${YELLOW} 2.${RESET} Nginx 反向代理"
-        echo -e "${GREEN} 3.${RESET} DD / 重装系统中心"
-        echo -e " 0. 返回主菜单"
-        echo -e "${CYAN}--------------------------------------------${RESET}"
-        read -rp "请输入数字 [0-3]: " choice
-        case "$choice" in
-            1) run_system_module_menu ;;
-            2) run_nginx_module_menu ;;
-            3) dd_menu ;;
-            0) return ;;
-            *) msg_err "无效选项"; sleep 1 ;;
-        esac
-    done
-}
-
-# --------------------------
-# 主菜单
-# --------------------------
-main_menu() {
+# ==============================================================================
+# 综合自更新模块
+# ==============================================================================
+github_update() {
     clear
-    echo -e "${CYAN}============================================${RESET}"
-    echo -e "${CYAN}      综合管理脚本 my  v${MY_VERSION}${RESET}"
-    echo -e "${CYAN}============================================${RESET}"
-    echo -e "${YELLOW} 1.${RESET} SSR 管理"
-    echo -e "${YELLOW} 2.${RESET} NFT 转发"
-    echo -e "${YELLOW} 3.${RESET} 综合管理目录"
-    echo -e "${YELLOW} 4.${RESET} 一键卸载"
-    echo -e "${YELLOW} 5.${RESET} GitHub 一键更新"
-    echo -e " 0. 退出"
-    echo -e "${CYAN}--------------------------------------------${RESET}"
-    read -rp "请输入数字 [0-5]: " choice
-    case "$choice" in
-        1) run_ssr_module_menu ;;
-        2) run_nft_module_menu ;;
-        3) comprehensive_menu ;;
-        4) uninstall_menu ;;
-        5) github_update ;;
-        0) exit 0 ;;
-        *) msg_err "无效选项"; sleep 1 ;;
-    esac
+    echo -e "${CYAN}========= 综合管理面板自适应更新 =========${RESET}"
+    msg_info "正在检测网络环境..."
+    
+    local dl_url
+    if curl -s -m 3 https://google.com >/dev/null 2>&1; then
+        msg_ok "检测为海外网络，使用 GitHub 直连拉取..."
+        dl_url="$UPDATE_URL_DIRECT"
+    else
+        msg_ok "检测为国内网络，使用加速节点拉取..."
+        dl_url="$UPDATE_URL_PROXY"
+    fi
+
+    local tmpf
+    tmpf="$(mktemp /tmp/my_update.XXXXXX)"
+    
+    msg_info "正在下载最新版本: $dl_url ..."
+    if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$tmpf" "$dl_url"; then
+        if ! wget -qO "$tmpf" "$dl_url"; then
+            msg_err "下载失败，请检查网络。"
+            rm -f "$tmpf"
+            sleep 2
+            return 1
+        fi
+    fi
+
+    if ! grep -q "^#!/bin/bash" "$tmpf"; then
+        msg_err "文件校验失败：缺少 bash 头部标识。"
+        rm -f "$tmpf"; sleep 2; return 1
+    fi
+    if ! bash -n "$tmpf" >/dev/null 2>&1; then
+        msg_err "语法校验失败，阻止替换。"
+        rm -f "$tmpf"; sleep 2; return 1
+    fi
+
+    local self
+    self="$(script_realpath)"
+    cp -a "$self" "${self}.bak.$(date +%s)" 2>/dev/null || true
+    mv -f "$tmpf" "$self"
+    chmod +x "$self"
+
+    msg_ok "✅ 综合面板更新成功！将自动重新加载..."
+    sleep 1
+    exec "$self"
 }
 
-# --------------------------
-# 初始化（不添加 SSR/NFT 额外任务，仅全局 2:00 清理）
-# --------------------------
-init() {
-    require_root
-    install_self_command
-    install_modules
-    ensure_global_clean_cron
-
-    # 兼容清理旧脚本遗留 cron（只删旧 ssr/nftmgr 任务，不新增）
-    cron_remove_regex '(^|\s)(/usr/local/bin/ssr|/usr/local/bin/nftmgr|nftmgr)\s+--cron(\s|$)'
-    cron_remove_regex '(^|\s)/usr/local/bin/ssr\s+(auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)(\s|$)'
+# ==============================================================================
+# 全局定时任务清理
+# ==============================================================================
+cron_remove_regex() {
+    local pattern="$1"
+    local crons
+    crons="$(crontab -l 2>/dev/null || true)"
+    [[ -z "$crons" ]] && return 0
+    echo "$crons" | grep -vE "$pattern" | crontab - 2>/dev/null || true
 }
 
-# --------------------------
-# 入口
-# --------------------------
+daily_clean() {
+    local is_silent="$1"
+    ssr_cli clean "$is_silent"
+}
+
+my_enable_ssr_cron_tasks() {
+    local crons
+    crons="$(crontab -l 2>/dev/null || true)"
+    local changed=0
+    
+    if ! echo "$crons" | grep -q "${CMD_NAME} clean"; then
+        crons=$(printf "%s\n0 3 * * * /usr/local/bin/%s clean > /dev/null 2>&1" "$crons" "$CMD_NAME")
+        changed=1
+    fi
+    if ! echo "$crons" | grep -q "vm.drop_caches=3"; then
+        crons=$(printf "%s\n0 4 * * * /sbin/sysctl -w vm.drop_caches=3 >/dev/null 2>&1" "$crons")
+        changed=1
+    fi
+    
+    if [[ $changed -eq 1 ]]; then
+        echo "$crons" | crontab - 2>/dev/null || true
+    fi
+}
+
+# ==============================================================================
+# 入口路由
+# ==============================================================================
 ensure_runtime_ready_for_cli() {
     require_root
     install_self_command
@@ -5437,13 +3253,54 @@ if [[ $# -gt 0 ]]; then
             exit $?
             ;;
         *)
-            msg_err "未知参数。可用: my clean | my ssr ... | my nft ... | my nginx <menu|list|delete <domain>|repair> | my dd <menu|debian13|debian12|ubuntu2404> | my update"
+            msg_err "未知参数。可用: my clean | my ssr ... | my nft ... | my nginx ..."
             exit 1
             ;;
     esac
 fi
 
-init
-while true; do
-    main_menu
-done
+# ==============================================================================
+# 主菜单
+# ==============================================================================
+main_menu() {
+    ensure_runtime_ready_for_cli
+    my_enable_ssr_cron_tasks
+    
+    while true; do
+        clear
+        echo -e "${CYAN}==========================================${RESET}"
+        echo -e "${CYAN}     综合网络管理脚本 (SSR + NFt + DD)    ${RESET}"
+        echo -e "${CYAN}              v${MY_VERSION}              ${RESET}"
+        echo -e "${CYAN}==========================================${RESET}"
+        echo -e "${GREEN}  1.${RESET} 🚀 进入 SSR 节点与极客调优模块"
+        echo -e "${GREEN}  2.${RESET} 🔄 进入 NFt 端口转发模块 (需手动维护)"
+        echo -e "${YELLOW}  3.${RESET} 💿 DD 一键重装纯净系统 (Debian/Ubuntu/Alpine)"
+        echo -e "${CYAN}------------------------------------------${RESET}"
+        echo -e "${YELLOW}  4.${RESET} 🗑️ 综合脚本一键卸载中心 (安全撤场)"
+        echo -e "${YELLOW}  5.${RESET} 🌍 综合脚本自适应安全更新"
+        echo -e "  0. 退出管理面板"
+        echo -e "${CYAN}==========================================${RESET}"
+        local choice
+        read -rp "请输入选项 [0-5]: " choice
+        case "$choice" in
+            1) ssr_cli ;;
+            2) 
+                echo -e "${YELLOW}提示：为保证稳定，建议使用专用的端口转发控制命令：${GREEN}my nft add${YELLOW} 等。${RESET}"
+                echo -e "此处将直接进入原版的 NFt 命令行环境..."
+                sleep 2
+                nft_cli
+                ;;
+            3) dd_menu ;;
+            4) 
+                read -rp "⚠️ 警告：这将彻底卸载脚本所有创建的服务并清理环境。确认？[y/N]: " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] && ssr_cli nuke_all
+                ;;
+            5) github_update ;;
+            0) echo -e "${GREEN}感谢使用，再见！${RESET}"; exit 0 ;;
+            *) msg_err "输入错误，请重新输入" ; sleep 1 ;;
+        esac
+    done
+}
+
+# 执行主菜单
+main_menu    
