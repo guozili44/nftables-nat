@@ -2774,19 +2774,83 @@ total_uninstall() {
     exit 0
 }
 
+manage_quic_udp443() {
+    local action="$1"
+    if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
+        if [[ "$action" == "block" ]]; then
+            ufw deny in 443/udp >/dev/null 2>&1
+            ufw deny out 443/udp >/dev/null 2>&1
+        else
+            ufw delete deny in 443/udp >/dev/null 2>&1
+            ufw delete deny out 443/udp >/dev/null 2>&1
+        fi
+        ufw reload >/dev/null 2>&1
+    elif have_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
+        if [[ "$action" == "block" ]]; then
+            firewall-cmd --permanent --add-rich-rule='rule family="ipv4" port port="443" protocol="udp" drop' >/dev/null 2>&1
+            firewall-cmd --permanent --add-rich-rule='rule family="ipv6" port port="443" protocol="udp" drop' >/dev/null 2>&1
+        else
+            firewall-cmd --permanent --remove-rich-rule='rule family="ipv4" port port="443" protocol="udp" drop' >/dev/null 2>&1
+            firewall-cmd --permanent --remove-rich-rule='rule family="ipv6" port port="443" protocol="udp" drop' >/dev/null 2>&1
+        fi
+        firewall-cmd --reload >/dev/null 2>&1
+    else
+        if [[ "$action" == "block" ]]; then
+            iptables -I INPUT -p udp --dport 443 -j DROP 2>/dev/null
+            iptables -I OUTPUT -p udp --dport 443 -j DROP 2>/dev/null
+            ip6tables -I INPUT -p udp --dport 443 -j DROP 2>/dev/null
+            ip6tables -I OUTPUT -p udp --dport 443 -j DROP 2>/dev/null
+            have_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+        else
+            while iptables -D INPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
+            while iptables -D OUTPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
+            while ip6tables -D INPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
+            while ip6tables -D OUTPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
+            have_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if [[ "$action" == "block" ]]; then
+        echo -e "${GREEN}✅ 已成功阻断 UDP 443 端口 (QUIC 已关闭)。${RESET}"
+    else
+        echo -e "${GREEN}✅ 已成功放行 UDP 443 端口 (QUIC 已开启)。${RESET}"
+    fi
+    sleep 2
+}
+
+quic_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}========= QUIC 防火墙管理 (防 QoS) =========${RESET}"
+        echo -e "${YELLOW}说明：阻断 UDP 443 可有效防止运营商对 UDP 流量的 QoS 和阻断，${RESET}"
+        echo -e "${YELLOW}      强制科学代理流量回退至更稳定的 TCP 协议。${RESET}"
+        echo -e "------------------------------------------------"
+        echo -e "${RED} 1.${RESET} 一键阻断 UDP 443 (关闭 QUIC - 推荐稳定)${RESET}"
+        echo -e "${GREEN} 2.${RESET} 一键放行 UDP 443 (开启 QUIC - 默认状态)${RESET}"
+        echo -e " 0. 返回上一级"
+        read -rp "请选择 [0-2]: " q_num
+        case "$q_num" in
+            1) manage_quic_udp443 "block" ;;
+            2) manage_quic_udp443 "unblock" ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+# =======================================================
 # 系统菜单
 sys_menu() {
     while true; do
         clear
-        echo -e "${CYAN}========= 系统基础与极客管理 =========${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 一键修改 SSH 安全端口"
-        echo -e "${YELLOW} 2.${RESET} 一键修改 Root 密码"
-        echo -e "${YELLOW} 3.${RESET} 服务器时间防偏移同步"
-        echo -e "${YELLOW} 4.${RESET} SSH 密钥登录管理中心"
-        echo -e "${GREEN} 5.${RESET} 原生 Cloudflare DDNS 解析模块"
-        echo -e "${YELLOW} 6.${RESET} DNS 管理中心（智能/手动/锁定/恢复）"
-        echo -e " 0. 返回上级菜单"
-        read -rp "输入数字 [0-6]: " sys_num
+        echo -e "${CYAN}================== 系统基础与极客管理 ==================${RESET}"
+        echo -e "  ${YELLOW}1.${RESET} 一键修改 SSH 安全端口      ${GREEN}5.${RESET} 原生 Cloudflare DDNS 解析模块"
+        echo -e "  ${YELLOW}2.${RESET} 一键修改 Root 密码         ${YELLOW}6.${RESET} DNS 管理中心（智能/锁定/恢复）"
+        echo -e "  ${YELLOW}3.${RESET} 服务器时间防偏移同步       ${RED}7.${RESET} 防 QoS：一键开启/关闭 QUIC"
+        echo -e "  ${YELLOW}4.${RESET} SSH 密钥登录管理中心"
+        echo -e "  0. 返回上级菜单"
+        echo -e "${CYAN}========================================================${RESET}"
+        read -rp "请输入数字 [0-7]: " sys_num
         case "$sys_num" in
             1) change_ssh_port ;;
             2) change_root_password ;;
@@ -2794,7 +2858,9 @@ sys_menu() {
             4) ssh_key_menu ;;
             5) cf_ddns_menu ;;
             6) dns_menu ;;
+            7) quic_menu ;;
             0) return ;;
+            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
         esac
     done
 }
