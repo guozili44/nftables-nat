@@ -678,7 +678,7 @@ plugin_state_write() {
     mkdir -p "$META_DIR" 2>/dev/null || true
     : > "$file"
     while [[ $# -ge 2 ]]; do
-        printf '%s="%s"\n' "$1" "$2" >> "$file""
+        printf '%s="%s"\n' "$1" "$2" >> "$file"
         shift 2
     done
     chmod 600 "$file" 2>/dev/null || true
@@ -901,7 +901,7 @@ start_managed_service() {
     local name="$1" unit_content="$2" bg_cmd="$3" bg_match="$4" log_file="$5" pid_file="$6"
     if service_use_systemd; then
         mkdir -p /etc/systemd/system 2>/dev/null || true
-        printf '%s\n' "$unit_content" > "/etc/systemd/system/${name}.service""
+        printf '%s\n' "$unit_content" > "/etc/systemd/system/${name}.service"
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable --now "$name" >/dev/null 2>&1 || return 1
         sleep 1
@@ -2770,7 +2770,7 @@ install_vless_native() {
 
     mkdir -p /usr/local/etc/xray
     local uuid keys priv pub short_id
-    uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || /usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '\r')
+    uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '\r')
     keys=$(/usr/local/bin/xray x25519 2>&1 | tr -d '\r')
     priv=$(xray_extract_reality_private_key "$keys")
     pub=$(xray_extract_reality_public_key "$keys")
@@ -3761,8 +3761,6 @@ main_menu() {
         *) echo -e "${RED}请输入正确的选项！${RESET}"; sleep 1 ;;
     esac
 }
-
-SSR_MODULE_EOF
 
 SSR_MODULE_EOF
 mv -f "${SSR_MODULE_FILE}.tmp" "${SSR_MODULE_FILE}"
@@ -5505,8 +5503,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2 fastopen=256;
-    listen [::]:443 ssl http2 fastopen=256;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name ${domain};
 
     access_log ${NGX_LOG_DIR}/${domain}_access.log;
