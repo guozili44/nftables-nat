@@ -3433,28 +3433,6 @@ get_nginx_status_brief() {
     fi
 }
 
-global_status_dashboard() {
-    local ssh_port ssh_auth ddns dns quic nodes nft_rules nginx
-    ssh_port=$(get_ssh_port_brief)
-    ssh_auth=$(get_ssh_auth_brief)
-    ddns=$(get_cf_ddns_brief_status)
-    dns=$(get_dns_brief_status)
-    quic=$(get_quic_status_brief)
-    nodes=$(count_proxy_nodes_brief)
-    nft_rules=$(get_nft_rules_brief)
-    nginx=$(get_nginx_status_brief)
-
-    clear
-    echo -e "${CYAN}================ 全局状态总览 ================${RESET}"
-    echo -e "代理节点: ${YELLOW}${nodes}${RESET} 个   NFT 转发规则: ${YELLOW}${nft_rules}${RESET} 条   Nginx: ${YELLOW}${nginx}${RESET}"
-    echo -e "SSH 端口: ${YELLOW}${ssh_port}${RESET}   SSH 登录: ${YELLOW}${ssh_auth}${RESET}"
-    echo -e "DNS: ${YELLOW}${dns}${RESET}   DDNS: ${YELLOW}${ddns}${RESET}"
-    echo -e "QUIC/UDP 443: ${YELLOW}${quic}${RESET}"
-    echo -e "${CYAN}==============================================${RESET}"
-    echo ""
-    read -n 1 -s -r -p "按任意键返回..."
-}
-
 manage_quic_udp443() {
     local action="$1"
     if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
@@ -3560,33 +3538,79 @@ sys_menu() {
     done
 }
 
+
+ssr_deploy_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}============= 节点部署中心 =============${RESET}"
+        echo -e "${YELLOW} 1.${RESET} 原生部署 SS-Rust"
+        echo -e "${YELLOW} 2.${RESET} 自动部署 SS2022 + v2ray-plugin"
+        echo -e "${YELLOW} 3.${RESET} 原生部署 VLESS Reality"
+        echo -e " 0. 返回上一级"
+        echo -e "${CYAN}========================================${RESET}"
+        read -rp "请输入对应数字 [0-3]: " num
+        case "$num" in
+            1) install_ss_rust_native ;;
+            2) install_ss_v2ray_plugin_native ;;
+            3) install_vless_native ;;
+            0) return ;;
+            *) echo -e "${RED}请输入正确的选项！${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+ssr_ops_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}============= 节点运维中心 =============${RESET}"
+        echo -e "${GREEN} 1.${RESET} 统一节点管控中心 (查看 / 修改端口 / 删除 / 核爆)"
+        echo -e "${GREEN} 2.${RESET} 核心缓存与更新中心"
+        echo -e " 0. 返回上一级"
+        echo -e "${CYAN}========================================${RESET}"
+        read -rp "请输入对应数字 [0-2]: " num
+        case "$num" in
+            1) unified_node_manager ;;
+            2) core_cache_menu ;;
+            0) return ;;
+            *) echo -e "${RED}请输入正确的选项！${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+ssr_tools_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}========== 网络优化与维护工具 ===========${RESET}"
+        echo -e "${YELLOW} 1.${RESET} 网络优化与系统清理 (手动常规/NAT + 清理)"
+        echo -e " 0. 返回上一级"
+        echo -e "${CYAN}========================================${RESET}"
+        read -rp "请输入对应数字 [0-1]: " num
+        case "$num" in
+            1) opt_menu ;;
+            0) return ;;
+            *) echo -e "${RED}请输入正确的选项！${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
 main_menu() {
     clear
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${CYAN}       SSR 综合智能管理脚本 v${SCRIPT_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${YELLOW} 1.${RESET} 原生部署 SS-Rust"
-    echo -e "${YELLOW} 2.${RESET} 自动部署 SS2022 + v2ray-plugin"
-    echo -e "${YELLOW} 3.${RESET} 原生部署 VLESS Reality"
-    echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${GREEN} 4.${RESET} 🔰 统一节点管控中心 (查看 / 修改端口 / 删除 / 核爆)"
-    echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (手动常规/NAT + 清理)"
-    echo -e "${GREEN} 6.${RESET} 核心缓存与更新中心"
+    echo -e "${YELLOW} 1.${RESET} 节点部署中心"
+    echo -e "${GREEN} 2.${RESET} 节点运维中心"
+    echo -e "${YELLOW} 3.${RESET} 网络优化与维护工具"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 返回上级菜单"
-    read -rp "请输入对应数字 [0-6]: " num
+    read -rp "请输入对应数字 [0-3]: " num
     case "$num" in
-        1) install_ss_rust_native ;;
-        2) install_ss_v2ray_plugin_native ;;
-        3) install_vless_native ;;
-        4) unified_node_manager ;;
-        5) opt_menu ;;
-        6) core_cache_menu ;;
+        1) ssr_deploy_menu ;;
+        2) ssr_ops_menu ;;
+        3) ssr_tools_menu ;;
         0) return 1 ;;
-        *) echo -e "${RED}请输入正确的选项！${RESET}" ;;
+        *) echo -e "${RED}请输入正确的选项！${RESET}"; sleep 1 ;;
     esac
-    echo -e "\n${CYAN}按任意键返回上一层...${RESET}"
-    read -n 1 -s -r
 }
 
 SSR_MODULE_EOF
@@ -3712,7 +3736,7 @@ install_deps() {
     mgr="$(detect_pkg_mgr)"
     [[ -z "$mgr" ]] && return 1
 
-    # 依赖：nft/dig/curl/flock/ss
+    # 依赖：nft/curl/flock/ss（域名解析允许 dig/getent/host/nslookup 任一）
     if [[ "$mgr" == "apt" ]]; then
         apt-get update -qq >/dev/null 2>&1 || true
         apt-get install -yqq nftables dnsutils curl util-linux iproute2 >/dev/null 2>&1 || true
@@ -3722,18 +3746,23 @@ install_deps() {
     fi
 }
 
+have_dns_resolver() {
+    have_cmd dig || have_cmd getent || have_cmd host || have_cmd nslookup
+}
+
 check_env() {
-    # 自动装依赖（尽量温和）
+    # 自动装依赖（尽量温和），dig 不再作为必需项，避免仅因缺少 dnsutils 就卡在进入菜单时
     local need=0
-    for c in nft dig curl flock ss sysctl; do
+    for c in nft curl flock ss sysctl; do
         have_cmd "$c" || need=1
     done
     [[ $need -eq 1 ]] && install_deps
 
-    # 再次检查
-    for c in nft dig curl flock ss sysctl; do
+    # 再次检查关键依赖
+    for c in nft curl flock ss sysctl; do
         have_cmd "$c" || msg_warn "⚠️ 未找到依赖命令: $c（部分功能可能不可用）"
     done
+    have_dns_resolver || msg_warn "⚠️ 未找到 dig/getent/host/nslookup，域名转发将不可用。"
 
     mkdir -p "$(dirname "$CONFIG_FILE")" "$LOG_DIR" "$NFT_MGR_DIR" 2>/dev/null || true
     [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
@@ -4804,7 +4833,65 @@ uninstall_script_impl() {
     exit 0
 }
 
+
 uninstall_script() { with_lock uninstall_script_impl; }
+# --------------------------
+# 菜单拆分
+# --------------------------
+count_forward_rules_brief() {
+    local c=0
+    if [[ -f "$CONFIG_FILE" ]]; then
+        c=$(grep -cvE '^[[:space:]]*($|#)' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    fi
+    printf %s "$c"
+}
+
+nft_rule_center_menu() {
+    while true; do
+        local rules
+        rules=$(count_forward_rules_brief)
+        clear
+        echo -e "${GREEN}==========================================${PLAIN}"
+        echo -e "${GREEN}          NFT 规则中心 (当前 ${rules} 条)         ${PLAIN}"
+        echo -e "${GREEN}==========================================${PLAIN}"
+        echo "1. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
+        echo "2. 规则管理 (查看/删除)"
+        echo "3. 清空所有转发规则"
+        echo "0. 返回上一级"
+        echo "------------------------------------------"
+        local choice
+        read -rp "请选择操作 [0-3]: " choice
+        case "$choice" in
+            1) add_forward ;;
+            2) view_and_del_forward ;;
+            3) clear_all_rules ;;
+            0) return ;;
+            *) msg_err "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+nft_tools_menu() {
+    while true; do
+        clear
+        echo -e "${GREEN}==========================================${PLAIN}"
+        echo -e "${GREEN}             NFT 工具与维护中心            ${PLAIN}"
+        echo -e "${GREEN}==========================================${PLAIN}"
+        echo "1. 智能系统调优 (稳定/极致)"
+        echo "2. 管理 DDNS 定时监控与日志"
+        echo "0. 返回上一级"
+        echo "------------------------------------------"
+        local choice
+        read -rp "请选择操作 [0-2]: " choice
+        case "$choice" in
+            1) optimize_system ;;
+            2) manage_cron ;;
+            0) return ;;
+            *) msg_err "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
 # --------------------------
 # 主菜单
 # --------------------------
@@ -4813,22 +4900,16 @@ main_menu() {
     echo -e "${GREEN}==========================================${PLAIN}"
     echo -e "${GREEN}     nftables 端口转发管理面板 (Pro)      ${PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
-    echo "1. 智能系统调优 (稳定/极致)"
-    echo "2. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
-    echo "3. 规则管理 (查看/删除)"
-    echo "4. 清空所有转发规则"
-    echo "5. 管理 DDNS 定时监控与日志"
+    echo "1. NFT 规则中心"
+    echo "2. NFT 工具与维护中心"
     echo "0. 退出面板"
     echo "------------------------------------------"
     local choice
-    read -rp "请选择操作 [0-5]: " choice
+    read -rp "请选择操作 [0-2]: " choice
 
     case "$choice" in
-        1) optimize_system ;;
-        2) add_forward ;;
-        3) view_and_del_forward ;;
-        4) clear_all_rules ;;
-        5) manage_cron ;;
+        1) nft_rule_center_menu ;;
+        2) nft_tools_menu ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
@@ -6097,26 +6178,20 @@ nft_cli() {
 # --------------------------
 comprehensive_menu() {
     while true; do
-        local ssh_port quic nginx
-        ssh_port=$(get_ssh_port_brief)
-        quic=$(get_quic_status_brief)
-        nginx=$(get_nginx_status_brief)
         clear
         echo -e "${CYAN}============================================${RESET}"
         echo -e "${CYAN}         系统 / 建站 / 重装中心            ${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 系统网络中心   ${CYAN}(SSH ${ssh_port} / QUIC ${quic})${RESET}"
-        echo -e "${YELLOW} 2.${RESET} Nginx 反向代理 ${CYAN}(${nginx})${RESET}"
+        echo -e "${YELLOW} 1.${RESET} 系统基础与极客管理"
+        echo -e "${YELLOW} 2.${RESET} Nginx 反向代理"
         echo -e "${GREEN} 3.${RESET} DD / 重装系统中心"
-        echo -e "${CYAN} 4.${RESET} 查看全局状态总览"
         echo -e " 0. 返回主菜单"
         echo -e "${CYAN}--------------------------------------------${RESET}"
-        read -rp "请输入数字 [0-4]: " choice
+        read -rp "请输入数字 [0-3]: " choice
         case "$choice" in
             1) run_system_module_menu ;;
             2) run_nginx_module_menu ;;
             3) dd_menu ;;
-            4) global_status_dashboard ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
         esac
@@ -6127,35 +6202,24 @@ comprehensive_menu() {
 # 主菜单
 # --------------------------
 main_menu() {
-    local nodes nft_rules nginx ssh_port quic
-    nodes=$(count_proxy_nodes_brief)
-    nft_rules=$(get_nft_rules_brief)
-    nginx=$(get_nginx_status_brief)
-    ssh_port=$(get_ssh_port_brief)
-    quic=$(get_quic_status_brief)
     clear
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${CYAN}      综合管理脚本 my  v${MY_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "状态速览: 节点 ${YELLOW}${nodes}${RESET} / NFT ${YELLOW}${nft_rules}${RESET} 条 / Nginx ${YELLOW}${nginx}${RESET}"
-    echo -e "          SSH ${YELLOW}${ssh_port}${RESET} / QUIC ${YELLOW}${quic}${RESET}"
-    echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${YELLOW} 1.${RESET} 代理节点与热更中心 (SSR)"
     echo -e "${YELLOW} 2.${RESET} 端口转发 / NFT 中心"
     echo -e "${YELLOW} 3.${RESET} 系统 / 建站 / 重装中心"
-    echo -e "${CYAN} 4.${RESET} 全局状态总览"
-    echo -e "${YELLOW} 5.${RESET} GitHub 一键更新"
-    echo -e "${YELLOW} 6.${RESET} 一键卸载"
+    echo -e "${YELLOW} 4.${RESET} GitHub 一键更新"
+    echo -e "${YELLOW} 5.${RESET} 一键卸载"
     echo -e " 0. 退出"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    read -rp "请输入数字 [0-6]: " choice
+    read -rp "请输入数字 [0-5]: " choice
     case "$choice" in
         1) run_ssr_module_menu ;;
         2) run_nft_module_menu ;;
         3) comprehensive_menu ;;
-        4) global_status_dashboard ;;
-        5) github_update ;;
-        6) uninstall_menu ;;
+        4) github_update ;;
+        5) uninstall_menu ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
