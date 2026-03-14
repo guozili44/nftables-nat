@@ -849,31 +849,370 @@ restart_managed_service() {
     fi
 }
 
-smooth_handoff_service() {
+controlled_restart_service() {
     local name="$1" bg_cmd="$2" bg_match="$3" log_file="$4" pid_file="$5"
     restart_managed_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"
+}
+
+# The script now uses a temporary front-layer redirect plus standby instance
+# during binary upgrades. This alias remains for compatibility with older call
+# sites and still performs a verified restart for non-upgrade paths.
+smooth_handoff_service() {
+    local name="$1" bg_cmd="$2" bg_match="$3" log_file="$4" pid_file="$5"
+    controlled_restart_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"
+}
+
+frontlayer_engine() {
+    if have_cmd nft; then
+        printf %s nft
+        return 0
+    fi
+    if have_cmd iptables; then
+        printf %s iptables
+        return 0
+    fi
+    return 1
+}
+
+frontlayer_chain_token() {
+    case "$1" in
+        ss-rust) printf %s SSRH ;;
+        ss-v2ray) printf %s SSV2 ;;
+        xray) printf %s XRAY ;;
+        *) printf %s HOTX ;;
+    esac
+}
+
+nft_frontlayer_comment() {
+    local name="$1" proto="$2" public_port="$3"
+    printf 'ssr-hot:%s:%s:%s' "$name" "$proto" "$public_port"
+}
+
+nft_frontlayer_ensure() {
+    nft list table inet ssr_hot >/dev/null 2>&1 || nft add table inet ssr_hot >/dev/null 2>&1 || return 1
+    nft list chain inet ssr_hot prerouting >/dev/null 2>&1 || nft 'add chain inet ssr_hot prerouting { type nat hook prerouting priority dstnat; policy accept; }' >/dev/null 2>&1 || return 1
+    return 0
+}
+
+nft_frontlayer_delete_proto() {
+    local name="$1" proto="$2" public_port="$3" comment handle
+    comment=$(nft_frontlayer_comment "$name" "$proto" "$public_port")
+    while read -r handle; do
+        [[ "$handle" =~ ^[0-9]+$ ]] || continue
+        nft delete rule inet ssr_hot prerouting handle "$handle" >/dev/null 2>&1 || true
+    done < <(nft -a list chain inet ssr_hot prerouting 2>/dev/null | awk -v c="$comment" '$0 ~ "comment \"" c "\"" {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}')
+}
+
+nft_frontlayer_upsert() {
+    local name="$1" public_port="$2" standby_port="$3" proto="$4"
+    local comment
+    comment=$(nft_frontlayer_comment "$name" "$proto" "$public_port")
+    nft_frontlayer_ensure || return 1
+    nft_frontlayer_delete_proto "$name" "$proto" "$public_port"
+    nft add rule inet ssr_hot prerouting "$proto" dport "$public_port" redirect to :"$standby_port" comment "$comment" >/dev/null 2>&1
+}
+
+nft_frontlayer_remove() {
+    local name="$1" public_port="$2" proto="$3"
+    nft_frontlayer_ensure || return 1
+    nft_frontlayer_delete_proto "$name" "$proto" "$public_port"
+}
+
+iptables_frontlayer_chain() {
+    local name="$1" proto="$2"
+    printf '%s_%s' "$(frontlayer_chain_token "$name")" "${proto^^}"
+}
+
+iptables_frontlayer_upsert_proto() {
+    local cmd="$1" name="$2" public_port="$3" standby_port="$4" proto="$5"
+    local chain
+    chain=$(iptables_frontlayer_chain "$name" "$proto")
+    "$cmd" -t nat -N "$chain" >/dev/null 2>&1 || true
+    "$cmd" -t nat -C PREROUTING -p "$proto" --dport "$public_port" -j "$chain" >/dev/null 2>&1 || \
+        "$cmd" -t nat -I PREROUTING -p "$proto" --dport "$public_port" -j "$chain" >/dev/null 2>&1 || return 1
+    "$cmd" -t nat -F "$chain" >/dev/null 2>&1 || return 1
+    "$cmd" -t nat -A "$chain" -j REDIRECT --to-ports "$standby_port" >/dev/null 2>&1
+}
+
+iptables_frontlayer_remove_proto() {
+    local cmd="$1" name="$2" public_port="$3" proto="$4"
+    local chain
+    chain=$(iptables_frontlayer_chain "$name" "$proto")
+    while "$cmd" -t nat -C PREROUTING -p "$proto" --dport "$public_port" -j "$chain" >/dev/null 2>&1; do
+        "$cmd" -t nat -D PREROUTING -p "$proto" --dport "$public_port" -j "$chain" >/dev/null 2>&1 || break
+    done
+    "$cmd" -t nat -F "$chain" >/dev/null 2>&1 || true
+    "$cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
+}
+
+frontlayer_redirect_upsert() {
+    local name="$1" public_port="$2" standby_port="$3" proto="$4" engine p
+    engine=$(frontlayer_engine) || return 1
+    proto=$(normalize_proto "$proto")
+    case "$engine" in
+        nft)
+            for p in $(proto_to_list "$proto"); do
+                nft_frontlayer_upsert "$name" "$public_port" "$standby_port" "$p" || return 1
+            done
+            ;;
+        iptables)
+            for p in $(proto_to_list "$proto"); do
+                iptables_frontlayer_upsert_proto iptables "$name" "$public_port" "$standby_port" "$p" || return 1
+                if have_cmd ip6tables; then
+                    iptables_frontlayer_upsert_proto ip6tables "$name" "$public_port" "$standby_port" "$p" || true
+                fi
+            done
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+frontlayer_redirect_remove() {
+    local name="$1" public_port="$2" proto="$3" engine p
+    engine=$(frontlayer_engine) || return 1
+    proto=$(normalize_proto "$proto")
+    case "$engine" in
+        nft)
+            for p in $(proto_to_list "$proto"); do
+                nft_frontlayer_remove "$name" "$public_port" "$p" || true
+            done
+            ;;
+        iptables)
+            for p in $(proto_to_list "$proto"); do
+                iptables_frontlayer_remove_proto iptables "$name" "$public_port" "$p" || true
+                if have_cmd ip6tables; then
+                    iptables_frontlayer_remove_proto ip6tables "$name" "$public_port" "$p" || true
+                fi
+            done
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_validate_with_binary() {
+    local name="$1" bin_path="$2" cfg="$3" rc
+    case "$name" in
+        ss-rust|ss-v2ray)
+            run_with_timeout 2 "$bin_path" -c "$cfg" >/dev/null 2>&1
+            rc=$?
+            [[ "$rc" -eq 0 || "$rc" -eq 124 || "$rc" -eq 137 ]]
+            ;;
+        xray)
+            "$bin_path" run -test -c "$cfg" >/dev/null 2>&1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_launch_temp() {
+    local name="$1" bin_path="$2" cfg="$3" log_file="$4" pid_file="$5"
+    mkdir -p "$(dirname "$log_file")" "$(dirname "$pid_file")" >/dev/null 2>&1 || true
+    case "$name" in
+        ss-rust|ss-v2ray)
+            nohup "$bin_path" -c "$cfg" >"$log_file" 2>&1 &
+            ;;
+        xray)
+            nohup "$bin_path" run -c "$cfg" >"$log_file" 2>&1 &
+            ;;
+        *) return 1 ;;
+    esac
+    echo $! > "$pid_file"
+}
+
+managed_service_stop_temp() {
+    local pid_file="$1"
+    if [[ -s "$pid_file" ]]; then
+        kill "$(cat "$pid_file" 2>/dev/null)" >/dev/null 2>&1 || true
+        sleep 1
+        kill -9 "$(cat "$pid_file" 2>/dev/null)" >/dev/null 2>&1 || true
+    fi
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+}
+
+is_listening_port() {
+    local port="$1" proto="$2" ok=0
+    proto=$(normalize_proto "$proto")
+    if have_cmd ss; then
+        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+            ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" || return 1
+        fi
+        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+            ss -lnuH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" || return 1
+        fi
+        return 0
+    fi
+    return 1
+}
+
+wait_port_listening() {
+    local port="$1" proto="$2" timeout="${3:-15}" i=0
+    while (( i < timeout )); do
+        is_listening_port "$port" "$proto" && return 0
+        sleep 1
+        i=$((i+1))
+    done
+    return 1
+}
+
+pick_handoff_port() {
+    local public_port="$1" proto="$2" try=0 cand
+    while (( try < 256 )); do
+        cand=$(( RANDOM % 20000 + 40000 ))
+        if [[ "$cand" == "$public_port" ]]; then
+            try=$((try+1))
+            continue
+        fi
+        if port_in_use "$cand" "$proto"; then
+            try=$((try+1))
+            continue
+        fi
+        printf %s "$cand"
+        return 0
+    done
+    return 1
+}
+
+active_tcp_conn_count() {
+    local port="$1"
+    if have_cmd ss; then
+        ss -Htan state established 2>/dev/null | awk -v p=":${port}" '$4 ~ (p "$") {c++} END {print c+0}'
+        return 0
+    fi
+    printf %s 0
+}
+
+wait_backend_drain() {
+    local port="$1" proto="$2"
+    local tcp_timeout="${HOT_TCP_DRAIN_TIMEOUT:-120}" udp_grace="${HOT_UDP_DRAIN_GRACE:-45}"
+    local elapsed=0 current=0
+    proto=$(normalize_proto "$proto")
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        while (( elapsed < tcp_timeout )); do
+            current=$(active_tcp_conn_count "$port")
+            [[ "$current" =~ ^[0-9]+$ ]] || current=0
+            (( current == 0 )) && break
+            sleep 1
+            elapsed=$((elapsed+1))
+        done
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        sleep "$udp_grace"
+    fi
+}
+
+hot_handoff_named_service() {
+    local name="$1" bin_path="$2"
+    local cfg port_path public_port proto match pid_file log_file
+    local standby_port temp_cfg temp_pid temp_log
+
+    cfg=$(managed_service_config_path "$name") || return 1
+    port_path=$(managed_service_port_json_path "$name") || return 1
+    proto=$(managed_service_proto "$name") || return 1
+    match=$(managed_service_match "$name") || return 1
+    pid_file=$(managed_service_pid "$name") || return 1
+    log_file=$(managed_service_log "$name") || return 1
+    [[ -f "$cfg" && -x "$bin_path" ]] || return 1
+    public_port=$(json_get_path "$cfg" "$port_path" 2>/dev/null || true)
+    [[ "$public_port" =~ ^[0-9]+$ ]] || return 1
+
+    if ! service_is_running "$name" "$match" "$pid_file"; then
+        start_named_service "$name" >/dev/null 2>&1 || restart_named_service "$name" >/dev/null 2>&1
+        return $?
+    fi
+
+    standby_port=$(pick_handoff_port "$public_port" "$proto") || return 1
+    temp_cfg=$(mktemp "/tmp/${name}.handoff.XXXXXX.json") || return 1
+    temp_pid=$(mktemp "/tmp/${name}.handoff.XXXXXX.pid") || { rm -f "$temp_cfg"; return 1; }
+    temp_log="/var/log/${name}.handoff.${standby_port}.log"
+    cp -a "$cfg" "$temp_cfg" 2>/dev/null || { rm -f "$temp_cfg" "$temp_pid"; return 1; }
+    json_set_path "$temp_cfg" "$port_path" "$standby_port" number || { rm -f "$temp_cfg" "$temp_pid"; return 1; }
+    managed_service_validate_with_binary "$name" "$bin_path" "$temp_cfg" || { rm -f "$temp_cfg" "$temp_pid"; return 1; }
+    managed_service_launch_temp "$name" "$bin_path" "$temp_cfg" "$temp_log" "$temp_pid" || { rm -f "$temp_cfg" "$temp_pid"; return 1; }
+    wait_port_listening "$standby_port" "$proto" 15 || {
+        managed_service_stop_temp "$temp_pid"
+        rm -f "$temp_cfg"
+        return 1
+    }
+
+    add_firewall_rule "$standby_port" "$proto" >/dev/null 2>&1 || true
+    if ! frontlayer_redirect_upsert "$name" "$public_port" "$standby_port" "$proto"; then
+        managed_service_stop_temp "$temp_pid"
+        remove_firewall_rule "$standby_port" "$proto" >/dev/null 2>&1 || true
+        rm -f "$temp_cfg"
+        return 1
+    fi
+
+    wait_backend_drain "$public_port" "$proto"
+    stop_named_service "$name" >/dev/null 2>&1 || true
+    [[ -n "$match" ]] && pkill -f "$match" >/dev/null 2>&1 || true
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+    sleep 1
+
+    if ! start_named_service "$name" >/dev/null 2>&1; then
+        frontlayer_redirect_remove "$name" "$public_port" "$proto" >/dev/null 2>&1 || true
+        managed_service_stop_temp "$temp_pid"
+        remove_firewall_rule "$standby_port" "$proto" >/dev/null 2>&1 || true
+        rm -f "$temp_cfg"
+        return 1
+    fi
+
+    frontlayer_redirect_remove "$name" "$public_port" "$proto" >/dev/null 2>&1 || true
+    wait_backend_drain "$standby_port" "$proto"
+    managed_service_stop_temp "$temp_pid"
+    remove_firewall_rule "$standby_port" "$proto" >/dev/null 2>&1 || true
+    rm -f "$temp_cfg"
+    return 0
 }
 
 activate_binary_with_rollback() {
     local component="$1" tag="$2" candidate="$3" dest="$4" meta_key="$5"
     local name="$6" bg_cmd="$7" bg_match="$8" log_file="$9" pid_file="${10}"
-    local backup=""
+    local backup="" svc rc applied_any=0
+    local -a targets=() switched=()
     [[ -x "$candidate" ]] || return 2
+
+    case "$component" in
+        ss-rust) targets=(ss-rust ss-v2ray) ;;
+        xray) targets=(xray) ;;
+        *) [[ -n "$name" ]] && targets=("$name") ;;
+    esac
+
     if [[ -x "$dest" ]]; then
         backup=$(mktemp "/tmp/${component:-bin}.rollback.XXXXXX") || return 2
         cp -a "$dest" "$backup" 2>/dev/null || { rm -f "$backup"; return 2; }
     fi
+
     safe_install_binary "$candidate" "$dest" || { rm -f "$backup"; return 2; }
-    if managed_service_present "$name" "$bg_match" "$pid_file"; then
-        if ! restart_managed_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"; then
+
+    for svc in "${targets[@]}"; do
+        managed_service_exists "$svc" || continue
+        if hot_handoff_named_service "$svc" "$dest"; then
+            switched+=("$svc")
+            applied_any=1
+            continue
+        fi
+        if [[ -n "$backup" && -s "$backup" ]]; then
+            safe_install_binary "$backup" "$dest" >/dev/null 2>&1 || true
+            for (( rc=${#switched[@]}-1; rc>=0; rc-- )); do
+                hot_handoff_named_service "${switched[$rc]}" "$dest" >/dev/null 2>&1 || start_named_service "${switched[$rc]}" >/dev/null 2>&1 || true
+            done
+            managed_service_exists "$svc" && start_named_service "$svc" >/dev/null 2>&1 || true
+        fi
+        rm -f "$backup"
+        return 2
+    done
+
+    if (( applied_any == 0 )) && managed_service_present "$name" "$bg_match" "$pid_file"; then
+        if ! controlled_restart_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"; then
             if [[ -n "$backup" && -s "$backup" ]]; then
                 safe_install_binary "$backup" "$dest" >/dev/null 2>&1 || true
-                restart_managed_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file" >/dev/null 2>&1 || true
+                controlled_restart_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file" >/dev/null 2>&1 || true
             fi
             rm -f "$backup"
             return 2
         fi
     fi
+
     [[ -n "$component" && -n "$tag" ]] && cache_store_binary "$component" "$tag" "$dest" >/dev/null 2>&1 || true
     [[ -n "$meta_key" && -n "$tag" ]] && meta_set "$meta_key" "$tag"
     rm -f "$backup"
@@ -2790,7 +3129,7 @@ update_xray_if_needed() {
     return $rc
 }
 
-hot_update_components() {
+update_components_with_rollback() {
     local is_silent=$1
     local updated_any=0
 
@@ -2801,12 +3140,16 @@ hot_update_components() {
 
     if [[ "$is_silent" != "silent" ]]; then
         if [[ $updated_any -eq 1 ]]; then
-            echo -e "${GREEN}✅ 核心组件已完成稳定更新（失败自动回滚）。${RESET}"
+            echo -e "${GREEN}✅ 核心组件已完成稳定更新（受控重启，失败自动回滚）。${RESET}"
         else
             echo -e "${GREEN}✅ 核心组件已是最新或无需更新。${RESET}"
         fi
         sleep 2
     fi
+}
+
+hot_update_components() {
+    update_components_with_rollback "$@"
 }
 
 report_update_result() {
@@ -3271,6 +3614,17 @@ normalize_proto() {
         tcp|udp|both) echo "$p" ;;
         "") echo "both" ;;
         *) echo "both" ;;
+    esac
+}
+
+proto_to_list() {
+    local p
+    p=$(normalize_proto "$1")
+    case "$p" in
+        both) printf '%s
+' tcp udp ;;
+        *) printf '%s
+' "$p" ;;
     esac
 }
 
