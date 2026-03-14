@@ -2,7 +2,7 @@
 # 综合管理脚本：SSR + nftables
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v1.3.1  (build 2026-03-12+ss2022-compact-noperl)
+# 版本：v1.3.3  (build 2026-03-14+ss2022-compact-fixed-slim)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 
 set -o pipefail
@@ -92,11 +92,11 @@ install_modules() {
 #!/bin/bash
 # 脚本名称: SSR 综合管理脚本 (稳定优先 + 极致性能 Profiles)
 # 核心特性:
-#   - 节点部署: SS-Rust / SS2022 + v2ray-plugin / SS2022 + obfs-local / VLESS Reality (Xray)
+#   - 节点部署: SS-Rust / SS2022 + v2ray-plugin / VLESS Reality (Xray)
 #   - 双档位网络调优: 手动选择 常规机器 / NAT 小鸡 => 稳定优先 / 极致优化
 #   - Cloudflare DDNS: 原生 API + 定时守护
 #   - 自动任务互斥: cron 使用 flock 防并发踩踏
-#   - 自动热更: 仅在有新版本时更新；下载到临时目录校验可运行后再原子替换
+#   - 稳定更新: 仅在有新版本时更新；先校验候选二进制，再重启服务，失败自动回滚
 #   - DNS 管理: 检测 /etc/resolv.conf 是否 symlink；提供一键解锁/恢复
 #
 # 命令：ssr regular|nat [stable|extreme] / ssr dns ...
@@ -126,8 +126,6 @@ readonly META_DIR="/usr/local/etc/ssr_meta"
 readonly META_FILE="${META_DIR}/versions.conf"
 readonly SS_V2RAY_CONF="/etc/ss-v2ray/config.json"
 readonly SS_V2RAY_STATE="${META_DIR}/ss_v2ray.conf"
-readonly SS_OBFS_CONF="/etc/ss-obfs/config.json"
-readonly SS_OBFS_STATE="${META_DIR}/ss_obfs.conf"
 readonly SWAP_MARK_FILE="${META_DIR}/swap_created_by_ssr"
 readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/99-my-auth.conf"
@@ -284,10 +282,33 @@ backup_file_once() {
     cp -a "$src" "$bak" 2>/dev/null || true
 }
 
+make_runtime_backup() {
+    local src="$1" bak
+    [[ -e "$src" ]] || return 1
+    bak=$(mktemp "/tmp/$(basename "$src").XXXXXX") || return 1
+    cp -a "$src" "$bak" 2>/dev/null || { rm -f "$bak"; return 1; }
+    echo "$bak"
+}
+
 restore_file_if_present() {
     local bak="$1"; local dst="$2"
     [[ -f "$bak" ]] || return 0
     cp -a "$bak" "$dst" 2>/dev/null || true
+}
+
+restore_file_strict() {
+    local bak="$1"; local dst="$2"
+    [[ -f "$bak" ]] || return 1
+    cp -a "$bak" "$dst" 2>/dev/null || return 1
+}
+
+restore_or_remove_file() {
+    local bak="$1"; local dst="$2"
+    if [[ -n "$bak" && -e "$bak" ]]; then
+        cp -a "$bak" "$dst" 2>/dev/null || return 1
+    else
+        rm -f "$dst" 2>/dev/null || true
+    fi
 }
 
 replace_or_append_line() {
@@ -318,17 +339,41 @@ remove_ssh_auth_dropin() {
     rm -f "$SSH_AUTH_DROPIN" 2>/dev/null || true
 }
 
+service_use_systemd() {
+    have_cmd systemctl && [[ -d /run/systemd/system ]]
+}
+
+ssh_service_name() {
+    if service_use_systemd; then
+        if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^sshd\.service'; then
+            echo sshd
+            return 0
+        fi
+        if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ssh\.service'; then
+            echo ssh
+            return 0
+        fi
+    fi
+    echo sshd
+}
+
 restart_ssh_safe() {
-    local cfg="/etc/ssh/sshd_config"
+    local cfg="/etc/ssh/sshd_config" svc
     if have_cmd sshd && ! sshd -t -f "$cfg" >/dev/null 2>&1; then
         echo -e "${YELLOW}⚠️ sshd_config 校验失败，未重启 SSH。${RESET}"
         return 1
     fi
-    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
-}
-
-service_use_systemd() {
-    have_cmd systemctl && [[ -d /etc/systemd/system ]]
+    if service_use_systemd; then
+        svc="$(ssh_service_name)"
+        systemctl restart "$svc" >/dev/null 2>&1 || return 1
+        systemctl is-active --quiet "$svc" >/dev/null 2>&1 || return 1
+        return 0
+    fi
+    if have_cmd service; then
+        service ssh restart >/dev/null 2>&1 || service sshd restart >/dev/null 2>&1 || return 1
+        return 0
+    fi
+    return 1
 }
 
 json_get_path() {
@@ -410,28 +455,60 @@ xray_extract_reality_public_key() {
     } | head -n1 | tr -d '[:space:]'
 }
 
-json_set_top_value() {
-    local file="$1" key="$2" value="$3" kind="$4"
+json_set_path() {
+    local file="$1" path="$2" value="$3" kind="$4"
     [[ -f "$file" ]] || return 1
     if have_cmd python3; then
-        python3 - "$file" "$key" "$value" "$kind" <<'PYPARSE'
-import json, sys
-file, key, value, kind = sys.argv[1:5]
+        python3 - "$file" "$path" "$value" "$kind" <<'PYPARSE'
+import json, os, sys
+file, path, value, kind = sys.argv[1:5]
+
+def convert(v, k):
+    if k == 'number':
+        return int(v)
+    if k == 'bool':
+        return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+    if k == 'null':
+        return None
+    return v
+
 with open(file, 'r', encoding='utf-8') as f:
     obj = json.load(f)
-obj[key] = int(value) if kind == 'number' else value
-with open(file, 'w', encoding='utf-8') as f:
+cur = obj
+parts = path.split('.')
+for part in parts[:-1]:
+    cur = cur[int(part)] if part.isdigit() else cur[part]
+last = parts[-1]
+cur[int(last) if last.isdigit() else last] = convert(value, kind)
+tmp = file + '.tmp'
+with open(tmp, 'w', encoding='utf-8') as f:
     json.dump(obj, f, ensure_ascii=False)
+os.replace(tmp, file)
 PYPARSE
-        return 0
+        return $?
     fi
-    if [[ "$kind" == "number" ]]; then
-        sed -i "s|\"${key}\": [0-9][0-9]*|\"${key}\": ${value}|g" "$file"
-    else
-        local esc
-        esc=$(printf '%s' "$value" | sed 's/[&]/\\&/g')
-        sed -i "s|\"${key}\": \"[^\"]*\"|\"${key}\": \"${esc}\"|g" "$file"
+    if have_cmd jq; then
+        local tmp
+        tmp=$(mktemp /tmp/json-set.XXXXXX) || return 1
+        if jq --arg path "$path" --arg val "$value" --arg kind "$kind" '
+            def conv($v; $k):
+                if $k == "number" then ($v | tonumber)
+                elif $k == "bool" then (($v | ascii_downcase) | test("^(true|1|yes|on)$"))
+                elif $k == "null" then null
+                else $v end;
+            ($path | split(".") | map(if test("^[0-9]+$") then tonumber else . end)) as $p
+            | setpath($p; conv($val; $kind))
+        ' "$file" > "$tmp" 2>/dev/null; then
+            mv -f "$tmp" "$file" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+            return 0
+        fi
+        rm -f "$tmp"
     fi
+    return 1
+}
+
+json_set_top_value() {
+    json_set_path "$1" "$2" "$3" "$4"
 }
 
 uri_encode() {
@@ -687,40 +764,6 @@ show_ss_v2ray_summary() {
 ${link}"
 }
 
-ss_obfs_make_link() {
-    local ip port method password host obfs plugin_raw plugin_enc userinfo
-    ip="${1:-$(ssr_fetch_public_ip)}"
-    port=$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null)
-    method=$(json_get_path "$SS_OBFS_CONF" method 2>/dev/null)
-    password=$(json_get_path "$SS_OBFS_CONF" password 2>/dev/null)
-    host=$(plugin_state_get "$SS_OBFS_STATE" HOST 2>/dev/null || true)
-    obfs=$(plugin_state_get "$SS_OBFS_STATE" MODE 2>/dev/null || true)
-    [[ -n "$ip" && -n "$port" && -n "$method" && -n "$password" && -n "$host" && -n "$obfs" ]] || return 1
-    userinfo=$(ss_make_userinfo "$method" "$password")
-    plugin_raw="obfs-local;obfs=${obfs};obfs-host=${host}"
-    plugin_enc=$(uri_encode "$plugin_raw")
-    printf 'ss://%s@%s:%s/?plugin=%s#SS2022-obfs' "$userinfo" "$ip" "$port" "$plugin_enc"
-}
-
-show_ss_obfs_summary() {
-    local ip port method password host obfs link
-    ip=$(ssr_fetch_public_ip)
-    port=$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null)
-    method=$(json_get_path "$SS_OBFS_CONF" method 2>/dev/null)
-    password=$(json_get_path "$SS_OBFS_CONF" password 2>/dev/null)
-    host=$(plugin_state_get "$SS_OBFS_STATE" HOST 2>/dev/null || true)
-    obfs=$(plugin_state_get "$SS_OBFS_STATE" MODE 2>/dev/null || true)
-    link=$(ss_obfs_make_link "$ip" 2>/dev/null || true)
-    echo -e "IP: ${GREEN}${ip}${RESET}"
-    echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
-    echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
-    echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
-    echo -e "混淆模式: ${GREEN}${obfs:-未读取}${RESET}"
-    echo -e "伪装域名: ${GREEN}${host:-未读取}${RESET}"
-    [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
-${link}"
-}
-
 show_vless_summary() {
     local ip port uuid sni priv pub sid link
     ip=$(ssr_fetch_public_ip)
@@ -743,6 +786,33 @@ ${link}"
     fi
 }
 
+service_unit_exists() {
+    local name="$1"
+    service_use_systemd || return 1
+    systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${name}\.service"
+}
+
+service_is_running() {
+    local name="$1" bg_match="$2" pid_file="$3"
+    if service_use_systemd; then
+        systemctl is-active --quiet "$name" 2>/dev/null
+        return $?
+    fi
+    if [[ -s "$pid_file" ]]; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null)
+        [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+    fi
+    [[ -n "$bg_match" ]] && pgrep -f "$bg_match" >/dev/null 2>&1
+}
+
+managed_service_present() {
+    local name="$1" bg_match="$2" pid_file="$3"
+    service_unit_exists "$name" && return 0
+    [[ -f "$pid_file" ]] && return 0
+    [[ -n "$bg_match" ]] && pgrep -f "$bg_match" >/dev/null 2>&1
+}
+
 start_managed_service() {
     local name="$1" unit_content="$2" bg_cmd="$3" bg_match="$4" log_file="$5" pid_file="$6"
     if service_use_systemd; then
@@ -751,14 +821,15 @@ start_managed_service() {
 ' "$unit_content" > "/etc/systemd/system/${name}.service"
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable --now "$name" >/dev/null 2>&1 || return 1
-        systemctl is-active --quiet "$name" 2>/dev/null || return 1
+        sleep 1
+        service_is_running "$name" "$bg_match" "$pid_file" || return 1
     else
         [[ -n "$bg_match" ]] && pkill -f "$bg_match" 2>/dev/null || true
         mkdir -p "$(dirname "$pid_file")" 2>/dev/null || true
         nohup sh -c "$bg_cmd" >"$log_file" 2>&1 &
         echo $! > "$pid_file"
         sleep 1
-        kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || return 1
+        service_is_running "$name" "$bg_match" "$pid_file" || return 1
     fi
 }
 
@@ -766,28 +837,47 @@ restart_managed_service() {
     local name="$1" bg_cmd="$2" bg_match="$3" log_file="$4" pid_file="$5"
     if service_use_systemd; then
         systemctl restart "$name" >/dev/null 2>&1 || return 1
-        systemctl is-active --quiet "$name" 2>/dev/null || return 1
+        sleep 1
+        service_is_running "$name" "$bg_match" "$pid_file" || return 1
     else
         [[ -n "$bg_match" ]] && pkill -f "$bg_match" 2>/dev/null || true
         mkdir -p "$(dirname "$pid_file")" 2>/dev/null || true
         nohup sh -c "$bg_cmd" >"$log_file" 2>&1 &
         echo $! > "$pid_file"
         sleep 1
-        kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || return 1
+        service_is_running "$name" "$bg_match" "$pid_file" || return 1
     fi
 }
 
 smooth_handoff_service() {
     local name="$1" bg_cmd="$2" bg_match="$3" log_file="$4" pid_file="$5"
-    if service_use_systemd; then
-        # 1. 异步发送优雅中止信号，老进程开始处理遗留连接，释放端口锁定
-        systemctl kill -s SIGTERM "$name" 2>/dev/null || true
-        # 2. 毫秒级排队启动新进程，瞬间接管端口，实现零掉线交接
-        systemctl start "$name" >/dev/null 2>&1 || true
-    else
-        # 无 systemd 环境则安全降级为普通重启
-        restart_managed_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"
+    restart_managed_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"
+}
+
+activate_binary_with_rollback() {
+    local component="$1" tag="$2" candidate="$3" dest="$4" meta_key="$5"
+    local name="$6" bg_cmd="$7" bg_match="$8" log_file="$9" pid_file="${10}"
+    local backup=""
+    [[ -x "$candidate" ]] || return 2
+    if [[ -x "$dest" ]]; then
+        backup=$(mktemp "/tmp/${component:-bin}.rollback.XXXXXX") || return 2
+        cp -a "$dest" "$backup" 2>/dev/null || { rm -f "$backup"; return 2; }
     fi
+    safe_install_binary "$candidate" "$dest" || { rm -f "$backup"; return 2; }
+    if managed_service_present "$name" "$bg_match" "$pid_file"; then
+        if ! restart_managed_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"; then
+            if [[ -n "$backup" && -s "$backup" ]]; then
+                safe_install_binary "$backup" "$dest" >/dev/null 2>&1 || true
+                restart_managed_service "$name" "$bg_cmd" "$bg_match" "$log_file" "$pid_file" >/dev/null 2>&1 || true
+            fi
+            rm -f "$backup"
+            return 2
+        fi
+    fi
+    [[ -n "$component" && -n "$tag" ]] && cache_store_binary "$component" "$tag" "$dest" >/dev/null 2>&1 || true
+    [[ -n "$meta_key" && -n "$tag" ]] && meta_set "$meta_key" "$tag"
+    rm -f "$backup"
+    return 0
 }
 
 stop_managed_service() {
@@ -1113,8 +1203,7 @@ safe_install_binary() {
 check_env() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行！${RESET}" && exit 1
 
-    # 依赖：尽量保守安装；缺啥装啥
-    local deps=(curl bc wget tar openssl unzip ip ping)
+    local deps=(curl bc wget tar openssl unzip ip ping jq python3)
     local missing=()
     local dep
     for dep in "${deps[@]}"; do
@@ -1133,6 +1222,16 @@ check_env() {
             apk add --no-cache curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute2 iputils python3 coreutils >/dev/null 2>&1 || true
         fi
     fi
+
+    missing=()
+    for dep in "${deps[@]}"; do
+        have_cmd "$dep" || missing+=("$dep")
+    done
+    if ((${#missing[@]} > 0)); then
+        echo -e "${RED}❌ 缺少关键依赖：${missing[*]}${RESET}"
+        echo -e "${YELLOW}请先安装以上依赖后再运行脚本。${RESET}"
+        exit 1
+    fi
 }
 
 install_global_command() {
@@ -1142,95 +1241,323 @@ install_global_command() {
         my_enable_ssr_cron_tasks
     fi
 }
-# 防火墙/服务清理
-remove_firewall_rule() {
-    local port=$1; local proto=$2
-    if have_cmd ufw; then
-        [[ "$proto" == "both" || "$proto" == "tcp" ]] && ufw delete allow "$port"/tcp >/dev/null 2>&1
-        [[ "$proto" == "both" || "$proto" == "udp" ]] && ufw delete allow "$port"/udp >/dev/null 2>&1
+
+add_firewall_rule() {
+    local port="$1" proto="$2"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    if have_cmd ufw && ufw status | grep -qw "active"; then
+        [[ "$proto" == "both" || "$proto" == "tcp" ]] && ufw allow "$port"/tcp >/dev/null 2>&1 || true
+        [[ "$proto" == "both" || "$proto" == "udp" ]] && ufw allow "$port"/udp >/dev/null 2>&1 || true
     fi
     if have_cmd firewall-cmd; then
-        [[ "$proto" == "both" || "$proto" == "tcp" ]] && firewall-cmd --remove-port="$port"/tcp --permanent >/dev/null 2>&1
-        [[ "$proto" == "both" || "$proto" == "udp" ]] && firewall-cmd --remove-port="$port"/udp --permanent >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
+        [[ "$proto" == "both" || "$proto" == "tcp" ]] && firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1 || true
+        [[ "$proto" == "both" || "$proto" == "udp" ]] && firewall-cmd --add-port="$port"/udp --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
     fi
+}
+
+remove_firewall_rule() {
+    local port="$1" proto="$2"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    if have_cmd ufw; then
+        [[ "$proto" == "both" || "$proto" == "tcp" ]] && ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
+        [[ "$proto" == "both" || "$proto" == "udp" ]] && ufw delete allow "$port"/udp >/dev/null 2>&1 || true
+    fi
+    if have_cmd firewall-cmd; then
+        [[ "$proto" == "both" || "$proto" == "tcp" ]] && firewall-cmd --remove-port="$port"/tcp --permanent >/dev/null 2>&1 || true
+        [[ "$proto" == "both" || "$proto" == "udp" ]] && firewall-cmd --remove-port="$port"/udp --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+}
+
+managed_service_exec() {
+    case "$1" in
+        ss-rust) printf %s "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" ;;
+        ss-v2ray) printf %s "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" ;;
+        xray) printf %s "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_match() {
+    managed_service_exec "$1"
+}
+
+managed_service_log() {
+    case "$1" in
+        ss-rust) printf %s "/var/log/ss-rust.log" ;;
+        ss-v2ray) printf %s "/var/log/ss-v2ray.log" ;;
+        xray) printf %s "/var/log/xray.log" ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_pid() {
+    case "$1" in
+        ss-rust) printf %s "/var/run/ss-rust.pid" ;;
+        ss-v2ray) printf %s "/var/run/ss-v2ray.pid" ;;
+        xray) printf %s "/var/run/xray.pid" ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_proto() {
+    case "$1" in
+        ss-rust) printf %s both ;;
+        ss-v2ray|xray) printf %s tcp ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_description() {
+    case "$1" in
+        ss-rust) printf %s "Shadowsocks-Rust Server" ;;
+        ss-v2ray) printf %s "Shadowsocks-Rust + v2ray-plugin Server" ;;
+        xray) printf %s "Xray Service" ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_label() {
+    case "$1" in
+        ss-rust) printf %s "SS-Rust" ;;
+        ss-v2ray) printf %s "SS2022 + v2ray-plugin" ;;
+        xray) printf %s "Xray / VLESS Reality" ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_config_path() {
+    case "$1" in
+        ss-rust) printf %s "/etc/ss-rust/config.json" ;;
+        ss-v2ray) printf %s "$SS_V2RAY_CONF" ;;
+        xray) printf %s "/usr/local/etc/xray/config.json" ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_port_json_path() {
+    case "$1" in
+        ss-rust|ss-v2ray) printf %s "server_port" ;;
+        xray) printf %s "inbounds.0.port" ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_current_port() {
+    local name="$1" cfg json_path
+    cfg=$(managed_service_config_path "$name") || return 1
+    json_path=$(managed_service_port_json_path "$name") || return 1
+    [[ -f "$cfg" ]] || return 1
+    json_get_path "$cfg" "$json_path" 2>/dev/null || true
+}
+
+managed_service_exists() {
+    local name="$1" cfg match pid_file
+    cfg=$(managed_service_config_path "$name" 2>/dev/null || true)
+    match=$(managed_service_match "$name" 2>/dev/null || true)
+    pid_file=$(managed_service_pid "$name" 2>/dev/null || true)
+    [[ -n "$cfg" && -f "$cfg" ]] && return 0
+    service_unit_exists "$name" && return 0
+    [[ -n "$pid_file" && -f "$pid_file" ]] && return 0
+    [[ -n "$match" ]] && pgrep -f "$match" >/dev/null 2>&1 && return 0
+    [[ "$name" == "xray" && -x /usr/local/bin/xray ]] && return 0
+    return 1
+}
+
+named_service_add_firewall() {
+    local name="$1" port="${2:-}" proto
+    [[ -n "$port" ]] || port=$(managed_service_current_port "$name" 2>/dev/null || true)
+    proto=$(managed_service_proto "$name") || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    add_firewall_rule "$port" "$proto"
+}
+
+named_service_remove_firewall() {
+    local name="$1" port="${2:-}" proto
+    [[ -n "$port" ]] || port=$(managed_service_current_port "$name" 2>/dev/null || true)
+    proto=$(managed_service_proto "$name") || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    remove_firewall_rule "$port" "$proto"
+}
+
+managed_service_unit() {
+    local name="$1" desc exec_cmd
+    desc=$(managed_service_description "$name") || return 1
+    exec_cmd=$(managed_service_exec "$name") || return 1
+    cat <<EOF
+[Unit]
+Description=${desc}
+After=network.target
+
+[Service]
+ExecStart=${exec_cmd}
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+start_named_service() {
+    local name="$1"
+    start_managed_service "$name" "$(managed_service_unit "$name")" "$(managed_service_exec "$name")" "$(managed_service_match "$name")" "$(managed_service_log "$name")" "$(managed_service_pid "$name")"
+}
+
+restart_named_service() {
+    local name="$1"
+    restart_managed_service "$name" "$(managed_service_exec "$name")" "$(managed_service_match "$name")" "$(managed_service_log "$name")" "$(managed_service_pid "$name")"
+}
+
+stop_named_service() {
+    local name="$1"
+    stop_managed_service "$name" "$(managed_service_match "$name")" "$(managed_service_pid "$name")"
+}
+
+apply_json_named_service_change() {
+    local file="$1" path="$2" value="$3" type="$4" svc="$5"
+    apply_json_service_change "$file" "$path" "$value" "$type" "$svc" "$(managed_service_exec "$svc")" "$(managed_service_match "$svc")" "$(managed_service_log "$svc")" "$(managed_service_pid "$svc")"
+}
+
+apply_json_named_service_port_change() {
+    local file="$1" path="$2" new_port="$3" old_port="$4" svc="$5"
+    apply_json_service_port_change "$file" "$path" "$new_port" "$old_port" "$svc" "$(managed_service_exec "$svc")" "$(managed_service_match "$svc")" "$(managed_service_log "$svc")" "$(managed_service_pid "$svc")"
+}
+
+ss_rust_binary_still_needed() {
+    local exclude="$1"
+    [[ "$exclude" != "ss-rust" && ( -f /etc/ss-rust/config.json || -f /etc/systemd/system/ss-rust.service || -f /var/run/ss-rust.pid ) ]] && return 0
+    [[ "$exclude" != "ss-v2ray" && ( -f "$SS_V2RAY_CONF" || -f /etc/systemd/system/ss-v2ray.service || -f /var/run/ss-v2ray.pid ) ]] && return 0
+    pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' >/dev/null 2>&1 && [[ "$exclude" != "ss-rust" ]] && return 0
+    pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' >/dev/null 2>&1 && [[ "$exclude" != "ss-v2ray" ]] && return 0
+    return 1
+}
+
+cleanup_ss_rust_binary_if_unused() {
+    local exclude="$1"
+    ss_rust_binary_still_needed "$exclude" && return 0
+    rm -f /usr/local/bin/ss-rust >/dev/null 2>&1 || true
+}
+
+apply_json_service_change() {
+    local file="$1" path="$2" value="$3" type="$4"
+    local svc="$5" bg_cmd="$6" bg_match="$7" log_file="$8" pid_file="$9"
+    local backup=""
+    backup=$(make_runtime_backup "$file") || return 1
+    json_set_path "$file" "$path" "$value" "$type" || { rm -f "$backup"; return 1; }
+    if restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"; then
+        rm -f "$backup"
+        return 0
+    fi
+    restore_file_strict "$backup" "$file" >/dev/null 2>&1 || true
+    restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file" >/dev/null 2>&1 || true
+    rm -f "$backup"
+    return 1
+}
+
+apply_json_service_port_change() {
+    local file="$1" path="$2" new_port="$3" old_port="$4" svc="$5"
+    local bg_cmd="$6" bg_match="$7" log_file="$8" pid_file="$9"
+    local backup="" proto
+    [[ "$new_port" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "$old_port" && "$old_port" == "$new_port" ]] && return 0
+    proto=$(managed_service_proto "$svc") || return 1
+    add_firewall_rule "$new_port" "$proto" || true
+    backup=$(make_runtime_backup "$file") || return 1
+    json_set_path "$file" "$path" "$new_port" number || {
+        rm -f "$backup"
+        remove_firewall_rule "$new_port" "$proto"
+        return 1
+    }
+    if restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"; then
+        [[ "$old_port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$old_port" "$proto"
+        rm -f "$backup"
+        return 0
+    fi
+    restore_file_strict "$backup" "$file" >/dev/null 2>&1 || true
+    restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file" >/dev/null 2>&1 || true
+    rm -f "$backup"
+    remove_firewall_rule "$new_port" "$proto"
+    return 1
+}
+
+managed_service_remove_artifacts() {
+    local name="$1"
+    case "$name" in
+        ss-rust)
+            rm -rf /etc/ss-rust
+            rm -f /var/log/ss-rust.log
+            cleanup_ss_rust_binary_if_unused "ss-rust"
+            ;;
+        ss-v2ray)
+            rm -rf /etc/ss-v2ray
+            rm -f /var/log/ss-v2ray.log "$SS_V2RAY_STATE"
+            cleanup_ss_rust_binary_if_unused "ss-v2ray"
+            ;;
+        xray)
+            rm -rf /usr/local/etc/xray
+            rm -f /usr/local/bin/xray /var/log/xray.log
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+managed_service_purge_unit() {
+    local name="$1"
+    rm -f         "/etc/systemd/system/${name}.service"         "/etc/systemd/system/${name}"         "/lib/systemd/system/${name}.service"         "/lib/systemd/system/${name}"         "/usr/lib/systemd/system/${name}.service"         "/usr/lib/systemd/system/${name}"
+}
+
+managed_service_destroy() {
+    local name="$1" mode="${2:-normal}" quiet="${3:-0}"
+    local port="" pidfile="" match="" label=""
+    [[ -n "$name" ]] || return 1
+    label=$(managed_service_label "$name" 2>/dev/null || printf %s "$name")
+    port=$(managed_service_current_port "$name" 2>/dev/null || true)
+    pidfile=$(managed_service_pid "$name" 2>/dev/null || true)
+    match=$(managed_service_match "$name" 2>/dev/null || true)
+
+    if [[ "$mode" == "force" ]]; then
+        service_use_systemd && { systemctl stop "$name" >/dev/null 2>&1 || true; systemctl disable "$name" >/dev/null 2>&1 || true; }
+        have_cmd service && service "$name" stop >/dev/null 2>&1 || true
+        have_cmd rc-service && rc-service "$name" stop >/dev/null 2>&1 || true
+    fi
+
+    named_service_remove_firewall "$name" "$port" >/dev/null 2>&1 || true
+    stop_named_service "$name" >/dev/null 2>&1 || true
+
+    if [[ "$mode" == "force" ]]; then
+        [[ -n "$match" ]] && pkill -9 -f "$match" >/dev/null 2>&1 || true
+        [[ "$name" == "xray" ]] && pkill -9 -x xray >/dev/null 2>&1 || true
+    fi
+
+    if [[ -n "$pidfile" && -f "$pidfile" ]]; then
+        kill -9 "$(cat "$pidfile" 2>/dev/null)" >/dev/null 2>&1 || true
+        rm -f "$pidfile" >/dev/null 2>&1 || true
+    fi
+
+    managed_service_remove_artifacts "$name" >/dev/null 2>&1 || true
+    managed_service_purge_unit "$name"
+
+    if service_use_systemd; then
+        systemctl reset-failed "$name" >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    [[ "$quiet" == "1" ]] || echo -e "${GREEN}✅ ${label} 已彻底销毁！${RESET}"
+    return 0
 }
 
 force_kill_service() {
     local target="$1" from_menu="$2"
-    local port="" pidfile="" target_desc="$1"
     if [[ -z "$target" ]]; then
         echo -e "${RED}❌ 目标服务名为空！${RESET}"
         [[ "$from_menu" == "menu" ]] && { sleep 2; return; } || exit 1
     fi
-
     echo -e "${RED}☢️ 正在执行全链路强制核爆: ${target} ...${RESET}"
-
-    if service_use_systemd; then
-        systemctl stop "$target" 2>/dev/null || true
-        systemctl disable "$target" 2>/dev/null || true
-    fi
-    have_cmd service && service "$target" stop >/dev/null 2>&1 || true
-    have_cmd rc-service && rc-service "$target" stop >/dev/null 2>&1 || true
-
-    case "$target" in
-        ss-rust)
-            port="$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null || true)"
-            [[ "$port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$port" "both"
-            pidfile="/var/run/ss-rust.pid"
-            pkill -9 -f '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' 2>/dev/null || true
-            pkill -9 -x ss-rust 2>/dev/null || true
-            rm -rf /etc/ss-rust
-            rm -f /usr/local/bin/ss-rust /var/log/ss-rust.log
-            ;;
-        xray)
-            port="$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null || true)"
-            [[ "$port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$port" "tcp"
-            pidfile="/var/run/xray.pid"
-            pkill -9 -f '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' 2>/dev/null || true
-            pkill -9 -x xray 2>/dev/null || true
-            rm -rf /usr/local/etc/xray
-            rm -f /usr/local/bin/xray /var/log/xray.log
-            ;;
-        ss-v2ray)
-            port="$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null || true)"
-            [[ "$port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$port" "tcp"
-            pidfile="/var/run/ss-v2ray.pid"
-            pkill -9 -f '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' 2>/dev/null || true
-            rm -rf /etc/ss-v2ray
-            rm -f /var/log/ss-v2ray.log "$SS_V2RAY_STATE"
-            ;;
-        ss-obfs)
-            port="$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null || true)"
-            [[ "$port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$port" "tcp"
-            pidfile="/var/run/ss-obfs.pid"
-            pkill -9 -f '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' 2>/dev/null || true
-            rm -rf /etc/ss-obfs
-            rm -f /var/log/ss-obfs.log "$SS_OBFS_STATE"
-            ;;
-        *)
-            pkill -9 -f "$target" 2>/dev/null || true
-            ;;
-    esac
-
-    if [[ -n "$pidfile" && -f "$pidfile" ]]; then
-        kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
-        rm -f "$pidfile"
-    fi
-
-    rm -f \
-        "/etc/systemd/system/${target}.service" \
-        "/etc/systemd/system/${target}" \
-        "/lib/systemd/system/${target}.service" \
-        "/lib/systemd/system/${target}" \
-        "/usr/lib/systemd/system/${target}.service" \
-        "/usr/lib/systemd/system/${target}"
-
-    if service_use_systemd; then
-        systemctl reset-failed "$target" >/dev/null 2>&1 || true
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
-
+    managed_service_destroy "$target" force 1
+    local target_desc
+    target_desc=$(managed_service_label "$target" 2>/dev/null || printf %s "$target")
     echo -e "${GREEN}✅ 目标服务 [${target_desc}] 已被强制清理完成！${RESET}"
     [[ "$from_menu" == "menu" ]] && sleep 2 || exit 0
 }
@@ -1247,36 +1574,15 @@ managed_nuke_build_index() {
     NUCLEAR_TARGETS=()
     NUCLEAR_LABELS=()
     NUCLEAR_PORTS=()
-    local idx=1 port
-
-    port="$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null || true)"
-    if [[ -f /etc/ss-rust/config.json || -x /usr/local/bin/ss-rust || -f /etc/systemd/system/ss-rust.service || -f /var/run/ss-rust.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' >/dev/null 2>&1; then
-        NUCLEAR_TARGETS[$idx]="ss-rust"
-        NUCLEAR_LABELS[$idx]="SS-Rust"
+    local idx=1 svc port
+    for svc in ss-rust ss-v2ray xray; do
+        managed_service_exists "$svc" || continue
+        port=$(managed_service_current_port "$svc" 2>/dev/null || true)
+        NUCLEAR_TARGETS[$idx]="$svc"
+        NUCLEAR_LABELS[$idx]="$(managed_service_label "$svc")"
         NUCLEAR_PORTS[$idx]="$port"
         ((idx++))
-    fi
-    port="$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null || true)"
-    if [[ -f "$SS_V2RAY_CONF" || -f /etc/systemd/system/ss-v2ray.service || -f /var/run/ss-v2ray.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' >/dev/null 2>&1; then
-        NUCLEAR_TARGETS[$idx]="ss-v2ray"
-        NUCLEAR_LABELS[$idx]="SS2022 + v2ray-plugin"
-        NUCLEAR_PORTS[$idx]="$port"
-        ((idx++))
-    fi
-    port="$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null || true)"
-    if [[ -f "$SS_OBFS_CONF" || -f /etc/systemd/system/ss-obfs.service || -f /var/run/ss-obfs.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' >/dev/null 2>&1; then
-        NUCLEAR_TARGETS[$idx]="ss-obfs"
-        NUCLEAR_LABELS[$idx]="SS2022 + obfs-local"
-        NUCLEAR_PORTS[$idx]="$port"
-        ((idx++))
-    fi
-    port="$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null || true)"
-    if [[ -f /usr/local/etc/xray/config.json || -x /usr/local/bin/xray || -f /etc/systemd/system/xray.service || -f /var/run/xray.pid ]] || pgrep -f '/usr/local/bin/xray' >/dev/null 2>&1; then
-        NUCLEAR_TARGETS[$idx]="xray"
-        NUCLEAR_LABELS[$idx]="Xray / VLESS Reality"
-        NUCLEAR_PORTS[$idx]="$port"
-        ((idx++))
-    fi
+    done
 }
 
 dns_backup() {
@@ -1709,15 +2015,22 @@ cf_ddns_menu() {
 change_ssh_port() {
     read -rp "新的 SSH 端口号 (1-65535): " new_port
     if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
+        local cfg_bak old_port
         backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
-        if have_cmd ufw && ufw status | grep -qw "active"; then ufw allow "$new_port"/tcp >/dev/null 2>&1; fi
-        if have_cmd firewall-cmd; then firewall-cmd --add-port="$new_port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+        cfg_bak=$(make_runtime_backup /etc/ssh/sshd_config) || { echo -e "${RED}❌ SSH 配置备份失败。${RESET}"; sleep 2; return 1; }
+        old_port=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')
+        [[ "$old_port" =~ ^[0-9]+$ ]] || old_port=22
+        add_firewall_rule "$new_port" tcp || true
         replace_or_append_line /etc/ssh/sshd_config '^#?Port ' "Port $new_port"
         if restart_ssh_safe; then
+            [[ "$old_port" =~ ^[0-9]+$ && "$old_port" != "$new_port" ]] && remove_firewall_rule "$old_port" tcp
+            rm -f "$cfg_bak"
             echo -e "${GREEN}✅ SSH 端口已修改为 $new_port 。${RESET}"
         else
-            restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
+            restore_file_strict "$cfg_bak" /etc/ssh/sshd_config >/dev/null 2>&1 || true
             restart_ssh_safe >/dev/null 2>&1 || true
+            [[ "$old_port" != "$new_port" ]] && remove_firewall_rule "$new_port" tcp
+            rm -f "$cfg_bak"
             echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
         fi
     else
@@ -1752,7 +2065,10 @@ sync_server_time() {
 }
 
 apply_ssh_key_sec() {
+    local cfg_bak dropin_bak=""
     backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
+    cfg_bak=$(make_runtime_backup /etc/ssh/sshd_config) || { echo -e "${RED}❌ SSH 配置备份失败。${RESET}"; sleep 2; return 1; }
+    [[ -f "$SSH_AUTH_DROPIN" ]] && dropin_bak=$(make_runtime_backup "$SSH_AUTH_DROPIN" 2>/dev/null || true)
     replace_or_append_line /etc/ssh/sshd_config '^#?PasswordAuthentication ' 'PasswordAuthentication no'
     replace_or_append_line /etc/ssh/sshd_config '^#?KbdInteractiveAuthentication ' 'KbdInteractiveAuthentication no'
     replace_or_append_line /etc/ssh/sshd_config '^#?ChallengeResponseAuthentication ' 'ChallengeResponseAuthentication no'
@@ -1761,32 +2077,39 @@ apply_ssh_key_sec() {
     replace_or_append_line /etc/ssh/sshd_config '^#?PermitRootLogin ' 'PermitRootLogin prohibit-password'
     write_ssh_auth_dropin no no no
     if ! restart_ssh_safe; then
-        remove_ssh_auth_dropin
-        restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
+        restore_file_strict "$cfg_bak" /etc/ssh/sshd_config >/dev/null 2>&1 || true
+        restore_or_remove_file "$dropin_bak" "$SSH_AUTH_DROPIN" >/dev/null 2>&1 || true
         restart_ssh_safe >/dev/null 2>&1 || true
+        rm -f "$cfg_bak" "$dropin_bak"
         echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
         sleep 2
         return 1
     fi
+    rm -f "$cfg_bak" "$dropin_bak"
     echo -e "${GREEN}✅ 已启用密钥登录并禁止密码登录。${RESET}"
     sleep 2
 }
 
 restore_password_login() {
+    local cfg_bak dropin_bak=""
     backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
+    cfg_bak=$(make_runtime_backup /etc/ssh/sshd_config) || { echo -e "${RED}❌ SSH 配置备份失败。${RESET}"; sleep 2; return 1; }
+    [[ -f "$SSH_AUTH_DROPIN" ]] && dropin_bak=$(make_runtime_backup "$SSH_AUTH_DROPIN" 2>/dev/null || true)
     replace_or_append_line /etc/ssh/sshd_config '^#?PasswordAuthentication ' 'PasswordAuthentication yes'
     replace_or_append_line /etc/ssh/sshd_config '^#?KbdInteractiveAuthentication ' 'KbdInteractiveAuthentication yes'
     replace_or_append_line /etc/ssh/sshd_config '^#?ChallengeResponseAuthentication ' 'ChallengeResponseAuthentication yes'
     replace_or_append_line /etc/ssh/sshd_config '^#?PubkeyAuthentication ' 'PubkeyAuthentication yes'
     remove_ssh_auth_dropin
     if ! restart_ssh_safe; then
-        write_ssh_auth_dropin no no no
-        restore_file_if_present "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
+        restore_file_strict "$cfg_bak" /etc/ssh/sshd_config >/dev/null 2>&1 || true
+        restore_or_remove_file "$dropin_bak" "$SSH_AUTH_DROPIN" >/dev/null 2>&1 || true
         restart_ssh_safe >/dev/null 2>&1 || true
+        rm -f "$cfg_bak" "$dropin_bak"
         echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
         sleep 2
         return 1
     fi
+    rm -f "$cfg_bak" "$dropin_bak"
     echo -e "${GREEN}✅ 已恢复密码登录。${RESET}"
     sleep 2
 }
@@ -1864,28 +2187,12 @@ EOF
         sleep 3
         return
     fi
-    local ss_unit='[Unit]
-Description=Shadowsocks-Rust Server
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/ss-rust -c /etc/ss-rust/config.json
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target'
-    if ! start_managed_service "ss-rust" "$ss_unit" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid"; then
+    if ! start_named_service "ss-rust"; then
         echo -e "${RED}❌ SS-Rust 启动失败。请检查 /var/log/ss-rust.log${RESET}"
         sleep 3
         return
     fi
-    if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; ufw allow "$port"/udp >/dev/null 2>&1; fi
-    if have_cmd firewall-cmd; then
-        firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1
-        firewall-cmd --add-port="$port"/udp --permanent >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-    fi
+    named_service_add_firewall "ss-rust" "$port" >/dev/null 2>&1 || true
     [[ -n "$ENSURED_SS_RUST_TAG" ]] && meta_set "SS_RUST_TAG" "$ENSURED_SS_RUST_TAG"
     echo -e "${GREEN}✅ SS-Rust (${ENSURED_SS_RUST_TAG:-local}) 安装完成！${RESET}"
     show_ss_rust_summary
@@ -1997,27 +2304,14 @@ EOF
         return
     fi
 
-    local xray_unit='[Unit]
-Description=Xray Service
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/xray run -c /usr/local/etc/xray/config.json
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target'
-
-    if ! start_managed_service "xray" "$xray_unit" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid"; then
+    if ! start_named_service "xray"; then
         echo -e "${RED}❌ Xray 启动失败。请检查 /var/log/xray.log${RESET}"
         rm -rf "$tmpdir"
         sleep 3
         return
     fi
 
-    if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; fi
-    if have_cmd firewall-cmd; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+    named_service_add_firewall "xray" "$port" >/dev/null 2>&1 || true
 
     [[ -n "$xray_latest" ]] && meta_set "XRAY_TAG" "$xray_latest"
 
@@ -2083,118 +2377,33 @@ EOF
         sleep 3
         return
     fi
-    local unit='[Unit]
-Description=Shadowsocks-Rust + v2ray-plugin Server
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target'
-    if ! start_managed_service "ss-v2ray" "$unit" "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/log/ss-v2ray.log" "/var/run/ss-v2ray.pid"; then
+    if ! start_named_service "ss-v2ray"; then
         echo -e "${RED}❌ SS2022 + v2ray-plugin 启动失败。${RESET}"
         sleep 3
         return
     fi
-    if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; fi
-    if have_cmd firewall-cmd; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+    named_service_add_firewall "ss-v2ray" "$port" >/dev/null 2>&1 || true
     echo -e "${GREEN}✅ SS2022 + v2ray-plugin 部署完成！${RESET}"
     show_ss_v2ray_summary
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
 
-install_ss_obfs_native() {
-    clear
-    echo -e "${CYAN}========= 自动部署 SS2022 + obfs-local =========${RESET}"
-    read -rp "端口 [留空随机]: " port
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        port=$((RANDOM % 55535 + 10000))
-    fi
-    ss_pick_method_password || return
-    ensure_ss_rust_binary || return
-    echo -e "${YELLOW}混淆模式:${RESET}
- 1) tls
- 2) http"
-    read -rp "选择 [1-2] (默认1): " obsel
-    [[ "$obsel" == "2" ]] && obfs_mode="http" || obfs_mode="tls"
-    read -rp "伪装域名 [默认 www.bing.com]: " host
-    [[ -z "$host" ]] && host="www.bing.com"
-    if [[ ! -x /usr/local/bin/obfs-server || ! -x /usr/local/bin/obfs-local ]]; then
-        echo -e "${CYAN}>>> 正在准备 simple-obfs (obfs-server / obfs-local)...${RESET}"
-        if have_cmd apt-get; then
-            apt-get update >/dev/null 2>&1 || true
-            apt-get install -y simple-obfs >/dev/null 2>&1 || true
-        elif have_cmd apk; then
-            apk add --no-cache simple-obfs >/dev/null 2>&1 || true
-        elif have_cmd dnf; then
-            dnf install -y simple-obfs >/dev/null 2>&1 || true
-        elif have_cmd yum; then
-            yum install -y epel-release >/dev/null 2>&1 || true
-            yum install -y simple-obfs >/dev/null 2>&1 || true
-        fi
-        for b in /usr/bin/obfs-server /usr/local/bin/obfs-server; do [[ -x "$b" ]] && install -m 755 "$b" /usr/local/bin/obfs-server >/dev/null 2>&1 && break; done
-        for b in /usr/bin/obfs-local /usr/local/bin/obfs-local; do [[ -x "$b" ]] && install -m 755 "$b" /usr/local/bin/obfs-local >/dev/null 2>&1 && break; done
-        if [[ ! -x /usr/local/bin/obfs-server || ! -x /usr/local/bin/obfs-local ]]; then
-            echo -e "${RED}❌ simple-obfs 安装失败或当前系统源未提供 obfs-server / obfs-local。${RESET}"
-            sleep 3
-            return
-        fi
-    fi
-    mkdir -p /etc/ss-obfs
-    cat > "$SS_OBFS_CONF" << EOF
-{ "server": "::", "server_port": $port, "password": "${SS_PICK_PASSWORD}", "method": "${SS_PICK_METHOD}", "mode": "tcp_only", "fast_open": true, "plugin": "obfs-server", "plugin_opts": "obfs=${obfs_mode}" }
-EOF
-    plugin_state_write "$SS_OBFS_STATE" HOST "$host" MODE "$obfs_mode"
-    run_with_timeout 3 /usr/local/bin/ss-rust -c "$SS_OBFS_CONF" >/dev/null 2>&1
-    local rc=$?
-    if [[ "$rc" -ne 0 && "$rc" -ne 124 && "$rc" -ne 137 ]]; then
-        echo -e "${RED}❌ 配置自检失败，已中止启动。${RESET}"
-        sleep 3
-        return
-    fi
-    local unit='[Unit]
-Description=Shadowsocks-Rust + simple-obfs Server
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target'
-    if ! start_managed_service "ss-obfs" "$unit" "/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/log/ss-obfs.log" "/var/run/ss-obfs.pid"; then
-        echo -e "${RED}❌ SS2022 + obfs-local 启动失败。${RESET}"
-        sleep 3
-        return
-    fi
-    if have_cmd ufw; then ufw allow "$port"/tcp >/dev/null 2>&1; fi
-    if have_cmd firewall-cmd; then firewall-cmd --add-port="$port"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
-    echo -e "${GREEN}✅ SS2022 + obfs-local 部署完成！${RESET}"
-    show_ss_obfs_summary
-    read -n 1 -s -r -p "按任意键返回上一层..."
-}
-
 # 统一节点生命周期管控中心
+
 unified_node_manager() {
     while true; do
         clear
-        local has_ss=0 has_v2=0 has_obfs=0 has_vless=0
-        ([[ -f /etc/ss-rust/config.json || -f /etc/systemd/system/ss-rust.service || -f /var/run/ss-rust.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' >/dev/null 2>&1) && has_ss=1
-        ([[ -f "$SS_V2RAY_CONF" || -f /etc/systemd/system/ss-v2ray.service || -f /var/run/ss-v2ray.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' >/dev/null 2>&1) && has_v2=1
-        ([[ -f "$SS_OBFS_CONF" || -f /etc/systemd/system/ss-obfs.service || -f /var/run/ss-obfs.pid ]] || pgrep -f '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' >/dev/null 2>&1) && has_obfs=1
-        ([[ -f /usr/local/etc/xray/config.json || -f /etc/systemd/system/xray.service || -f /var/run/xray.pid ]] || pgrep -f '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' >/dev/null 2>&1) && has_vless=1
+        local has_ss=0 has_v2=0 has_vless=0
+        managed_service_exists "ss-rust" && has_ss=1
+        managed_service_exists "ss-v2ray" && has_v2=1
+        managed_service_exists "xray" && has_vless=1
         echo -e "${CYAN}========= 统一节点生命周期管控中心 =========${RESET}"
         if [[ $has_ss -eq 1 ]]; then echo -e "${GREEN} 1) ⚡ SS-Rust 节点${RESET}"; else echo -e "${RED} 1) ❌ 未部署 SS-Rust${RESET}"; fi
         if [[ $has_v2 -eq 1 ]]; then echo -e "${GREEN} 2) 🌐 SS2022 + v2ray-plugin${RESET}"; else echo -e "${RED} 2) ❌ 未部署 SS2022 + v2ray-plugin${RESET}"; fi
-        if [[ $has_obfs -eq 1 ]]; then echo -e "${GREEN} 3) ☁️ SS2022 + obfs-local${RESET}"; else echo -e "${RED} 3) ❌ 未部署 SS2022 + obfs-local${RESET}"; fi
-        if [[ $has_vless -eq 1 ]]; then echo -e "${GREEN} 4) 🔮 VLESS Reality 节点${RESET}"; else echo -e "${RED} 4) ❌ 未部署 VLESS Reality${RESET}"; fi
-        echo -e "${RED} 5) ☢️ 全局强制核爆 (清理任意卡死/幽灵服务)${RESET}"
+        if [[ $has_vless -eq 1 ]]; then echo -e "${GREEN} 3) 🔮 VLESS Reality 节点${RESET}"; else echo -e "${RED} 3) ❌ 未部署 VLESS Reality${RESET}"; fi
+        echo -e "${RED} 4) ☢️ 全局强制核爆${RESET}"
         echo -e " 0) 返回主菜单"
-        read -rp "请选择 [0-5]: " node_choice
+        read -rp "请选择 [0-4]: " node_choice
         case "$node_choice" in
             1)
                 if [[ $has_ss -eq 1 ]]; then
@@ -2208,12 +2417,11 @@ unified_node_manager() {
                     if [[ "$op" == "1" ]]; then
                         read -rp "新端口 (1-65535): " np
                         if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
-                            json_set_top_value /etc/ss-rust/config.json server_port "$np" number
-                            remove_firewall_rule "$port" "both"
-                            if have_cmd ufw; then ufw allow "$np"/tcp >/dev/null 2>&1; ufw allow "$np"/udp >/dev/null 2>&1; fi
-                            if have_cmd firewall-cmd; then firewall-cmd --add-port="$np"/tcp --permanent >/dev/null 2>&1; firewall-cmd --add-port="$np"/udp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
-                            restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
-                            echo -e "${GREEN}✅ 修改成功${RESET}"
+                            if apply_json_named_service_port_change /etc/ss-rust/config.json server_port "$np" "$port" "ss-rust"; then
+                                echo -e "${GREEN}✅ 修改成功${RESET}"
+                            else
+                                echo -e "${RED}❌ 修改失败，已自动回滚${RESET}"
+                            fi
                         else
                             echo -e "${RED}❌ 端口无效${RESET}"
                         fi
@@ -2221,16 +2429,14 @@ unified_node_manager() {
                     elif [[ "$op" == "2" ]]; then
                         read -rp "新密码: " npwd
                         [[ -z "$npwd" ]] && { echo -e "${RED}❌ 密码不能为空${RESET}"; sleep 1; continue; }
-                        json_set_top_value /etc/ss-rust/config.json password "$npwd" string
-                        restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
-                        echo -e "${GREEN}✅ 修改成功${RESET}"
+                        if apply_json_named_service_change /etc/ss-rust/config.json password "$npwd" string "ss-rust"; then
+                            echo -e "${GREEN}✅ 修改成功${RESET}"
+                        else
+                            echo -e "${RED}❌ 修改失败，已自动回滚${RESET}"
+                        fi
                         sleep 1
                     elif [[ "$op" == "3" ]]; then
-                        remove_firewall_rule "$port" "both"
-                        stop_managed_service "ss-rust" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/run/ss-rust.pid"
-                        rm -rf /etc/ss-rust /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service /var/log/ss-rust.log
-                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
-                        echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
+                        managed_service_destroy "ss-rust"
                         sleep 1
                     fi
                 fi
@@ -2247,12 +2453,11 @@ unified_node_manager() {
                     if [[ "$op" == "1" ]]; then
                         read -rp "新端口 (1-65535): " np
                         if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
-                            json_set_top_value "$SS_V2RAY_CONF" server_port "$np" number
-                            remove_firewall_rule "$port" "tcp"
-                            if have_cmd ufw; then ufw allow "$np"/tcp >/dev/null 2>&1; fi
-                            if have_cmd firewall-cmd; then firewall-cmd --add-port="$np"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
-                            restart_managed_service "ss-v2ray" "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/log/ss-v2ray.log" "/var/run/ss-v2ray.pid" >/dev/null 2>&1 || true
-                            echo -e "${GREEN}✅ 修改成功${RESET}"
+                            if apply_json_named_service_port_change "$SS_V2RAY_CONF" server_port "$np" "$port" "ss-v2ray"; then
+                                echo -e "${GREEN}✅ 修改成功${RESET}"
+                            else
+                                echo -e "${RED}❌ 修改失败，已自动回滚${RESET}"
+                            fi
                         else
                             echo -e "${RED}❌ 端口无效${RESET}"
                         fi
@@ -2260,60 +2465,19 @@ unified_node_manager() {
                     elif [[ "$op" == "2" ]]; then
                         read -rp "新密码: " npwd
                         [[ -z "$npwd" ]] && { echo -e "${RED}❌ 密码不能为空${RESET}"; sleep 1; continue; }
-                        json_set_top_value "$SS_V2RAY_CONF" password "$npwd" string
-                        restart_managed_service "ss-v2ray" "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/log/ss-v2ray.log" "/var/run/ss-v2ray.pid" >/dev/null 2>&1 || true
-                        echo -e "${GREEN}✅ 修改成功${RESET}"
+                        if apply_json_named_service_change "$SS_V2RAY_CONF" password "$npwd" string "ss-v2ray"; then
+                            echo -e "${GREEN}✅ 修改成功${RESET}"
+                        else
+                            echo -e "${RED}❌ 修改失败，已自动回滚${RESET}"
+                        fi
                         sleep 1
                     elif [[ "$op" == "3" ]]; then
-                        remove_firewall_rule "$port" "tcp"
-                        stop_managed_service "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid"
-                        rm -rf /etc/ss-v2ray /etc/systemd/system/ss-v2ray.service /var/log/ss-v2ray.log "$SS_V2RAY_STATE"
-                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
-                        echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
+                        managed_service_destroy "ss-v2ray"
                         sleep 1
                     fi
                 fi
                 ;;
             3)
-                if [[ $has_obfs -eq 1 ]]; then
-                    clear
-                    local port
-                    show_ss_obfs_summary
-                    port=$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null)
-                    echo -e "---------------------------------"
-                    echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 修改密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
-                    read -rp "输入操作: " op
-                    if [[ "$op" == "1" ]]; then
-                        read -rp "新端口 (1-65535): " np
-                        if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
-                            json_set_top_value "$SS_OBFS_CONF" server_port "$np" number
-                            remove_firewall_rule "$port" "tcp"
-                            if have_cmd ufw; then ufw allow "$np"/tcp >/dev/null 2>&1; fi
-                            if have_cmd firewall-cmd; then firewall-cmd --add-port="$np"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
-                            restart_managed_service "ss-obfs" "/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/log/ss-obfs.log" "/var/run/ss-obfs.pid" >/dev/null 2>&1 || true
-                            echo -e "${GREEN}✅ 修改成功${RESET}"
-                        else
-                            echo -e "${RED}❌ 端口无效${RESET}"
-                        fi
-                        sleep 1
-                    elif [[ "$op" == "2" ]]; then
-                        read -rp "新密码: " npwd
-                        [[ -z "$npwd" ]] && { echo -e "${RED}❌ 密码不能为空${RESET}"; sleep 1; continue; }
-                        json_set_top_value "$SS_OBFS_CONF" password "$npwd" string
-                        restart_managed_service "ss-obfs" "/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/log/ss-obfs.log" "/var/run/ss-obfs.pid" >/dev/null 2>&1 || true
-                        echo -e "${GREEN}✅ 修改成功${RESET}"
-                        sleep 1
-                    elif [[ "$op" == "3" ]]; then
-                        remove_firewall_rule "$port" "tcp"
-                        stop_managed_service "ss-obfs" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/run/ss-obfs.pid"
-                        rm -rf /etc/ss-obfs /etc/systemd/system/ss-obfs.service /var/log/ss-obfs.log "$SS_OBFS_STATE"
-                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
-                        echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
-                        sleep 1
-                    fi
-                fi
-                ;;
-            4)
                 if [[ $has_vless -eq 1 ]]; then
                     clear
                     local port
@@ -2325,31 +2489,29 @@ unified_node_manager() {
                     if [[ "$op" == "1" ]]; then
                         read -rp "新端口 (1-65535): " np
                         if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
-                            json_set_path /usr/local/etc/xray/config.json inbounds.0.port "$np" number
-                            remove_firewall_rule "$port" "tcp"
-                            if have_cmd ufw; then ufw allow "$np"/tcp >/dev/null 2>&1; fi
-                            if have_cmd firewall-cmd; then firewall-cmd --add-port="$np"/tcp --permanent >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
-                            restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
-                            echo -e "${GREEN}✅ 修改成功${RESET}"
+                            if apply_json_named_service_port_change /usr/local/etc/xray/config.json inbounds.0.port "$np" "$port" "xray"; then
+                                echo -e "${GREEN}✅ 修改成功${RESET}"
+                            else
+                                echo -e "${RED}❌ 修改失败，已自动回滚${RESET}"
+                            fi
                         else
                             echo -e "${RED}❌ 端口无效${RESET}"
                         fi
                         sleep 1
                     elif [[ "$op" == "2" ]]; then
-                        restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
-                        echo -e "${GREEN}✅ 已重启${RESET}"
+                        if restart_named_service "xray" >/dev/null 2>&1; then
+                            echo -e "${GREEN}✅ 已重启${RESET}"
+                        else
+                            echo -e "${RED}❌ 重启失败，请检查配置或日志${RESET}"
+                        fi
                         sleep 1
                     elif [[ "$op" == "3" ]]; then
-                        remove_firewall_rule "$port" "tcp"
-                        stop_managed_service "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"
-                        rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service /var/log/xray.log
-                        service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
-                        echo -e "${GREEN}✅ 已彻底销毁！${RESET}"
+                        managed_service_destroy "xray"
                         sleep 1
                     fi
                 fi
                 ;;
-            5)
+            4)
                 while true; do
                     clear
                     echo -e "${CYAN}========= ☢️ 全局强制核爆中心 =========${RESET}"
@@ -2515,17 +2677,14 @@ opt_menu() {
 }
 
 run_daemon_check() {
-    if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ss-rust\.service'; then
-        systemctl is-active --quiet ss-rust 2>/dev/null || restart_managed_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
+    if managed_service_present "ss-rust" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/run/ss-rust.pid" && ! service_is_running "ss-rust" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/run/ss-rust.pid"; then
+        restart_named_service "ss-rust" >/dev/null 2>&1 || true
     fi
-    if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ss-v2ray\.service'; then
-        systemctl is-active --quiet ss-v2ray 2>/dev/null || restart_managed_service "ss-v2ray" "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/log/ss-v2ray.log" "/var/run/ss-v2ray.pid" >/dev/null 2>&1 || true
+    if managed_service_present "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid" && ! service_is_running "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid"; then
+        restart_named_service "ss-v2ray" >/dev/null 2>&1 || true
     fi
-    if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ss-obfs\.service'; then
-        systemctl is-active --quiet ss-obfs 2>/dev/null || restart_managed_service "ss-obfs" "/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/log/ss-obfs.log" "/var/run/ss-obfs.pid" >/dev/null 2>&1 || true
-    fi
-    if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^xray\.service'; then
-        systemctl is-active --quiet xray 2>/dev/null || restart_managed_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
+    if managed_service_present "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid" && ! service_is_running "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"; then
+        restart_named_service "xray" >/dev/null 2>&1 || true
     fi
 }
 
@@ -2563,36 +2722,32 @@ update_ss_rust_if_needed() {
     [[ -z "$current" ]] && current=$(ss_rust_current_tag || true)
     [[ -n "$current" && "$current" == "$latest" ]] && return 3
 
-    if cache_restore_binary_tag "ss-rust" "$latest" /usr/local/bin/ss-rust && (run_with_timeout 3 /usr/local/bin/ss-rust --version >/dev/null 2>&1 || run_with_timeout 3 /usr/local/bin/ss-rust -V >/dev/null 2>&1); then
-        meta_set "SS_RUST_TAG" "$latest"
-        smooth_handoff_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
-        return 0
-    fi
-
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-ssrust.XXXXXX)
-    local tarball="${tmpdir}/ss-rust.tar.xz" url="" ok=""
+    local tarball="${tmpdir}/ss-rust.tar.xz" candidate="${tmpdir}/ssserver" url="" ok=""
 
-    for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
-        url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${latest}/shadowsocks-${latest}.${candidate_arch}.tar.xz"
-        rm -f "$tarball" "${tmpdir}/ssserver" >/dev/null 2>&1 || true
-        if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
-            continue
-        fi
-        tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
-        [[ -x "${tmpdir}/ssserver" ]] || continue
-        if run_with_timeout 3 "${tmpdir}/ssserver" --version >/dev/null 2>&1 || run_with_timeout 3 "${tmpdir}/ssserver" -V >/dev/null 2>&1; then
-            ok=1
-            break
-        fi
-    done
+    if cache_restore_binary_tag "ss-rust" "$latest" "$candidate" && (run_with_timeout 3 "$candidate" --version >/dev/null 2>&1 || run_with_timeout 3 "$candidate" -V >/dev/null 2>&1); then
+        ok=1
+    else
+        for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
+            url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${latest}/shadowsocks-${latest}.${candidate_arch}.tar.xz"
+            rm -f "$tarball" "$candidate" >/dev/null 2>&1 || true
+            if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
+                continue
+            fi
+            tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
+            [[ -x "$candidate" ]] || continue
+            if run_with_timeout 3 "$candidate" --version >/dev/null 2>&1 || run_with_timeout 3 "$candidate" -V >/dev/null 2>&1; then
+                ok=1
+                break
+            fi
+        done
+    fi
     [[ -n "$ok" ]] || { rm -rf "$tmpdir"; return 2; }
 
-    safe_install_binary "${tmpdir}/ssserver" /usr/local/bin/ss-rust || { rm -rf "$tmpdir"; return 2; }
-    cache_store_binary "ss-rust" "$latest" /usr/local/bin/ss-rust >/dev/null 2>&1 || true
-    meta_set "SS_RUST_TAG" "$latest"
-    smooth_handoff_service "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid" >/dev/null 2>&1 || true
+    activate_binary_with_rollback "ss-rust" "$latest" "$candidate" /usr/local/bin/ss-rust "SS_RUST_TAG" "ss-rust" "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/log/ss-rust.log" "/var/run/ss-rust.pid"
+    local rc=$?
     rm -rf "$tmpdir"
-    return 0
+    return $rc
 }
 
 update_xray_if_needed() {
@@ -2612,32 +2767,27 @@ update_xray_if_needed() {
     [[ -z "$current" ]] && current=$(xray_current_tag || true)
     [[ -n "$current" && "$current" == "$latest" ]] && return 3
 
-    if cache_restore_binary_tag "xray" "$latest" /usr/local/bin/xray && run_with_timeout 3 /usr/local/bin/xray version >/dev/null 2>&1 && run_with_timeout 3 /usr/local/bin/xray x25519 >/dev/null 2>&1; then
-        meta_set "XRAY_TAG" "$latest"
-        smooth_handoff_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
-        return 0
-    fi
-
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-xray.XXXXXX)
-    local zipf="${tmpdir}/xray.zip"
+    local zipf="${tmpdir}/xray.zip" candidate="${tmpdir}/xray"
     local url="https://github.com/XTLS/Xray-core/releases/download/${latest}/Xray-linux-${xray_arch}.zip"
 
-    if ! download_file "$url" "$zipf" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
-        rm -rf "$tmpdir"
-        return 2
+    if cache_restore_binary_tag "xray" "$latest" "$candidate" && run_with_timeout 3 "$candidate" version >/dev/null 2>&1 && run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1; then
+        :
+    else
+        if ! download_file "$url" "$zipf" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
+            rm -rf "$tmpdir"
+            return 2
+        fi
+        unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
+        [[ -x "$candidate" ]] || { rm -rf "$tmpdir"; return 2; }
+        run_with_timeout 3 "$candidate" version >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
+        run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
     fi
 
-    unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
-    [[ -x "${tmpdir}/xray" ]] || { rm -rf "$tmpdir"; return 2; }
-    run_with_timeout 3 "${tmpdir}/xray" version >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
-    run_with_timeout 3 "${tmpdir}/xray" x25519 >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
-
-    safe_install_binary "${tmpdir}/xray" /usr/local/bin/xray || { rm -rf "$tmpdir"; return 2; }
-    cache_store_binary "xray" "$latest" /usr/local/bin/xray >/dev/null 2>&1 || true
-    meta_set "XRAY_TAG" "$latest"
-    smooth_handoff_service "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid" >/dev/null 2>&1 || true
+    activate_binary_with_rollback "xray" "$latest" "$candidate" /usr/local/bin/xray "XRAY_TAG" "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid"
+    local rc=$?
     rm -rf "$tmpdir"
-    return 0
+    return $rc
 }
 
 hot_update_components() {
@@ -2651,7 +2801,7 @@ hot_update_components() {
 
     if [[ "$is_silent" != "silent" ]]; then
         if [[ $updated_any -eq 1 ]]; then
-            echo -e "${GREEN}✅ 核心组件已完成安全热更（仅更新到新版本）。${RESET}"
+            echo -e "${GREEN}✅ 核心组件已完成稳定更新（失败自动回滚）。${RESET}"
         else
             echo -e "${GREEN}✅ 核心组件已是最新或无需更新。${RESET}"
         fi
@@ -2719,32 +2869,13 @@ daily_task() {
 
 # 完全卸载
 ssr_cleanup_artifacts() {
-    if [[ -f "/etc/ss-rust/config.json" ]]; then
-        local sp; sp=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
-        [[ -n "$sp" && "$sp" != "null" ]] && remove_firewall_rule "$sp" "both"
-    fi
-    if [[ -f "$SS_V2RAY_CONF" ]]; then
-        local vp; vp=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
-        [[ -n "$vp" && "$vp" != "null" ]] && remove_firewall_rule "$vp" "tcp"
-    fi
-    if [[ -f "$SS_OBFS_CONF" ]]; then
-        local op; op=$(json_get_path "$SS_OBFS_CONF" server_port 2>/dev/null)
-        [[ -n "$op" && "$op" != "null" ]] && remove_firewall_rule "$op" "tcp"
-    fi
-    if [[ -f "/usr/local/etc/xray/config.json" ]]; then
-        local xp; xp=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
-        [[ -n "$xp" && "$xp" != "null" ]] && remove_firewall_rule "$xp" "tcp"
-    fi
-
-    stop_managed_service "ss-rust" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/run/ss-rust.pid"
-    stop_managed_service "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid"
-    stop_managed_service "ss-obfs" '/usr/local/bin/ss-rust -c /etc/ss-obfs/config.json' "/var/run/ss-obfs.pid"
-    stop_managed_service "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"
-    rm -rf /etc/ss-rust /etc/ss-v2ray /etc/ss-obfs /usr/local/bin/ss-rust /etc/systemd/system/ss-rust.service /etc/systemd/system/ss-v2ray.service /etc/systemd/system/ss-obfs.service /var/log/ss-rust.log /var/log/ss-v2ray.log /var/log/ss-obfs.log
-    rm -rf /usr/local/etc/xray /usr/local/bin/xray /etc/systemd/system/xray.service /var/log/xray.log
+    local svc
+    for svc in ss-rust ss-v2ray xray; do
+        managed_service_destroy "$svc" force 1 >/dev/null 2>&1 || true
+    done
 
     [[ -f "$DDNS_CONF" ]] && remove_cf_ddns "force" 2>/dev/null || true
-    rm -f /usr/local/bin/v2ray-plugin /usr/local/bin/obfs-server /usr/local/bin/obfs-local "$CONF_FILE" "$NAT_CONF_FILE" "$DDNS_CONF" "$DDNS_LOG" "$META_FILE" "$SS_V2RAY_STATE" "$SS_OBFS_STATE"
+    rm -f /usr/local/bin/v2ray-plugin "$CONF_FILE" "$NAT_CONF_FILE" "$DDNS_CONF" "$DDNS_LOG" "$META_FILE" "$SS_V2RAY_STATE"
     rm -f /usr/local/bin/ssr /usr/local/bin/ssr.sh 2>/dev/null || true
     crontab -l 2>/dev/null | grep -vE "/usr/local/bin/ssr (auto_update|auto_task|daemon_check|auto_core_update|clean|daily_task|ddns)" | crontab - 2>/dev/null || true
     dns_unlock_restore 2>/dev/null || true
@@ -2872,23 +3003,21 @@ main_menu() {
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${YELLOW} 1.${RESET} 原生部署 SS-Rust"
     echo -e "${YELLOW} 2.${RESET} 自动部署 SS2022 + v2ray-plugin"
-    echo -e "${YELLOW} 3.${RESET} 自动部署 SS2022 + obfs-local"
-    echo -e "${YELLOW} 4.${RESET} 原生部署 VLESS Reality"
+    echo -e "${YELLOW} 3.${RESET} 原生部署 VLESS Reality"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${GREEN} 5.${RESET} 🔰 统一节点管控中心 (查看 / 修改端口 / 删除 / 核爆)"
-    echo -e "${YELLOW} 6.${RESET} 网络优化与系统清理 (手动常规/NAT + 清理)"
-    echo -e "${GREEN} 7.${RESET} 核心缓存与更新中心"
+    echo -e "${GREEN} 4.${RESET} 🔰 统一节点管控中心 (查看 / 修改端口 / 删除 / 核爆)"
+    echo -e "${YELLOW} 5.${RESET} 网络优化与系统清理 (手动常规/NAT + 清理)"
+    echo -e "${GREEN} 6.${RESET} 核心缓存与更新中心"
     echo -e "${CYAN}============================================${RESET}"
     echo -e " 0. 返回上级菜单"
-    read -rp "请输入对应数字 [0-7]: " num
+    read -rp "请输入对应数字 [0-6]: " num
     case "$num" in
         1) install_ss_rust_native ;;
         2) install_ss_v2ray_plugin_native ;;
-        3) install_ss_obfs_native ;;
-        4) install_vless_native ;;
-        5) unified_node_manager ;;
-        6) opt_menu ;;
-        7) core_cache_menu ;;
+        3) install_vless_native ;;
+        4) unified_node_manager ;;
+        5) opt_menu ;;
+        6) core_cache_menu ;;
         0) return 1 ;;
         *) echo -e "${RED}请输入正确的选项！${RESET}" ;;
     esac
@@ -3127,8 +3256,13 @@ is_port() {
 }
 
 is_ipv4() {
-    local ip="$1"
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+    local ip="$1" o1 o2 o3 o4
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        ((octet >= 0 && octet <= 255)) || return 1
+    done
 }
 
 normalize_proto() {
