@@ -2135,8 +2135,11 @@ dns_status() {
 
 dns_menu() {
     while true; do
+        local dns_brief
+        dns_brief=$(get_dns_brief_status)
         clear
         echo -e "${CYAN}========= DNS 管理中心 =========${RESET}"
+        echo -e "当前状态: ${YELLOW}${dns_brief}${RESET}"
         echo -e "${GREEN} 1.${RESET} 查看 DNS 状态"
         echo -e "${GREEN} 2.${RESET} 智能选优：稳定优先"
         echo -e "${GREEN} 3.${RESET} 智能选优：极致优化"
@@ -2454,8 +2457,12 @@ restore_password_login() {
 }
 
 ssh_key_menu() {
+    local ssh_auth ssh_port
+    ssh_auth=$(get_ssh_auth_brief)
+    ssh_port=$(get_ssh_port_brief)
     clear
     echo -e "${CYAN}========= SSH 密钥登录管理 =========${RESET}"
+    echo -e "当前 SSH: 端口 ${YELLOW}${ssh_port}${RESET} / 登录模式 ${YELLOW}${ssh_auth}${RESET}"
     echo -e "${YELLOW} 1.${RESET} 自动拉取公钥 (GitHub)"
     echo -e "${YELLOW} 2.${RESET} 手动填写公钥"
     echo -e "${YELLOW} 3.${RESET} 一键生成密钥对"
@@ -3248,6 +3255,206 @@ total_uninstall() {
     exit 0
 }
 
+
+get_sshd_effective_value() {
+    local key="$1" file value=""
+    for file in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+        [[ -f "$file" ]] || continue
+        local found
+        found=$(awk -v key="$key" '
+            $0 !~ /^[[:space:]]*#/ && tolower($1) == tolower(key) {
+                $1=""
+                sub(/^[[:space:]]+/, "")
+                val=$0
+            }
+            END { if (val != "") print val }
+        ' "$file" 2>/dev/null)
+        [[ -n "$found" ]] && value="$found"
+    done
+    [[ -n "$value" ]] && printf %s "$value"
+}
+
+get_ssh_port_brief() {
+    local port
+    port=$(get_sshd_effective_value Port)
+    [[ "$port" =~ ^[0-9]+$ ]] || port=22
+    printf %s "$port"
+}
+
+get_ssh_auth_brief() {
+    local pass pub has_keys="0"
+    pass=$(get_sshd_effective_value PasswordAuthentication)
+    pub=$(get_sshd_effective_value PubkeyAuthentication)
+    [[ -s /root/.ssh/authorized_keys ]] && has_keys="1"
+    [[ -z "$pass" ]] && pass="yes"
+    [[ -z "$pub" ]] && pub="yes"
+    pass=$(printf %s "$pass" | tr '[:upper:]' '[:lower:]')
+    pub=$(printf %s "$pub" | tr '[:upper:]' '[:lower:]')
+    if [[ "$pass" == "no" && "$pub" == "yes" ]]; then
+        printf %s "仅密钥"
+    elif [[ "$pass" == "yes" && "$pub" == "yes" ]]; then
+        if [[ "$has_keys" == "1" ]]; then
+            printf %s "密码+密钥"
+        else
+            printf %s "密码登录"
+        fi
+    elif [[ "$pass" == "yes" ]]; then
+        printf %s "仅密码"
+    else
+        printf %s "自定义"
+    fi
+}
+
+get_dns_brief_status() {
+    local immutable="0" attr
+    if have_cmd lsattr; then
+        attr=$(lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}')
+        [[ "$attr" == *i* ]] && immutable="1"
+    fi
+    if [[ "$immutable" == "1" ]]; then
+        printf %s "已锁定"
+    elif [[ -f "$RESOLVED_DROPIN" ]]; then
+        printf %s "resolved 托管"
+    elif [[ -L /etc/resolv.conf ]]; then
+        printf %s "系统托管"
+    else
+        printf %s "普通/自定义"
+    fi
+}
+
+get_cf_ddns_brief_status() {
+    if [[ -f "$DDNS_CONF" ]]; then
+        local record
+        record=$(grep -E '^CF_RECORD=' "$DDNS_CONF" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^"//; s/"$//')
+        [[ -n "$record" ]] && printf %s "已启用(${record})" || printf %s "已启用"
+    else
+        printf %s "未启用"
+    fi
+}
+
+quic_rule_blocked_ufw() {
+    have_cmd ufw || return 1
+    ufw status 2>/dev/null | grep -F '443/udp' | grep -qi 'DENY'
+}
+
+quic_rule_blocked_firewalld() {
+    have_cmd firewall-cmd || return 1
+    firewall-cmd --permanent --list-rich-rules 2>/dev/null | grep -q 'port="443" protocol="udp" drop'
+}
+
+quic_rule_blocked_iptables() {
+    iptables -C INPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
+    iptables -C OUTPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
+    ip6tables -C INPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
+    ip6tables -C OUTPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
+    return 1
+}
+
+get_quic_backend() {
+    if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
+        printf %s "ufw"
+    elif have_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
+        printf %s "firewalld"
+    elif quic_rule_blocked_iptables; then
+        printf %s "iptables"
+    else
+        printf %s "none"
+    fi
+}
+
+get_quic_state() {
+    local backend
+    backend=$(get_quic_backend)
+    case "$backend" in
+        ufw)
+            quic_rule_blocked_ufw && printf %s "blocked" || printf %s "open"
+            ;;
+        firewalld)
+            quic_rule_blocked_firewalld && printf %s "blocked" || printf %s "open"
+            ;;
+        iptables)
+            quic_rule_blocked_iptables && printf %s "blocked" || printf %s "open"
+            ;;
+        *)
+            printf %s "open"
+            ;;
+    esac
+}
+
+get_quic_status_brief() {
+    local state backend
+    state=$(get_quic_state)
+    backend=$(get_quic_backend)
+    if [[ "$state" == "blocked" ]]; then
+        printf %s "已阻断(${backend})"
+    else
+        if [[ "$backend" == "none" ]]; then
+            printf %s "默认放行(未托管)"
+        else
+            printf %s "已放行(${backend})"
+        fi
+    fi
+}
+
+count_proxy_nodes_brief() {
+    local c=0 name
+    for name in ss-rust ss-v2ray xray; do
+        managed_service_exists "$name" && c=$((c+1))
+    done
+    printf %s "$c"
+}
+
+get_nft_rules_brief() {
+    local c=0
+    if [[ -f "$CONFIG_FILE" ]]; then
+        c=$(grep -cvE '^[[:space:]]*($|#)' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    fi
+    printf %s "$c"
+}
+
+get_nginx_domains_brief() {
+    local c=0
+    if [[ -d /etc/nginx/sites-enabled ]]; then
+        c=$(find /etc/nginx/sites-enabled -maxdepth 1 \( -type l -o -type f \) ! -name default 2>/dev/null | wc -l)
+        c=${c//[[:space:]]/}
+    fi
+    printf %s "$c"
+}
+
+get_nginx_status_brief() {
+    local domains
+    domains=$(get_nginx_domains_brief)
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        printf %s "运行中(${domains}站点)"
+    elif [[ "$domains" =~ ^[0-9]+$ && "$domains" -gt 0 ]]; then
+        printf %s "已配${domains}站点/未运行"
+    else
+        printf %s "未启用"
+    fi
+}
+
+global_status_dashboard() {
+    local ssh_port ssh_auth ddns dns quic nodes nft_rules nginx
+    ssh_port=$(get_ssh_port_brief)
+    ssh_auth=$(get_ssh_auth_brief)
+    ddns=$(get_cf_ddns_brief_status)
+    dns=$(get_dns_brief_status)
+    quic=$(get_quic_status_brief)
+    nodes=$(count_proxy_nodes_brief)
+    nft_rules=$(get_nft_rules_brief)
+    nginx=$(get_nginx_status_brief)
+
+    clear
+    echo -e "${CYAN}================ 全局状态总览 ================${RESET}"
+    echo -e "代理节点: ${YELLOW}${nodes}${RESET} 个   NFT 转发规则: ${YELLOW}${nft_rules}${RESET} 条   Nginx: ${YELLOW}${nginx}${RESET}"
+    echo -e "SSH 端口: ${YELLOW}${ssh_port}${RESET}   SSH 登录: ${YELLOW}${ssh_auth}${RESET}"
+    echo -e "DNS: ${YELLOW}${dns}${RESET}   DDNS: ${YELLOW}${ddns}${RESET}"
+    echo -e "QUIC/UDP 443: ${YELLOW}${quic}${RESET}"
+    echo -e "${CYAN}==============================================${RESET}"
+    echo ""
+    read -n 1 -s -r -p "按任意键返回..."
+}
+
 manage_quic_udp443() {
     local action="$1"
     if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
@@ -3294,18 +3501,23 @@ manage_quic_udp443() {
 
 quic_menu() {
     while true; do
+        local quic_status
+        quic_status=$(get_quic_status_brief)
         clear
         echo -e "${CYAN}========= QUIC 防火墙管理 (防 QoS) =========${RESET}"
+        echo -e "当前状态: ${YELLOW}${quic_status}${RESET}"
         echo -e "${YELLOW}说明：阻断 UDP 443 可有效防止运营商对 UDP 流量的 QoS 和阻断，${RESET}"
         echo -e "${YELLOW}      强制科学代理流量回退至更稳定的 TCP 协议。${RESET}"
         echo -e "------------------------------------------------"
         echo -e "${RED} 1.${RESET} 一键阻断 UDP 443 (关闭 QUIC - 推荐稳定)${RESET}"
         echo -e "${GREEN} 2.${RESET} 一键放行 UDP 443 (开启 QUIC - 默认状态)${RESET}"
+        echo -e "${CYAN} 3.${RESET} 刷新并重看当前状态"
         echo -e " 0. 返回上一级"
-        read -rp "请选择 [0-2]: " q_num
+        read -rp "请选择 [0-3]: " q_num
         case "$q_num" in
             1) manage_quic_udp443 "block" ;;
             2) manage_quic_udp443 "unblock" ;;
+            3) ;;
             0) return ;;
             *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
         esac
@@ -3316,11 +3528,20 @@ quic_menu() {
 # 系统菜单
 sys_menu() {
     while true; do
+        local ssh_port ssh_auth ddns dns quic
+        ssh_port=$(get_ssh_port_brief)
+        ssh_auth=$(get_ssh_auth_brief)
+        ddns=$(get_cf_ddns_brief_status)
+        dns=$(get_dns_brief_status)
+        quic=$(get_quic_status_brief)
         clear
         echo -e "${CYAN}================== 系统基础与极客管理 ==================${RESET}"
-        echo -e "  ${YELLOW}1.${RESET} 一键修改 SSH 安全端口      ${GREEN}5.${RESET} 原生 Cloudflare DDNS 解析模块"
-        echo -e "  ${YELLOW}2.${RESET} 一键修改 Root 密码         ${YELLOW}6.${RESET} DNS 管理中心（智能/锁定/恢复）"
-        echo -e "  ${YELLOW}3.${RESET} 服务器时间防偏移同步       ${RED}7.${RESET} 防 QoS：一键开启/关闭 QUIC"
+        echo -e "  SSH: 端口 ${YELLOW}${ssh_port}${RESET} / ${YELLOW}${ssh_auth}${RESET}"
+        echo -e "  DDNS: ${YELLOW}${ddns}${RESET}   DNS: ${YELLOW}${dns}${RESET}   QUIC: ${YELLOW}${quic}${RESET}"
+        echo -e "--------------------------------------------------------"
+        echo -e "  ${YELLOW}1.${RESET} SSH 端口管理               ${GREEN}5.${RESET} Cloudflare DDNS 管理"
+        echo -e "  ${YELLOW}2.${RESET} Root 密码修改              ${YELLOW}6.${RESET} DNS 管理中心（智能/锁定/恢复）"
+        echo -e "  ${YELLOW}3.${RESET} 服务器时间防偏移同步       ${RED}7.${RESET} QUIC / UDP 443 防火墙管理"
         echo -e "  ${YELLOW}4.${RESET} SSH 密钥登录管理中心"
         echo -e "  0. 返回上级菜单"
         echo -e "${CYAN}========================================================${RESET}"
@@ -5876,20 +6097,26 @@ nft_cli() {
 # --------------------------
 comprehensive_menu() {
     while true; do
+        local ssh_port quic nginx
+        ssh_port=$(get_ssh_port_brief)
+        quic=$(get_quic_status_brief)
+        nginx=$(get_nginx_status_brief)
         clear
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}          综合管理目录                      ${RESET}"
+        echo -e "${CYAN}         系统 / 建站 / 重装中心            ${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 系统底层管控"
-        echo -e "${YELLOW} 2.${RESET} Nginx 反向代理"
+        echo -e "${YELLOW} 1.${RESET} 系统网络中心   ${CYAN}(SSH ${ssh_port} / QUIC ${quic})${RESET}"
+        echo -e "${YELLOW} 2.${RESET} Nginx 反向代理 ${CYAN}(${nginx})${RESET}"
         echo -e "${GREEN} 3.${RESET} DD / 重装系统中心"
+        echo -e "${CYAN} 4.${RESET} 查看全局状态总览"
         echo -e " 0. 返回主菜单"
         echo -e "${CYAN}--------------------------------------------${RESET}"
-        read -rp "请输入数字 [0-3]: " choice
+        read -rp "请输入数字 [0-4]: " choice
         case "$choice" in
             1) run_system_module_menu ;;
             2) run_nginx_module_menu ;;
             3) dd_menu ;;
+            4) global_status_dashboard ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
         esac
@@ -5900,24 +6127,35 @@ comprehensive_menu() {
 # 主菜单
 # --------------------------
 main_menu() {
+    local nodes nft_rules nginx ssh_port quic
+    nodes=$(count_proxy_nodes_brief)
+    nft_rules=$(get_nft_rules_brief)
+    nginx=$(get_nginx_status_brief)
+    ssh_port=$(get_ssh_port_brief)
+    quic=$(get_quic_status_brief)
     clear
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${CYAN}      综合管理脚本 my  v${MY_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${YELLOW} 1.${RESET} SSR 管理"
-    echo -e "${YELLOW} 2.${RESET} NFT 转发"
-    echo -e "${YELLOW} 3.${RESET} 综合管理目录"
-    echo -e "${YELLOW} 4.${RESET} 一键卸载"
+    echo -e "状态速览: 节点 ${YELLOW}${nodes}${RESET} / NFT ${YELLOW}${nft_rules}${RESET} 条 / Nginx ${YELLOW}${nginx}${RESET}"
+    echo -e "          SSH ${YELLOW}${ssh_port}${RESET} / QUIC ${YELLOW}${quic}${RESET}"
+    echo -e "${CYAN}--------------------------------------------${RESET}"
+    echo -e "${YELLOW} 1.${RESET} 代理节点与热更中心 (SSR)"
+    echo -e "${YELLOW} 2.${RESET} 端口转发 / NFT 中心"
+    echo -e "${YELLOW} 3.${RESET} 系统 / 建站 / 重装中心"
+    echo -e "${CYAN} 4.${RESET} 全局状态总览"
     echo -e "${YELLOW} 5.${RESET} GitHub 一键更新"
+    echo -e "${YELLOW} 6.${RESET} 一键卸载"
     echo -e " 0. 退出"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    read -rp "请输入数字 [0-5]: " choice
+    read -rp "请输入数字 [0-6]: " choice
     case "$choice" in
         1) run_ssr_module_menu ;;
         2) run_nft_module_menu ;;
         3) comprehensive_menu ;;
-        4) uninstall_menu ;;
+        4) global_status_dashboard ;;
         5) github_update ;;
+        6) uninstall_menu ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
