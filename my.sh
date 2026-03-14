@@ -18,6 +18,7 @@ MY_SCRIPT_ID="my-manager"
 MY_VERSION="1.3.2"
 
 MY_INSTALL_DIR="/usr/local/lib/my"
+COMMON_MODULE_FILE="${MY_INSTALL_DIR}/common_module.sh"
 SSR_MODULE_FILE="${MY_INSTALL_DIR}/ssr_module.sh"
 NFT_MODULE_FILE="${MY_INSTALL_DIR}/nft_module.sh"
 NGX_MODULE_FILE="${MY_INSTALL_DIR}/nginx_module.sh"
@@ -87,6 +88,88 @@ install_self_command() {
 install_modules() {
     mkdir -p "${MY_INSTALL_DIR}" 2>/dev/null || true
 
+    # 公共工具模块（供 SSR / NFT / Nginx 共享，避免跨模块函数丢失）
+    cat > "${COMMON_MODULE_FILE}.tmp" <<'COMMON_MODULE_EOF'
+#!/bin/bash
+set -o pipefail
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+is_port() {
+    local p="$1"
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    ((p >= 1 && p <= 65535))
+}
+
+is_ipv4() {
+    local ip="$1" o1 o2 o3 o4 octet
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        ((octet >= 0 && octet <= 255)) || return 1
+    done
+}
+
+normalize_proto() {
+    local p="${1,,}"
+    case "$p" in
+        tcp|udp|both) echo "$p" ;;
+        *) echo "both" ;;
+    esac
+}
+
+proto_to_list() {
+    local p
+    p=$(normalize_proto "$1")
+    case "$p" in
+        both) printf '%s\n' tcp udp ;;
+        *) printf '%s\n' "$p" ;;
+    esac
+}
+
+port_in_use() {
+    local port="$1" proto="${2:-both}"
+    local used=1
+    proto="$(normalize_proto "$proto")"
+    if have_cmd ss; then
+        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+            ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
+        fi
+        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+            ss -lnuH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
+        fi
+    fi
+    return $used
+}
+
+resolve_ipv4_first() {
+    local addr="$1" out=""
+    if is_ipv4 "$addr"; then
+        echo "$addr"
+        return 0
+    fi
+    if have_cmd dig; then
+        out=$(dig +time=2 +tries=1 +short -4 A "$addr" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
+        [[ -n "$out" ]] && { echo "$out"; return 0; }
+    fi
+    if have_cmd getent; then
+        out=$(getent ahostsv4 "$addr" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
+        [[ -n "$out" ]] && { echo "$out"; return 0; }
+    fi
+    if have_cmd host; then
+        out=$(host -4 "$addr" 2>/dev/null | awk '/has address/ {print $NF; exit}')
+        [[ -n "$out" ]] && { echo "$out"; return 0; }
+    fi
+    if have_cmd nslookup; then
+        out=$(nslookup "$addr" 2>/dev/null | awk '/^Address: / {print $2; exit}')
+        [[ -n "$out" ]] && { echo "$out"; return 0; }
+    fi
+    return 1
+}
+COMMON_MODULE_EOF
+mv -f "${COMMON_MODULE_FILE}.tmp" "${COMMON_MODULE_FILE}"
+
     # SSR 模块（已移除脚本自更新/卸载菜单，并适配 my 统一管理）
     cat > "${SSR_MODULE_FILE}.tmp" <<'SSR_MODULE_EOF'
 #!/bin/bash
@@ -128,6 +211,8 @@ readonly SS_V2RAY_CONF="/etc/ss-v2ray/config.json"
 readonly SS_V2RAY_STATE="${META_DIR}/ss_v2ray.conf"
 readonly SWAP_MARK_FILE="${META_DIR}/swap_created_by_ssr"
 readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
+readonly COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
+[[ -f "$COMMON_MODULE_FILE" ]] && source "$COMMON_MODULE_FILE"
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/99-my-auth.conf"
 readonly JOURNALD_BACKUP_FILE="${META_DIR}/journald.conf.bak"
 
@@ -428,14 +513,15 @@ PYPARSE
 }
 
 normalize_xray_x25519_output() {
-    printf '%s' "$1" | tr -d '
-' |         sed -E             -e 's/Private[[:space:]]*[Kk]ey:/\
-PrivateKey:/g'             -e 's/Public[[:space:]]*[Kk]ey:/\
-PublicKey:/g'             -e 's/PrivateKey:/\
-PrivateKey:/g'             -e 's/PublicKey:/\
-PublicKey:/g'             -e 's/Password:/\
-Password:/g'             -e 's/Hash32:/\
-Hash32:/g' |         sed '/^[[:space:]]*$/d'
+    printf '%s' "$1" | tr '\r' '\n' | awk '
+        {
+            gsub(/Private[[:space:]]*[Kk]ey[[:space:]]*:/, "\nPrivateKey:")
+            gsub(/Public[[:space:]]*[Kk]ey[[:space:]]*:/, "\nPublicKey:")
+            gsub(/Password[[:space:]]*:/, "\nPassword:")
+            gsub(/Hash32[[:space:]]*:/, "\nHash32:")
+            print
+        }
+    ' | tr -s '\n' | sed '/^[[:space:]]*$/d'
 }
 
 xray_extract_reality_private_key() {
@@ -592,8 +678,7 @@ plugin_state_write() {
     mkdir -p "$META_DIR" 2>/dev/null || true
     : > "$file"
     while [[ $# -ge 2 ]]; do
-        printf '%s="%s"
-' "$1" "$2" >> "$file"
+        printf '%s="%s"\n' "$1" "$2" >> "$file""
         shift 2
     done
     chmod 600 "$file" 2>/dev/null || true
@@ -659,8 +744,7 @@ ss_pick_method_password() {
             if have_cmd openssl; then
                 SS_PICK_PASSWORD=$(openssl rand -hex 12 2>/dev/null)
             else
-                SS_PICK_PASSWORD=$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' 
-')
+                SS_PICK_PASSWORD=$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
             fi
         else
             SS_PICK_PASSWORD="$input_pwd"
@@ -817,8 +901,7 @@ start_managed_service() {
     local name="$1" unit_content="$2" bg_cmd="$3" bg_match="$4" log_file="$5" pid_file="$6"
     if service_use_systemd; then
         mkdir -p /etc/systemd/system 2>/dev/null || true
-        printf '%s
-' "$unit_content" > "/etc/systemd/system/${name}.service"
+        printf '%s\n' "$unit_content" > "/etc/systemd/system/${name}.service""
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable --now "$name" >/dev/null 2>&1 || return 1
         sleep 1
@@ -1237,6 +1320,22 @@ system_cpu_count() {
     getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1
 }
 
+system_nofile_hard() {
+    local n
+    n="$(sh -c 'ulimit -Hn' 2>/dev/null || true)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=65535
+    echo "$n"
+}
+
+tier_step_up() {
+    case "$1" in
+        tiny) echo small ;;
+        small) echo medium ;;
+        medium) echo large ;;
+        *) echo large ;;
+    esac
+}
+
 is_private_ipv4() {
     case "$1" in
         10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
@@ -1249,19 +1348,29 @@ current_ipv4_for_route() {
 }
 
 detect_machine_tier() {
-    local mem cpu
+    local mem cpu nofile tier
     mem="$(system_memory_mb)"
     cpu="$(system_cpu_count)"
-    [[ -z "$mem" ]] && mem=1024
+    nofile="$(system_nofile_hard)"
+    [[ "$mem" =~ ^[0-9]+$ ]] || mem=1024
+    [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=1
+    [[ "$nofile" =~ ^[0-9]+$ ]] || nofile=65535
+
     if (( mem < 1024 || cpu <= 1 )); then
-        echo tiny
-    elif (( mem < 4096 )); then
-        echo small
-    elif (( mem < 8192 )); then
-        echo medium
+        tier=tiny
+    elif (( mem < 4096 || cpu <= 2 )); then
+        tier=small
+    elif (( mem < 8192 || cpu <= 4 )); then
+        tier=medium
     else
-        echo large
+        tier=large
     fi
+
+    if (( nofile >= 1048576 && mem >= 4096 && cpu >= 4 )); then
+        tier="$(tier_step_up "$tier")"
+    fi
+
+    echo "$tier"
 }
 
 profile_alias() {
@@ -1276,13 +1385,52 @@ profile_title() {
     [[ "$(profile_alias "$1")" == "perf" ]] && echo "极致优化" || echo "稳定优先"
 }
 
+cc_available_list() {
+    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true
+}
+
+cc_in_list() {
+    local cc="$1" avail="${2:-$(cc_available_list)}"
+    [[ " $avail " == *" ${cc} "* ]]
+}
+
+try_activate_bbr_stack() {
+    modprobe -q sch_fq >/dev/null 2>&1 || true
+    modprobe -q tcp_bbr >/dev/null 2>&1 || true
+}
+
 best_congestion_control() {
-    local avail
-    avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-    for cc in bbr cubic reno; do
-        echo " $avail " | grep -q " ${cc} " && { echo "$cc"; return 0; }
+    local avail current
+    avail="$(cc_available_list)"
+    if cc_in_list bbr "$avail"; then
+        echo bbr
+        return 0
+    fi
+
+    try_activate_bbr_stack
+    avail="$(cc_available_list)"
+    if cc_in_list bbr "$avail"; then
+        echo bbr
+        return 0
+    fi
+
+    for cc in cubic reno; do
+        cc_in_list "$cc" "$avail" && { echo "$cc"; return 0; }
     done
-    echo bbr
+
+    current="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+    [[ -n "$current" ]] && echo "$current" || echo cubic
+}
+
+best_default_qdisc() {
+    local cc="${1:-$(best_congestion_control)}" current_qdisc
+    if [[ "$cc" == "bbr" ]]; then
+        modprobe -q sch_fq >/dev/null 2>&1 || true
+        echo fq
+        return 0
+    fi
+    current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+    [[ -n "$current_qdisc" ]] && echo "$current_qdisc" || echo fq_codel
 }
 
 measure_host_latency_ms() {
@@ -1359,9 +1507,10 @@ smart_dns_apply() {
 }
 
 render_sysctl_profile() {
-    local target="$1" env="$2" mode="$(profile_alias "$3")" tier="${4:-medium}" cc
+    local target="$1" env="$2" mode="$(profile_alias "$3")" tier="${4:-medium}" cc qdisc
     local rmax wmax rmem wmem somax backlog filemax fin_timeout keepalive_time keepalive_intvl keepalive_probes
     cc="$(best_congestion_control)"
+    qdisc="$(best_default_qdisc "$cc")"
     keepalive_time=60; keepalive_intvl=20; keepalive_probes=3
 
     case "${env}:${mode}:${tier}" in
@@ -1393,7 +1542,7 @@ render_sysctl_profile() {
 
     cat > "$target" <<EOF
 # ssr ${env} $(profile_title "$mode")
-net.core.default_qdisc = fq
+net.core.default_qdisc = ${qdisc}
 net.ipv4.tcp_congestion_control = ${cc}
 net.ipv4.tcp_mtu_probing = 1
 net.core.rmem_max = ${rmax}
@@ -1472,7 +1621,7 @@ github_latest_tag() {
         tag=$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null)
     fi
     if [[ -z "$tag" && -n "$body" ]]; then
-        tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*//p' | head -n1)
+        tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
     fi
     [[ -n "$tag" && "$tag" != "null" ]] && echo "$tag"
 }
@@ -2621,7 +2770,7 @@ install_vless_native() {
 
     mkdir -p /usr/local/etc/xray
     local uuid keys priv pub short_id
-    uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '\r')
+    uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || /usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '\r')
     keys=$(/usr/local/bin/xray x25519 2>&1 | tr -d '\r')
     priv=$(xray_extract_reality_private_key "$keys")
     pub=$(xray_extract_reality_public_key "$keys")
@@ -3614,6 +3763,8 @@ main_menu() {
 }
 
 SSR_MODULE_EOF
+
+SSR_MODULE_EOF
 mv -f "${SSR_MODULE_FILE}.tmp" "${SSR_MODULE_FILE}"
 
     # NFT 模块（已移除脚本自更新/卸载菜单，并适配 my 统一管理）
@@ -3647,6 +3798,8 @@ NFTABLES_CONF="/etc/nftables.conf"
 NFTABLES_CREATED_MARK="/etc/nftables.conf.nftmgr_created"
 PERSIST_MODE_DEFAULT="service"
 NFT_MGR_CONF="${NFT_MGR_DIR}/nft_mgr.conf"
+COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
+[[ -f "$COMMON_MODULE_FILE" ]] && source "$COMMON_MODULE_FILE"
 NFT_MGR_SERVICE="/etc/systemd/system/nft-mgr.service"
 
 SYSCTL_FILE="/etc/sysctl.d/99-nft-mgr.conf"
@@ -3677,9 +3830,9 @@ settings_set() {
     touch "$SETTINGS_FILE" 2>/dev/null || true
     chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
     if grep -qE "^${key}=" "$SETTINGS_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}="${value}"|g" "$SETTINGS_FILE"
+        sed -i "s|^${key}=.*|${key}=\"${value}\"|g" "$SETTINGS_FILE"
     else
-        echo "${key}="${value}"" >> "$SETTINGS_FILE"
+        echo "${key}=\"${value}\"" >> "$SETTINGS_FILE"
     fi
 }
 PERSIST_MODE="$(settings_get "PERSIST_MODE" || true)"
@@ -3843,54 +3996,13 @@ ensure_ddns_cron_disabled_if_unused() {
     return 0
 }
 # --------------------------
-is_port() {
-    local p="$1"
-    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
-}
-
-is_ipv4() {
-    local ip="$1" o1 o2 o3 o4
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
-    for octet in "$o1" "$o2" "$o3" "$o4"; do
-        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
-        ((octet >= 0 && octet <= 255)) || return 1
-    done
-}
-
-normalize_proto() {
-    local p="${1,,}"
-    case "$p" in
-        tcp|udp|both) echo "$p" ;;
-        "") echo "both" ;;
-        *) echo "both" ;;
-    esac
-}
-
-proto_to_list() {
-    local p
-    p=$(normalize_proto "$1")
-    case "$p" in
-        both) printf '%s
-' tcp udp ;;
-        *) printf '%s
-' "$p" ;;
-    esac
-}
 
 # --------------------------
 # DNS 解析
 # --------------------------
 get_ip() {
     local addr="$1"
-    if is_ipv4 "$addr"; then
-        echo "$addr"
-        return 0
-    fi
-    # 更稳健：限制超时/尝试次数，优先取第一条 A
-    dig +time=2 +tries=1 +short -4 A "$addr" 2>/dev/null \
-        | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
-        | head -n 1
+    resolve_ipv4_first "$addr"
 }
 
 # --------------------------
@@ -4062,27 +4174,98 @@ nft_profile_title() {
     [[ "$(nft_profile_alias "$1")" == "perf" ]] && echo "极致优化" || echo "稳定优先"
 }
 
+nft_system_cpu_count() {
+    getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1
+}
+
+nft_system_nofile_hard() {
+    local n
+    n="$(sh -c 'ulimit -Hn' 2>/dev/null || true)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=65535
+    echo "$n"
+}
+
+nft_tier_step_up() {
+    case "$1" in
+        tiny) echo small ;;
+        small) echo medium ;;
+        medium) echo large ;;
+        *) echo large ;;
+    esac
+}
+
 nft_detect_machine_tier() {
-    local mem_mb
+    local mem_mb cpu nofile tier
     mem_mb="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
-    if (( mem_mb < 700 )); then
-        echo tiny
-    elif (( mem_mb < 1400 )); then
-        echo small
-    elif (( mem_mb < 3000 )); then
-        echo medium
+    cpu="$(nft_system_cpu_count)"
+    nofile="$(nft_system_nofile_hard)"
+    [[ "$mem_mb" =~ ^[0-9]+$ ]] || mem_mb=1024
+    [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=1
+    [[ "$nofile" =~ ^[0-9]+$ ]] || nofile=65535
+
+    if (( mem_mb < 1024 || cpu <= 1 )); then
+        tier=tiny
+    elif (( mem_mb < 4096 || cpu <= 2 )); then
+        tier=small
+    elif (( mem_mb < 8192 || cpu <= 4 )); then
+        tier=medium
     else
-        echo large
+        tier=large
     fi
+
+    if (( nofile >= 1048576 && mem_mb >= 4096 && cpu >= 4 )); then
+        tier="$(nft_tier_step_up "$tier")"
+    fi
+
+    echo "$tier"
+}
+
+nft_cc_available_list() {
+    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true
+}
+
+nft_cc_in_list() {
+    local cc="$1" avail="${2:-$(nft_cc_available_list)}"
+    [[ " $avail " == *" ${cc} "* ]]
+}
+
+nft_try_activate_bbr_stack() {
+    modprobe -q sch_fq >/dev/null 2>&1 || true
+    modprobe -q tcp_bbr >/dev/null 2>&1 || true
 }
 
 nft_best_congestion_control() {
-    local avail
-    avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-    [[ " $avail " == *" bbr "* ]] && { echo bbr; return 0; }
-    [[ " $avail " == *" cubic "* ]] && { echo cubic; return 0; }
-    [[ " $avail " == *" reno "* ]] && { echo reno; return 0; }
-    sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic
+    local avail current
+    avail="$(nft_cc_available_list)"
+    if nft_cc_in_list bbr "$avail"; then
+        echo bbr
+        return 0
+    fi
+
+    nft_try_activate_bbr_stack
+    avail="$(nft_cc_available_list)"
+    if nft_cc_in_list bbr "$avail"; then
+        echo bbr
+        return 0
+    fi
+
+    for cc in cubic reno; do
+        nft_cc_in_list "$cc" "$avail" && { echo "$cc"; return 0; }
+    done
+
+    current="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+    [[ -n "$current" ]] && echo "$current" || echo cubic
+}
+
+nft_best_default_qdisc() {
+    local cc="${1:-$(nft_best_congestion_control)}" current_qdisc
+    if [[ "$cc" == "bbr" ]]; then
+        modprobe -q sch_fq >/dev/null 2>&1 || true
+        echo fq
+        return 0
+    fi
+    current_qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+    [[ -n "$current_qdisc" ]] && echo "$current_qdisc" || echo fq_codel
 }
 
 nft_sysctl_key_supported() {
@@ -4112,10 +4295,11 @@ ensure_forwarding() {
 }
 
 nft_apply_profile() {
-    local mode="$(nft_profile_alias "${1:-stable}")" tier cc
+    local mode="$(nft_profile_alias "${1:-stable}")" tier cc qdisc
     local somax backlog filemax rmax wmax fin_timeout conntrack
     tier="$(nft_detect_machine_tier)"
     cc="$(nft_best_congestion_control)"
+    qdisc="$(nft_best_default_qdisc "$cc")"
 
     case "${mode}:${tier}" in
         stable:tiny|stable:small)
@@ -4140,7 +4324,7 @@ nft_apply_profile() {
     echo "# nftmgr $(nft_profile_title "$mode") / ${tier}" >> "$SYSCTL_FILE"
 
     nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.ip_forward" "1"
-    [[ "$cc" == "bbr" ]] && nft_write_sysctl_line "$SYSCTL_FILE" "net.core.default_qdisc" "fq"
+    nft_write_sysctl_line "$SYSCTL_FILE" "net.core.default_qdisc" "$qdisc"
     nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_congestion_control" "$cc"
     nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_mtu_probing" "1"
     nft_write_sysctl_line "$SYSCTL_FILE" "net.core.somaxconn" "$somax"
@@ -4916,6 +5100,8 @@ main_menu() {
 }
 
 NFT_MODULE_EOF
+
+NFT_MODULE_EOF
 mv -f "${NFT_MODULE_FILE}.tmp" "${NFT_MODULE_FILE}"
 
     # Nginx 反向代理模块（并入 my 统一管理，避免与 Certbot/多站点冲突）
@@ -4945,6 +5131,51 @@ ngx_msg_warn() { echo -e "${YELLOW}$*${RESET}"; }
 ngx_msg_err() { echo -e "${RED}$*${RESET}"; }
 ngx_msg_info() { echo -e "${CYAN}$*${RESET}"; }
 ngx_pause() { read -n 1 -s -r -p "按任意键继续..."; echo; }
+
+ngx_system_memory_mb() {
+    awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null
+}
+
+ngx_system_cpu_count() {
+    getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1
+}
+
+ngx_system_nofile_hard() {
+    local n
+    n="$(sh -c 'ulimit -Hn' 2>/dev/null || true)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=65535
+    echo "$n"
+}
+
+ngx_detect_machine_tier() {
+    local mem cpu nofile
+    mem="$(ngx_system_memory_mb)"
+    cpu="$(ngx_system_cpu_count)"
+    nofile="$(ngx_system_nofile_hard)"
+    [[ "$mem" =~ ^[0-9]+$ ]] || mem=1024
+    [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=1
+    [[ "$nofile" =~ ^[0-9]+$ ]] || nofile=65535
+
+    if (( mem < 2048 || cpu <= 1 )); then
+        echo small
+    elif (( mem < 8192 || cpu <= 4 )); then
+        echo medium
+    elif (( nofile >= 262144 )); then
+        echo large
+    else
+        echo medium
+    fi
+}
+
+ngx_pick_perf_profile() {
+    local tier="$(ngx_detect_machine_tier)"
+    case "$tier" in
+        small)  echo "$tier 4096 65535 65535" ;;
+        medium) echo "$tier 8192 262144 262144" ;;
+        large)  echo "$tier 16384 524288 524288" ;;
+        *)      echo "medium 8192 262144 262144" ;;
+    esac
+}
 
 ngx_state_get() {
     local key="$1"
@@ -5045,6 +5276,129 @@ ngx_site_conf() {
     printf '%s\n' "${NGX_CONF_PREFIX}.${1}.conf"
 }
 
+ngx_patch_main_conf() {
+    local conf="/etc/nginx/nginx.conf" worker_conn="$1" worker_rlimit="$2" tmp
+    [[ -f "$conf" ]] || return 1
+    tmp="$(mktemp "${NGX_TMP_DIR}/nginx.conf.XXXXXX")" || return 1
+    awk -v wc="$worker_conn" -v wr="$worker_rlimit" '
+        BEGIN { in_events=0; saw_events=0; saw_rl=0; events_wc_done=0 }
+        /^[[:space:]]*worker_rlimit_nofile[[:space:]]+[0-9]+;/ {
+            if (!saw_rl) {
+                print "worker_rlimit_nofile " wr ";"
+                saw_rl=1
+            }
+            next
+        }
+        {
+            line=$0
+            if (!saw_rl && line ~ /^[[:space:]]*worker_processes[[:space:]]+/) {
+                print line
+                print "worker_rlimit_nofile " wr ";"
+                saw_rl=1
+                next
+            }
+            if (line ~ /^[[:space:]]*events[[:space:]]*\{/) {
+                in_events=1
+                saw_events=1
+                events_wc_done=0
+            }
+            if (in_events && line ~ /^[[:space:]]*worker_connections[[:space:]]+[0-9]+;/) {
+                print "    worker_connections " wc ";"
+                events_wc_done=1
+                next
+            }
+            if (in_events && line ~ /^[[:space:]]*}/) {
+                if (!events_wc_done) {
+                    print "    worker_connections " wc ";"
+                    events_wc_done=1
+                }
+                print line
+                in_events=0
+                next
+            }
+            print line
+        }
+        END {
+            if (!saw_rl) {
+                print "worker_rlimit_nofile " wr ";"
+            }
+            if (!saw_events) {
+                print "events {"
+                print "    worker_connections " wc ";"
+                print "}"
+            }
+        }
+    ' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    install -m 644 "$tmp" "$conf" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+}
+
+ngx_apply_runtime_profile() {
+    local tier worker_conn worker_rlimit limit_nofile
+    local conf="/etc/nginx/nginx.conf"
+    local conf_bak="${NGX_TMP_DIR}/nginx.conf.bak"
+    local override_dir="/etc/systemd/system/nginx.service.d"
+    local override_file="${override_dir}/override.conf"
+    local override_tmp="${NGX_TMP_DIR}/nginx.override.tmp"
+    local override_bak="${NGX_TMP_DIR}/nginx.override.bak"
+    local had_override=0
+
+    read -r tier worker_conn worker_rlimit limit_nofile <<EOF
+$(ngx_pick_perf_profile)
+EOF
+
+    [[ -f "$conf" ]] || return 0
+    mkdir -p "$NGX_TMP_DIR" "$override_dir" 2>/dev/null || true
+    cp -f "$conf" "$conf_bak" 2>/dev/null || return 1
+    if [[ -f "$override_file" ]]; then
+        had_override=1
+        cp -f "$override_file" "$override_bak" 2>/dev/null || true
+    fi
+
+    if ! ngx_patch_main_conf "$worker_conn" "$worker_rlimit"; then
+        cp -f "$conf_bak" "$conf" 2>/dev/null || true
+        return 1
+    fi
+
+    cat > "$override_tmp" <<EOF
+[Service]
+LimitNOFILE=${limit_nofile}
+EOF
+    install -m 644 "$override_tmp" "$override_file" 2>/dev/null || { cp -f "$conf_bak" "$conf" 2>/dev/null || true; rm -f "$override_tmp"; return 1; }
+    rm -f "$override_tmp"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    if ! nginx -t >/dev/null 2>&1; then
+        cp -f "$conf_bak" "$conf" 2>/dev/null || true
+        if (( had_override )); then
+            cp -f "$override_bak" "$override_file" 2>/dev/null || true
+        else
+            rm -f "$override_file" 2>/dev/null || true
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if ! systemctl reload nginx >/dev/null 2>&1 && ! systemctl restart nginx >/dev/null 2>&1; then
+        cp -f "$conf_bak" "$conf" 2>/dev/null || true
+        if (( had_override )); then
+            cp -f "$override_bak" "$override_file" 2>/dev/null || true
+        else
+            rm -f "$override_file" 2>/dev/null || true
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        nginx -t >/dev/null 2>&1 || true
+        systemctl reload nginx >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    ngx_state_set NGINX_TIER "$tier"
+    ngx_state_set NGINX_WORKER_CONNECTIONS "$worker_conn"
+    ngx_state_set NGINX_LIMIT_NOFILE "$limit_nofile"
+    ngx_msg_ok "已按 ${tier} 档应用 Nginx 并发参数：worker_connections=${worker_conn}, LimitNOFILE=${limit_nofile}"
+    return 0
+}
+
 ngx_write_common_conf() {
     mkdir -p /etc/nginx/conf.d "$NGX_WEBROOT" "$NGX_TMP_DIR" "$NGX_META_DIR" 2>/dev/null || true
     chmod 755 "$NGX_WEBROOT" 2>/dev/null || true
@@ -5073,6 +5427,9 @@ ngx_install_dependencies() {
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl start nginx >/dev/null 2>&1 || true
     ngx_write_common_conf
+    if ! ngx_apply_runtime_profile; then
+        ngx_msg_warn "Nginx 并发优化应用失败，已回滚到原配置。"
+    fi
     ngx_msg_ok "环境依赖就绪。"
 }
 
@@ -5148,9 +5505,8 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    listen 443 ssl http2 fastopen=256;
+    listen [::]:443 ssl http2 fastopen=256;
     server_name ${domain};
 
     access_log ${NGX_LOG_DIR}/${domain}_access.log;
@@ -5333,16 +5689,15 @@ ngx_add_proxy() {
         return 1
     fi
 
-    tmp_final="$(mktemp "${NGX_TMP_DIR}/final.XXXXXX")" || { ngx_delete_cert_if_exists "$domain_name"; rm -f "$conf"; return 1; }
+    tmp_final="$(mktemp "${NGX_TMP_DIR}/final.XXXXXX")" || { rm -f "$conf"; return 1; }
     ngx_render_https_conf "$domain_name" > "$tmp_final"
-    install -m 644 "$tmp_final" "$conf" 2>/dev/null || { rm -f "$tmp_final"; ngx_delete_cert_if_exists "$domain_name"; rm -f "$conf"; return 1; }
+    install -m 644 "$tmp_final" "$conf" 2>/dev/null || { rm -f "$tmp_final"; rm -f "$conf"; return 1; }
     rm -f "$tmp_final"
 
     if ! ngx_test_reload; then
         rm -f "$conf"
-        ngx_delete_cert_if_exists "$domain_name"
         ngx_test_reload >/dev/null 2>&1 || true
-        ngx_msg_err "最终 HTTPS 配置校验失败，已回滚。"
+        ngx_msg_err "最终 HTTPS 配置校验失败，证书已保留，仅回滚了 Nginx 配置。"
         sleep 2
         return 1
     fi
@@ -5409,9 +5764,11 @@ nginx_menu() {
     done
 }
 NGX_MODULE_EOF
+
+NGX_MODULE_EOF
 mv -f "${NGX_MODULE_FILE}.tmp" "${NGX_MODULE_FILE}"
 
-    chmod 755 "${SSR_MODULE_FILE}" "${NFT_MODULE_FILE}" "${NGX_MODULE_FILE}" 2>/dev/null || true
+    chmod 755 "${COMMON_MODULE_FILE}" "${SSR_MODULE_FILE}" "${NFT_MODULE_FILE}" "${NGX_MODULE_FILE}" 2>/dev/null || true
 }
 
 # --------------------------
@@ -5718,8 +6075,7 @@ DDTOOL_LAST_PASSWORD=""
 
 _ddtool_rand_pass() {
     if have_cmd openssl; then
-        openssl rand -base64 12 2>/dev/null | tr -d '=+/
-' | cut -c1-14
+        openssl rand -base64 12 2>/dev/null | tr -d '=+/\n' | cut -c1-14
     else
         tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 14
     fi
@@ -6245,7 +6601,7 @@ init() {
 ensure_runtime_ready_for_cli() {
     require_root
     install_self_command
-    [[ -f "${SSR_MODULE_FILE}" && -f "${NFT_MODULE_FILE}" && -f "${NGX_MODULE_FILE}" ]] || install_modules
+    [[ -f "${COMMON_MODULE_FILE}" && -f "${SSR_MODULE_FILE}" && -f "${NFT_MODULE_FILE}" && -f "${NGX_MODULE_FILE}" ]] || install_modules
 }
 
 if [[ $# -gt 0 ]]; then
