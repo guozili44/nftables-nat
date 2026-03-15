@@ -2,7 +2,7 @@
 # 综合管理脚本：SSR + nftables
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v1.3.3  (build 2026-03-14+ss2022-compact-fixed-slim)
+# 版本：v1.3.4  (build 2026-03-15+txn-state-tree)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 
 set -o pipefail
@@ -15,9 +15,12 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # --------------------------
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="1.3.2"
+MY_VERSION="1.3.4"
 
 MY_INSTALL_DIR="/usr/local/lib/my"
+MY_STATE_DIR="${MY_INSTALL_DIR}/state"
+MY_SSR_STATE_DIR="${MY_STATE_DIR}/ssr"
+MY_NGX_STATE_DIR="${MY_STATE_DIR}/nginx"
 COMMON_MODULE_FILE="${MY_INSTALL_DIR}/common_module.sh"
 SSR_MODULE_FILE="${MY_INSTALL_DIR}/ssr_module.sh"
 NFT_MODULE_FILE="${MY_INSTALL_DIR}/nft_module.sh"
@@ -26,7 +29,7 @@ NGX_MODULE_FILE="${MY_INSTALL_DIR}/nginx_module.sh"
 MY_LOCK_FILE="/var/lock/my.lock"
 SSR_LOCK_FILE="/var/lock/ssr.lock"
 
-SSR_DDNS_CONF="/usr/local/etc/ssr_ddns.conf"
+SSR_DDNS_CONF="${MY_SSR_STATE_DIR}/ddns.conf"
 
 UPDATE_URL_DIRECT="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh"
 UPDATE_URL_PROXY="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh"
@@ -95,6 +98,122 @@ set -o pipefail
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+state_dir_ensure() {
+    mkdir -p "$1" >/dev/null 2>&1 || return 1
+}
+
+state_kv_get() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 1
+    grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^"//; s/"$//'
+}
+
+state_kv_set() {
+    local file="$1" key="$2" value="$3"
+    state_dir_ensure "$(dirname "$file")" || return 1
+    touch "$file" 2>/dev/null || return 1
+    chmod 600 "$file" 2>/dev/null || true
+    if grep -qE "^${key}=" "$file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}="${value}"|g" "$file"
+    else
+        printf '%s="%s"
+' "$key" "$value" >> "$file"
+    fi
+}
+
+state_write_pairs() {
+    local file="$1"; shift
+    state_dir_ensure "$(dirname "$file")" || return 1
+    : > "$file"
+    while [[ $# -ge 2 ]]; do
+        printf '%s="%s"
+' "$1" "$2" >> "$file"
+        shift 2
+    done
+    chmod 600 "$file" 2>/dev/null || true
+}
+
+state_migrate_file() {
+    local old="$1" new="$2"
+    [[ -e "$old" ]] || return 0
+    state_dir_ensure "$(dirname "$new")" || return 1
+    if [[ ! -e "$new" || ! -s "$new" ]]; then
+        cp -a "$old" "$new" >/dev/null 2>&1 || return 1
+    fi
+}
+
+state_migrate_dir() {
+    local old="$1" new="$2"
+    [[ -d "$old" ]] || return 0
+    state_dir_ensure "$new" || return 1
+    cp -a "$old"/. "$new"/ >/dev/null 2>&1 || true
+}
+
+txn_begin() {
+    local dir
+    dir=$(mktemp -d /tmp/my-txn.XXXXXX) || return 1
+    : > "$dir/stack"
+    echo "$dir"
+}
+
+txn_register() {
+    local txn="$1"; shift
+    local out="" q
+    [[ -n "$txn" ]] || return 1
+    for q in "$@"; do
+        printf -v q '%q' "$q"
+        out+="$q "
+    done
+    printf '%s
+' "${out% }" >> "$txn/stack"
+}
+
+_txn_restore_file() {
+    local dst="$1" bak="$2"
+    [[ -f "$bak" ]] || return 1
+    cp -a "$bak" "$dst" >/dev/null 2>&1 || return 1
+}
+
+_txn_remove_path() {
+    rm -rf "$1" >/dev/null 2>&1 || true
+}
+
+txn_backup_file() {
+    local txn="$1" target="$2" bak=""
+    mkdir -p "$txn/files" >/dev/null 2>&1 || return 1
+    if [[ -e "$target" ]]; then
+        bak=$(mktemp "$txn/files/$(basename "$target").XXXXXX") || return 1
+        cp -a "$target" "$bak" >/dev/null 2>&1 || { rm -f "$bak"; return 1; }
+        txn_register "$txn" _txn_restore_file "$target" "$bak"
+        echo "$bak"
+    else
+        txn_register "$txn" _txn_remove_path "$target"
+        echo ""
+    fi
+}
+
+txn_reverse_read() {
+    local file="$1"
+    if have_cmd tac; then
+        tac "$file"
+    else
+        awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' "$file"
+    fi
+}
+
+txn_abort() {
+    local txn="$1" line
+    [[ -n "$txn" && -f "$txn/stack" ]] || { rm -rf "$txn" >/dev/null 2>&1 || true; return 0; }
+    while IFS= read -r line; do
+        eval "$line" >/dev/null 2>&1 || true
+    done < <(txn_reverse_read "$txn/stack")
+    rm -rf "$txn" >/dev/null 2>&1 || true
+}
+
+txn_commit() {
+    rm -rf "$1" >/dev/null 2>&1 || true
+}
+
 is_port() {
     local p="$1"
     [[ "$p" =~ ^[0-9]+$ ]] || return 1
@@ -123,8 +242,10 @@ proto_to_list() {
     local p
     p=$(normalize_proto "$1")
     case "$p" in
-        both) printf '%s\n' tcp udp ;;
-        *) printf '%s\n' "$p" ;;
+        both) printf '%s
+' tcp udp ;;
+        *) printf '%s
+' "$p" ;;
     esac
 }
 
@@ -199,24 +320,28 @@ readonly CONF_FILE="/etc/sysctl.d/99-ssr-net.conf"
 readonly NAT_CONF_FILE="/etc/sysctl.d/99-ssr-nat.conf"
 
 # CF DDNS
-readonly DDNS_CONF="/usr/local/etc/ssr_ddns.conf"
+readonly SSR_STATE_DIR="${MY_STATE_DIR:-/usr/local/lib/my/state}/ssr"
+readonly DDNS_CONF="${SSR_STATE_DIR}/ddns.conf"
 readonly DDNS_LOG="/var/log/ssr_ddns.log"
+readonly LEGACY_DDNS_CONF="/usr/local/etc/ssr_ddns.conf"
 
 readonly LOCK_FILE="/var/lock/ssr.lock"
 
 # Meta (用于判断是否有新版本)
-readonly META_DIR="/usr/local/etc/ssr_meta"
+readonly META_DIR="${SSR_STATE_DIR}"
 readonly META_FILE="${META_DIR}/versions.conf"
 readonly SS_V2RAY_CONF="/etc/ss-v2ray/config.json"
 readonly SS_V2RAY_STATE="${META_DIR}/ss_v2ray.conf"
 readonly SWAP_MARK_FILE="${META_DIR}/swap_created_by_ssr"
 readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
+readonly LEGACY_META_DIR="/usr/local/etc/ssr_meta"
 readonly COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
 [[ -f "$COMMON_MODULE_FILE" ]] && source "$COMMON_MODULE_FILE"
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/99-my-auth.conf"
 readonly JOURNALD_BACKUP_FILE="${META_DIR}/journald.conf.bak"
 
-readonly DNS_BACKUP_DIR="/usr/local/etc/ssr_dns_backup"
+readonly DNS_BACKUP_DIR="${SSR_STATE_DIR}/dns"
+readonly LEGACY_DNS_BACKUP_DIR="/usr/local/etc/ssr_dns_backup"
 readonly DNS_META="${DNS_BACKUP_DIR}/meta.conf"
 readonly DNS_FILE_BAK="${DNS_BACKUP_DIR}/resolv.conf.bak"
 readonly RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/ssr-dns.conf"
@@ -244,22 +369,24 @@ run_with_timeout() {
     fi
 }
 
+ssr_state_init_if_needed() {
+    state_dir_ensure "$SSR_STATE_DIR" >/dev/null 2>&1 || true
+    state_dir_ensure "$DNS_BACKUP_DIR" >/dev/null 2>&1 || true
+    state_migrate_file "$LEGACY_DDNS_CONF" "$DDNS_CONF" >/dev/null 2>&1 || true
+    state_migrate_dir "$LEGACY_META_DIR" "$META_DIR" >/dev/null 2>&1 || true
+    state_migrate_dir "$LEGACY_DNS_BACKUP_DIR" "$DNS_BACKUP_DIR" >/dev/null 2>&1 || true
+}
+
 meta_get() {
     local key="$1"
-    [[ -f "$META_FILE" ]] || return 1
-    grep -E "^${key}=" "$META_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//; s/"$//'
+    ssr_state_init_if_needed
+    state_kv_get "$META_FILE" "$key"
 }
 
 meta_set() {
-    local key="$1"; local value="$2"
-    mkdir -p "$META_DIR"
-    touch "$META_FILE"
-    chmod 600 "$META_FILE" 2>/dev/null || true
-    if grep -qE "^${key}=" "$META_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=\"${value}\"|g" "$META_FILE"
-    else
-        echo "${key}=\"${value}\"" >> "$META_FILE"
-    fi
+    local key="$1" value="$2"
+    ssr_state_init_if_needed
+    state_kv_set "$META_FILE" "$key" "$value"
 }
 
 readonly CORE_CACHE_DIR="/usr/local/lib/my/cache"
@@ -669,19 +796,14 @@ ${link}"
 
 plugin_state_get() {
     local file="$1" key="$2"
-    [[ -f "$file" ]] || return 1
-    grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^"//; s/"$//'
+    ssr_state_init_if_needed
+    state_kv_get "$file" "$key"
 }
 
 plugin_state_write() {
     local file="$1"; shift
-    mkdir -p "$META_DIR" 2>/dev/null || true
-    : > "$file"
-    while [[ $# -ge 2 ]]; do
-        printf '%s="%s"\n' "$1" "$2" >> "$file"
-        shift 2
-    done
-    chmod 600 "$file" 2>/dev/null || true
+    ssr_state_init_if_needed
+    state_write_pairs "$file" "$@"
 }
 
 random_token() {
@@ -1691,6 +1813,8 @@ safe_install_binary() {
 check_env() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行！${RESET}" && exit 1
 
+    ssr_state_init_if_needed
+
     local deps=(curl bc wget tar openssl unzip ip ping jq python3)
     local missing=()
     local dep
@@ -1931,42 +2055,38 @@ cleanup_ss_rust_binary_if_unused() {
 apply_json_service_change() {
     local file="$1" path="$2" value="$3" type="$4"
     local svc="$5" bg_cmd="$6" bg_match="$7" log_file="$8" pid_file="$9"
-    local backup=""
-    backup=$(make_runtime_backup "$file") || return 1
-    json_set_path "$file" "$path" "$value" "$type" || { rm -f "$backup"; return 1; }
+    local txn=""
+    txn=$(txn_begin) || return 1
+    txn_register "$txn" restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"
+    txn_backup_file "$txn" "$file" >/dev/null || { txn_abort "$txn"; return 1; }
+    json_set_path "$file" "$path" "$value" "$type" || { txn_abort "$txn"; return 1; }
     if restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"; then
-        rm -f "$backup"
+        txn_commit "$txn"
         return 0
     fi
-    restore_file_strict "$backup" "$file" >/dev/null 2>&1 || true
-    restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file" >/dev/null 2>&1 || true
-    rm -f "$backup"
+    txn_abort "$txn"
     return 1
 }
 
 apply_json_service_port_change() {
     local file="$1" path="$2" new_port="$3" old_port="$4" svc="$5"
     local bg_cmd="$6" bg_match="$7" log_file="$8" pid_file="$9"
-    local backup="" proto
+    local txn="" proto
     [[ "$new_port" =~ ^[0-9]+$ ]] || return 1
     [[ -n "$old_port" && "$old_port" == "$new_port" ]] && return 0
     proto=$(managed_service_proto "$svc") || return 1
+    txn=$(txn_begin) || return 1
+    txn_register "$txn" remove_firewall_rule "$new_port" "$proto"
+    txn_register "$txn" restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"
+    txn_backup_file "$txn" "$file" >/dev/null || { txn_abort "$txn"; return 1; }
     add_firewall_rule "$new_port" "$proto" || true
-    backup=$(make_runtime_backup "$file") || return 1
-    json_set_path "$file" "$path" "$new_port" number || {
-        rm -f "$backup"
-        remove_firewall_rule "$new_port" "$proto"
-        return 1
-    }
+    json_set_path "$file" "$path" "$new_port" number || { txn_abort "$txn"; return 1; }
     if restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file"; then
         [[ "$old_port" =~ ^[0-9]+$ ]] && remove_firewall_rule "$old_port" "$proto"
-        rm -f "$backup"
+        txn_commit "$txn"
         return 0
     fi
-    restore_file_strict "$backup" "$file" >/dev/null 2>&1 || true
-    restart_managed_service "$svc" "$bg_cmd" "$bg_match" "$log_file" "$pid_file" >/dev/null 2>&1 || true
-    rm -f "$backup"
-    remove_firewall_rule "$new_port" "$proto"
+    txn_abort "$txn"
     return 1
 }
 
@@ -2840,7 +2960,7 @@ install_ss_v2ray_plugin_native() {
             *) echo -e "${RED}❌ 当前架构暂不支持自动安装 v2ray-plugin: ${arch}${RESET}"; sleep 3; return ;;
         esac
         vp_latest=$(cached_latest_tag "shadowsocks/v2ray-plugin" "v2ray-plugin")
-        [[ -z "$vp_latest" ]] && vp_latest="v1.3.2"
+        [[ -z "$vp_latest" ]] && vp_latest="v1.3.4"
         tmpdir=$(mktemp -d /tmp/ssr-v2ray-plugin.XXXXXX)
         tarf="${tmpdir}/v2ray-plugin.tar.gz"
         asset_name="${asset_name}-${vp_latest}.tar.gz"
@@ -5098,8 +5218,6 @@ main_menu() {
 }
 
 NFT_MODULE_EOF
-
-NFT_MODULE_EOF
 mv -f "${NFT_MODULE_FILE}.tmp" "${NFT_MODULE_FILE}"
 
     # Nginx 反向代理模块（并入 my 统一管理，避免与 Certbot/多站点冲突）
@@ -5114,8 +5232,10 @@ readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
 
 readonly MY_NGX_ID="my-nginx-proxy"
-readonly NGX_META_DIR="/usr/local/etc/my_nginx_proxy"
-readonly NGX_STATE_FILE="${NGX_META_DIR}/state.conf"
+readonly NGX_STATE_DIR="${MY_STATE_DIR:-/usr/local/lib/my/state}/nginx"
+readonly LEGACY_NGX_STATE_DIR="/usr/local/etc/my_nginx_proxy"
+readonly NGX_META_DIR="${NGX_STATE_DIR}"
+readonly NGX_STATE_FILE="${NGX_STATE_DIR}/state.conf"
 readonly NGX_COMMON_CONF="/etc/nginx/conf.d/00-my-rproxy-common.conf"
 readonly NGX_CONF_PREFIX="/etc/nginx/conf.d/my-rproxy"
 readonly NGX_WEBROOT="/var/lib/my-nginx-proxy/acme"
@@ -5177,20 +5297,12 @@ ngx_pick_perf_profile() {
 
 ngx_state_get() {
     local key="$1"
-    [[ -f "$NGX_STATE_FILE" ]] || return 1
-    grep -E "^${key}=" "$NGX_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//; s/"$//'
+    state_kv_get "$NGX_STATE_FILE" "$key"
 }
 
 ngx_state_set() {
     local key="$1" value="$2"
-    mkdir -p "$NGX_META_DIR" 2>/dev/null || true
-    touch "$NGX_STATE_FILE"
-    chmod 600 "$NGX_STATE_FILE" 2>/dev/null || true
-    if grep -qE "^${key}=" "$NGX_STATE_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=\"${value}\"|g" "$NGX_STATE_FILE"
-    else
-        echo "${key}=\"${value}\"" >> "$NGX_STATE_FILE"
-    fi
+    state_kv_set "$NGX_STATE_FILE" "$key" "$value"
 }
 
 ngx_pkg_installed() {
@@ -5198,6 +5310,8 @@ ngx_pkg_installed() {
 }
 
 ngx_state_init_if_needed() {
+    state_dir_ensure "$NGX_STATE_DIR" >/dev/null 2>&1 || true
+    state_migrate_dir "$LEGACY_NGX_STATE_DIR" "$NGX_STATE_DIR" >/dev/null 2>&1 || true
     [[ "$(ngx_state_get STATE_INIT)" == "1" ]] && return 0
     ngx_state_set STATE_INIT 1
     ngx_pkg_installed nginx && ngx_state_set PKG_NGINX_BY_MY 0 || ngx_state_set PKG_NGINX_BY_MY 1
@@ -5555,6 +5669,40 @@ ngx_install_conf_from_stdin() {
     rm -f "$tmp"
 }
 
+_ngx_reload_quiet() {
+    ngx_test_reload >/dev/null 2>&1 || true
+}
+
+ngx_apply_conf_file_txn() {
+    local conf="$1" src="$2" txn
+    [[ -n "$conf" && -f "$src" ]] || return 1
+    txn="$(txn_begin)" || return 1
+    txn_register "$txn" _ngx_reload_quiet
+    txn_backup_file "$txn" "$conf" >/dev/null || { txn_abort "$txn"; return 1; }
+    install -m 644 "$src" "$conf" 2>/dev/null || { txn_abort "$txn"; return 1; }
+    if ngx_test_reload; then
+        txn_commit "$txn"
+        return 0
+    fi
+    txn_abort "$txn"
+    return 1
+}
+
+ngx_remove_conf_txn() {
+    local conf="$1" txn
+    [[ -n "$conf" ]] || return 1
+    txn="$(txn_begin)" || return 1
+    txn_register "$txn" _ngx_reload_quiet
+    txn_backup_file "$txn" "$conf" >/dev/null || { txn_abort "$txn"; return 1; }
+    rm -f "$conf" 2>/dev/null || { txn_abort "$txn"; return 1; }
+    if ngx_test_reload; then
+        txn_commit "$txn"
+        return 0
+    fi
+    txn_abort "$txn"
+    return 1
+}
+
 ngx_delete_cert_if_exists() {
     local domain="$1"
     certbot delete --cert-name "$domain" --non-interactive --quiet >/dev/null 2>&1 || true
@@ -5567,14 +5715,15 @@ ngx_delete_proxy_domain() {
     conf="$(ngx_site_conf "$domain")"
     [[ -f "$conf" ]] || { ngx_msg_err "未找到由本脚本管理的域名 ${domain}。"; return 1; }
 
-    ngx_delete_cert_if_exists "$domain"
-    rm -f "$conf" "${NGX_LOG_DIR}/${domain}_access.log" "${NGX_LOG_DIR}/${domain}_error.log" 2>/dev/null || true
-    if ngx_have_cmd nginx && ngx_test_reload; then
-        ngx_msg_ok "域名 ${domain} 的反代与证书已清理。"
-    else
-        ngx_msg_warn "配置文件已删除，但 Nginx 重载失败，请检查其它非本脚本配置。"
+    if ngx_remove_conf_txn "$conf"; then
+        ngx_delete_cert_if_exists "$domain"
+        rm -f "${NGX_LOG_DIR}/${domain}_access.log" "${NGX_LOG_DIR}/${domain}_error.log" 2>/dev/null || true
+        ngx_msg_ok "域名 ${domain} 的反代已移除，证书已清理。"
+        return 0
     fi
-    return 0
+
+    ngx_msg_warn "配置回滚已完成，Nginx 重载失败，域名 ${domain} 的证书与配置均已保留。"
+    return 1
 }
 
 ngx_list_proxies() {
@@ -5634,7 +5783,7 @@ ngx_delete_proxy_pick() {
 }
 
 ngx_add_proxy() {
-    local backend_input domain_name cert_email conf tmp_final
+    local backend_input domain_name cert_email conf tmp_http tmp_final txn
     echo -e "${CYAN}=== 添加新的反向代理 ===${RESET}"
     ngx_install_dependencies || { ngx_msg_err "依赖安装失败。"; sleep 2; return 1; }
 
@@ -5662,10 +5811,18 @@ ngx_add_proxy() {
     ngx_write_common_conf
     mkdir -p "$NGX_WEBROOT" "$NGX_TMP_DIR" 2>/dev/null || true
 
-    ngx_render_http_conf "$domain_name" | ngx_install_conf_from_stdin "$conf" || { ngx_msg_err "写入 HTTP 配置失败。"; return 1; }
+    tmp_http="$(mktemp "${NGX_TMP_DIR}/http.XXXXXX")" || { ngx_msg_err "创建临时 HTTP 配置失败。"; return 1; }
+    ngx_render_http_conf "$domain_name" > "$tmp_http" || { rm -f "$tmp_http"; ngx_msg_err "生成 HTTP 配置失败。"; return 1; }
+
+    txn="$(txn_begin)" || { rm -f "$tmp_http"; ngx_msg_err "初始化事务失败。"; return 1; }
+    txn_register "$txn" _ngx_reload_quiet
+    txn_backup_file "$txn" "$conf" >/dev/null || { rm -f "$tmp_http"; txn_abort "$txn"; ngx_msg_err "备份现有站点配置失败。"; return 1; }
+    install -m 644 "$tmp_http" "$conf" 2>/dev/null || { rm -f "$tmp_http"; txn_abort "$txn"; ngx_msg_err "写入 HTTP 配置失败。"; return 1; }
+    rm -f "$tmp_http"
+
     if ! ngx_test_reload; then
-        rm -f "$conf"
-        ngx_msg_err "Nginx 配置验证失败，已回滚。"
+        txn_abort "$txn"
+        ngx_msg_err "Nginx HTTP 预配置校验失败，已回滚。"
         sleep 2
         return 1
     fi
@@ -5679,27 +5836,40 @@ ngx_add_proxy() {
 
     ngx_msg_info "开始申请 SSL 证书..."
     if ! certbot certonly --webroot -w "$NGX_WEBROOT" --non-interactive --agree-tos "${email_args[@]}" -d "$domain_name" >/dev/null 2>&1; then
-        rm -f "$conf"
-        ngx_test_reload >/dev/null 2>&1 || true
         ngx_delete_cert_if_exists "$domain_name"
-        ngx_msg_err "SSL 证书申请失败，已自动回滚配置。"
+        txn_abort "$txn"
+        ngx_msg_err "SSL 证书申请失败，站点配置已通过事务回滚。"
         sleep 2
         return 1
     fi
 
-    tmp_final="$(mktemp "${NGX_TMP_DIR}/final.XXXXXX")" || { rm -f "$conf"; return 1; }
-    ngx_render_https_conf "$domain_name" > "$tmp_final"
-    install -m 644 "$tmp_final" "$conf" 2>/dev/null || { rm -f "$tmp_final"; rm -f "$conf"; return 1; }
+    tmp_final="$(mktemp "${NGX_TMP_DIR}/final.XXXXXX")" || {
+        txn_abort "$txn"
+        ngx_msg_err "创建最终 HTTPS 配置失败，证书已保留，站点配置已回滚。"
+        return 1
+    }
+    ngx_render_https_conf "$domain_name" > "$tmp_final" || {
+        rm -f "$tmp_final"
+        txn_abort "$txn"
+        ngx_msg_err "生成最终 HTTPS 配置失败，证书已保留，站点配置已回滚。"
+        return 1
+    }
+    install -m 644 "$tmp_final" "$conf" 2>/dev/null || {
+        rm -f "$tmp_final"
+        txn_abort "$txn"
+        ngx_msg_err "安装最终 HTTPS 配置失败，证书已保留，站点配置已回滚。"
+        return 1
+    }
     rm -f "$tmp_final"
 
     if ! ngx_test_reload; then
-        rm -f "$conf"
-        ngx_test_reload >/dev/null 2>&1 || true
-        ngx_msg_err "最终 HTTPS 配置校验失败，证书已保留，仅回滚了 Nginx 配置。"
+        txn_abort "$txn"
+        ngx_msg_err "最终 HTTPS 配置校验失败，证书已保留，站点配置已通过事务回滚。"
         sleep 2
         return 1
     fi
 
+    txn_commit "$txn"
     ngx_msg_ok "✅ 部署完成：https://${domain_name}"
     return 0
 }
@@ -5761,8 +5931,6 @@ nginx_menu() {
         esac
     done
 }
-NGX_MODULE_EOF
-
 NGX_MODULE_EOF
 mv -f "${NGX_MODULE_FILE}.tmp" "${NGX_MODULE_FILE}"
 
@@ -6585,6 +6753,7 @@ main_menu() {
 init() {
     require_root
     install_self_command
+    mkdir -p "${MY_STATE_DIR}" "${MY_SSR_STATE_DIR}" "${MY_NGX_STATE_DIR}" 2>/dev/null || true
     install_modules
     ensure_global_clean_cron
 
@@ -6599,6 +6768,7 @@ init() {
 ensure_runtime_ready_for_cli() {
     require_root
     install_self_command
+    mkdir -p "${MY_STATE_DIR}" "${MY_SSR_STATE_DIR}" "${MY_NGX_STATE_DIR}" 2>/dev/null || true
     [[ -f "${COMMON_MODULE_FILE}" && -f "${SSR_MODULE_FILE}" && -f "${NFT_MODULE_FILE}" && -f "${NGX_MODULE_FILE}" ]] || install_modules
 }
 
