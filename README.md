@@ -31,7 +31,7 @@ curl -fL https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/mai
 
 > **快捷命令**：安装后，您可以在终端随时输入 `my` 唤起主菜单。
 
-### 2. 单独模块快捷路径
+### 2. 单独模块快捷路径（不建议使用，很久未更新，不知道有什么BUG了）
 
 如果您仅需使用特定功能模块，可以使用以下独立命令：
 
