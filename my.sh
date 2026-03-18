@@ -593,6 +593,17 @@ sshd_effective_value_runtime() {
     sshd -T 2>/dev/null | awk -v k="$key" '$1==tolower(k) { $1=""; sub(/^[[:space:]]+/, ""); print; exit }'
 }
 
+normalize_ssh_root_login_mode() {
+    local mode="$1"
+    mode=$(printf %s "$mode" | tr '[:upper:]' '[:lower:]')
+    case "$mode" in
+        prohibit-password|without-password) printf %s "prohibit-password" ;;
+        forced-commands-only) printf %s "forced-commands-only" ;;
+        yes|no) printf %s "$mode" ;;
+        *) printf %s "$mode" ;;
+    esac
+}
+
 port_listening_tcp() {
     local port="$1"
     ss -lnt "( sport = :${port} )" 2>/dev/null | tail -n +2 | grep -q .
@@ -607,7 +618,8 @@ verify_ssh_runtime() {
     [[ "$got_port" == "$expected_port" ]] || return 1
     got_pass=$(sshd_effective_value_runtime passwordauthentication | tr '[:upper:]' '[:lower:]')
     [[ -z "$expected_pass" || "$got_pass" == "$expected_pass" ]] || return 1
-    got_root=$(sshd_effective_value_runtime permitrootlogin | tr '[:upper:]' '[:lower:]')
+    got_root=$(normalize_ssh_root_login_mode "$(sshd_effective_value_runtime permitrootlogin)")
+    expected_root=$(normalize_ssh_root_login_mode "$expected_root")
     [[ -z "$expected_root" || "$got_root" == "$expected_root" ]] || return 1
     port_listening_tcp "$expected_port" || return 1
     return 0
@@ -1811,7 +1823,7 @@ fetch_github_user_keys() {
     [[ -n "$gh_user" ]] || return 1
     body=$(fetch_text_url "https://github.com/${gh_user}.keys" || true)
     if [[ -n "$body" && "$body" != "Not Found" ]]; then
-        printf '%s\n' "$body"
+        printf '%s\n' "$body" | sed 's/\r$//' | sed '/^[[:space:]]*$/d'
         return 0
     fi
     body=$(fetch_text_url "https://api.github.com/users/${gh_user}/keys" || true)
@@ -1834,7 +1846,7 @@ PYKEYS
 )
     fi
     [[ -n "$keys" ]] || return 1
-    printf '%s\n' "$keys"
+    printf '%s\n' "$keys" | sed 's/\r$//' | sed '/^[[:space:]]*$/d'
 }
 
 github_latest_tag() {
@@ -2831,23 +2843,29 @@ ssh_key_menu() {
     case "$skm_num" in
         1)
             read -rp "GitHub用户名: " gh_user
-            [[ -n "$gh_user" ]] && {
+            if [[ -n "$gh_user" ]]; then
                 mkdir -p ~/.ssh && chmod 700 ~/.ssh
+                touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
                 local keys
                 keys=$(fetch_github_user_keys "$gh_user" 2>/dev/null || true)
-                [[ -n "$keys" ]] && {
-                    echo "$keys" >> ~/.ssh/authorized_keys
-                    chmod 600 ~/.ssh/authorized_keys
+                if [[ -n "$keys" ]]; then
+                    printf '%s\n' "$keys" >> ~/.ssh/authorized_keys
+                    sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys 2>/dev/null || true
                     echo -e "${GREEN}✅ 拉取成功！${RESET}"
-                    apply_ssh_key_sec
-                } || { echo -e "${RED}❌ 未找到公钥。${RESET}"; sleep 2; }
-            }
+                    apply_ssh_key_sec || true
+                else
+                    echo -e "${RED}❌ 未找到公钥。${RESET}"
+                    sleep 2
+                fi
+            fi
             ;;
         2)
             read -rp "粘贴公钥: " manual_key
             [[ -n "$manual_key" ]] && {
                 mkdir -p ~/.ssh && chmod 700 ~/.ssh
+                touch ~/.ssh/authorized_keys
                 echo "$manual_key" >> ~/.ssh/authorized_keys
+                sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys 2>/dev/null || true
                 chmod 600 ~/.ssh/authorized_keys
                 echo -e "${GREEN}✅ 成功！${RESET}"
                 apply_ssh_key_sec
@@ -2857,7 +2875,9 @@ ssh_key_menu() {
             mkdir -p ~/.ssh && chmod 700 ~/.ssh
             rm -f ~/.ssh/id_ed25519*
             ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+            touch ~/.ssh/authorized_keys
             cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+            sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys 2>/dev/null || true
             chmod 600 ~/.ssh/authorized_keys
             echo -e "${RED}⚠️ 请保存以下私钥（只显示一次）！⚠️${RESET}
 "
@@ -3621,22 +3641,35 @@ get_sshd_effective_value() {
 
 get_ssh_port_brief() {
     local port
-    port=$(get_sshd_effective_value Port)
+    if have_cmd sshd && sshd -t >/dev/null 2>&1; then
+        port=$(sshd_effective_port 2>/dev/null || true)
+    else
+        port=$(get_sshd_effective_value Port)
+    fi
     [[ "$port" =~ ^[0-9]+$ ]] || port=22
     printf %s "$port"
 }
 
 get_ssh_auth_brief() {
     local pass pub has_keys="0"
-    pass=$(get_sshd_effective_value PasswordAuthentication)
-    pub=$(get_sshd_effective_value PubkeyAuthentication)
+    if have_cmd sshd && sshd -t >/dev/null 2>&1; then
+        pass=$(sshd_effective_value_runtime passwordauthentication)
+        pub=$(sshd_effective_value_runtime pubkeyauthentication)
+    else
+        pass=$(get_sshd_effective_value PasswordAuthentication)
+        pub=$(get_sshd_effective_value PubkeyAuthentication)
+    fi
     [[ -s /root/.ssh/authorized_keys ]] && has_keys="1"
     [[ -z "$pass" ]] && pass="yes"
     [[ -z "$pub" ]] && pub="yes"
     pass=$(printf %s "$pass" | tr '[:upper:]' '[:lower:]')
     pub=$(printf %s "$pub" | tr '[:upper:]' '[:lower:]')
     if [[ "$pass" == "no" && "$pub" == "yes" ]]; then
-        printf %s "仅密钥"
+        if [[ "$has_keys" == "1" ]]; then
+            printf %s "仅密钥"
+        else
+            printf %s "配置异常"
+        fi
     elif [[ "$pass" == "yes" && "$pub" == "yes" ]]; then
         if [[ "$has_keys" == "1" ]]; then
             printf %s "密码+密钥"
