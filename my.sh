@@ -3809,6 +3809,25 @@ get_dns_brief_status() {
     fi
 }
 
+get_dns_servers_brief() {
+    local dns_line="" servers=""
+    if [[ -f "$RESOLVED_DROPIN" ]]; then
+        dns_line=$(grep -E '^DNS=' "$RESOLVED_DROPIN" 2>/dev/null | tail -n1 | cut -d= -f2-)
+        dns_line=$(printf '%s' "$dns_line" | xargs 2>/dev/null || printf '%s' "$dns_line")
+        if [[ -n "$dns_line" ]]; then
+            printf %s "$dns_line"
+            return 0
+        fi
+    fi
+    servers=$(awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ' ' -)
+    servers=$(printf '%s' "$servers" | xargs 2>/dev/null || printf '%s' "$servers")
+    if [[ -n "$servers" ]]; then
+        printf %s "$servers"
+    else
+        printf %s "未探测到"
+    fi
+}
+
 get_cf_ddns_brief_status() {
     if [[ -f "$DDNS_CONF" ]]; then
         local record
@@ -7071,10 +7090,11 @@ status_quic_line() {
 
 status_page_loop() {
     while true; do
-        local cc_brief ddns dns nft_rules nft_mode timesync ss_ver xr_ver
+        local cc_brief ddns dns dns_servers nft_rules nft_mode timesync ss_ver xr_ver
         cc_brief=$(status_cc_brief)
         ddns=$(get_cf_ddns_brief_status 2>/dev/null || echo "未知")
         dns=$(get_dns_brief_status 2>/dev/null || echo "未知")
+        dns_servers=$(get_dns_servers_brief 2>/dev/null || echo "未探测到")
         nft_rules=$(nft_status_eval count_forward_rules_brief 2>/dev/null || echo 0)
         nft_mode=$(nft_status_eval settings_get "PERSIST_MODE" 2>/dev/null || echo "service")
         timesync=$(status_timesync_brief)
@@ -7108,7 +7128,7 @@ status_page_loop() {
         echo -e "${GREEN}系统基础与极客管理${RESET}"
         status_ssh_line
         echo -e "  DDNS: ${YELLOW}${ddns}${RESET}"
-        echo -e "  DNS: ${YELLOW}${dns}${RESET}"
+        echo -e "  DNS: ${YELLOW}${dns}${RESET} / 当前 ${YELLOW}${dns_servers}${RESET}"
         echo -e ""
         echo -e "${CYAN}快捷导航${RESET}"
         echo -e "  ${YELLOW}1.${RESET} 代理节点与热更中心    ${YELLOW}4.${RESET} Nginx 反向代理"
