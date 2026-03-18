@@ -1034,9 +1034,13 @@ ensure_ss_rust_binary() {
     tmpdir=$(mktemp -d /tmp/ssr-ssrust.XXXXXX)
     tarball="${tmpdir}/ss-rust.tar.xz"
     for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
-        url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/shadowsocks-${ss_latest}.${candidate_arch}.tar.xz"
+        local asset_name official_url api_url proxy_url
+        asset_name="shadowsocks-${ss_latest}.${candidate_arch}.tar.xz"
+        official_url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/${asset_name}"
+        api_url=$(github_release_asset_url "shadowsocks/shadowsocks-rust" "$ss_latest" "$asset_name" 2>/dev/null || true)
+        proxy_url="https://ghproxy.net/${official_url#https://}"
         rm -f "$tarball" "${tmpdir}/ssserver" >/dev/null 2>&1 || true
-        if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
+        if ! download_file_any "$tarball" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
             continue
         fi
         tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
@@ -1854,10 +1858,13 @@ download_file() {
     # download_file URL DEST
     local url="$1"; local dest="$2"
     rm -f "$dest"
+    [[ -n "$url" && -n "$dest" ]] || return 1
     if have_cmd curl; then
-        curl -fsSL --retry 3 --connect-timeout 8 --max-time 120 "$url" -o "$dest" >/dev/null 2>&1
+        curl -A 'Mozilla/5.0' -fL --retry 3 --retry-delay 1 --connect-timeout 8 --max-time 120 "$url" -o "$dest" >/dev/null 2>&1
+    elif have_cmd wget; then
+        wget --user-agent='Mozilla/5.0' -qO "$dest" "$url" >/dev/null 2>&1
     else
-        wget -qO "$dest" "$url" >/dev/null 2>&1
+        return 1
     fi
 }
 
@@ -1865,10 +1872,10 @@ fetch_text_url() {
     local url="$1"
     [[ -n "$url" ]] || return 1
     if have_cmd curl; then
-        curl -fsSL --connect-timeout 8 --max-time 20 "$url" 2>/dev/null && return 0
+        curl -A 'Mozilla/5.0' -fsSL --connect-timeout 8 --max-time 20 "$url" 2>/dev/null && return 0
     fi
     if have_cmd wget; then
-        wget -qO- "$url" 2>/dev/null && return 0
+        wget --user-agent='Mozilla/5.0' -qO- "$url" 2>/dev/null && return 0
     fi
     return 1
 }
@@ -1906,22 +1913,16 @@ PYKEYS
 
 github_latest_release_redirect_tag() {
     # github_latest_release_redirect_tag "owner/repo"
-    local repo="$1" headers="" loc="" tag=""
+    local repo="$1" final_url="" tag=""
     [[ -n "$repo" ]] || return 1
     if have_cmd curl; then
-        headers=$(curl -fsSI --connect-timeout 8 --max-time 20 "https://github.com/${repo}/releases/latest" 2>/dev/null || true)
-        loc=$(printf '%s
-' "$headers" | tr -d '
-' | awk 'BEGIN{IGNORECASE=1} /^location:[[:space:]]*/{sub(/^[Ll]ocation:[[:space:]]*/, ""); print; exit}')
+        final_url=$(curl -A 'Mozilla/5.0' -fsSL -o /dev/null -w '%{url_effective}' --connect-timeout 8 --max-time 20 "https://github.com/${repo}/releases/latest" 2>/dev/null || true)
+    elif have_cmd wget; then
+        final_url=$(wget --user-agent='Mozilla/5.0' -O /dev/null -S "https://github.com/${repo}/releases/latest" 2>&1 | awk '/^  Location: /{loc=$2} END{gsub(/
+/,"",loc); print loc}' || true)
     fi
-    if [[ -z "$loc" ]] && have_cmd wget; then
-        headers=$(wget -S --max-redirect=0 -O /dev/null "https://github.com/${repo}/releases/latest" 2>&1 || true)
-        loc=$(printf '%s
-' "$headers" | tr -d '
-' | awk 'BEGIN{IGNORECASE=1} /^  [Ll]ocation:[[:space:]]*/{sub(/^  [Ll]ocation:[[:space:]]*/, ""); print; exit}')
-    fi
-    [[ -n "$loc" ]] || return 1
-    tag=$(printf '%s' "$loc" | sed -n 's#.*\/releases\/tag\/##p' | head -n1)
+    [[ -n "$final_url" ]] || return 1
+    tag=$(printf '%s' "$final_url" | sed -n 's#.*\/releases\/tag\/##p' | head -n1)
     [[ -n "$tag" ]] && echo "$tag"
 }
 
@@ -1930,11 +1931,26 @@ github_latest_tag() {
     local repo="$1" body="" tag=""
     [[ -n "$repo" ]] || return 1
     body=$(fetch_text_url "https://api.github.com/repos/${repo}/releases/latest" || true)
-    if [[ -n "$body" ]] && have_cmd jq; then
-        tag=$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null)
-    fi
-    if [[ -z "$tag" && -n "$body" ]]; then
-        tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*//p' | head -n1)
+    if [[ -n "$body" && "$body" != *"rate limit exceeded"* && "$body" != *"API rate limit exceeded"* ]]; then
+        if have_cmd jq; then
+            tag=$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null)
+        fi
+        if [[ -z "$tag" && -n "$body" ]] && have_cmd python3; then
+            tag=$(python3 - "$body" <<'PYTAG'
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    tag = data.get('tag_name') or ''
+    if tag:
+        print(tag)
+except Exception:
+    pass
+PYTAG
+)
+        fi
+        if [[ -z "$tag" && -n "$body" ]]; then
+            tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+        fi
     fi
     if [[ -z "$tag" || "$tag" == "null" ]]; then
         tag=$(github_latest_release_redirect_tag "$repo" || true)
@@ -3238,10 +3254,14 @@ install_vless_native() {
 
         tmpdir=$(mktemp -d /tmp/ssr-xray.XXXXXX)
         zipf="${tmpdir}/xray.zip"
-        local url="https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/Xray-linux-${xray_arch}.zip"
+        local asset_name official_url api_url proxy_url
+        asset_name="Xray-linux-${xray_arch}.zip"
+        official_url="https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/${asset_name}"
+        api_url=$(github_release_asset_url "XTLS/Xray-core" "$xray_latest" "$asset_name" 2>/dev/null || true)
+        proxy_url="https://ghproxy.net/${official_url#https://}"
 
         echo -e "${CYAN}>>> 下载核心: ${xray_latest} (linux-${xray_arch}) ...${RESET}"
-        if ! download_file "$url" "$zipf" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
+        if ! download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
             echo -e "${RED}❌ 核心下载或校验失败。${RESET}"
             rm -rf "$tmpdir"
             sleep 3
@@ -3750,9 +3770,13 @@ update_ss_rust_if_needed() {
         ok=1
     else
         for candidate_arch in "$ss_arch_primary" "$ss_arch_fallback"; do
-            url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${latest}/shadowsocks-${latest}.${candidate_arch}.tar.xz"
+            local asset_name official_url api_url proxy_url
+            asset_name="shadowsocks-${latest}.${candidate_arch}.tar.xz"
+            official_url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${latest}/${asset_name}"
+            api_url=$(github_release_asset_url "shadowsocks/shadowsocks-rust" "$latest" "$asset_name" 2>/dev/null || true)
+            proxy_url="https://ghproxy.net/${official_url#https://}"
             rm -f "$tarball" "$candidate" >/dev/null 2>&1 || true
-            if ! download_file "$url" "$tarball" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
+            if ! download_file_any "$tarball" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
                 continue
             fi
             tar -xf "$tarball" -C "$tmpdir" ssserver >/dev/null 2>&1 || true
@@ -3790,12 +3814,16 @@ update_xray_if_needed() {
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-xray.XXXXXX)
     local zipf="${tmpdir}/xray.zip" candidate="${tmpdir}/xray"
-    local url="https://github.com/XTLS/Xray-core/releases/download/${latest}/Xray-linux-${xray_arch}.zip"
+    local asset_name official_url api_url proxy_url
+    asset_name="Xray-linux-${xray_arch}.zip"
+    official_url="https://github.com/XTLS/Xray-core/releases/download/${latest}/${asset_name}"
+    api_url=$(github_release_asset_url "XTLS/Xray-core" "$latest" "$asset_name" 2>/dev/null || true)
+    proxy_url="https://ghproxy.net/${official_url#https://}"
 
     if cache_restore_binary_tag "xray" "$latest" "$candidate" && run_with_timeout 3 "$candidate" version >/dev/null 2>&1 && run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1; then
         :
     else
-        if ! download_file "$url" "$zipf" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
+        if ! download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
             rm -rf "$tmpdir"
             return 2
         fi
