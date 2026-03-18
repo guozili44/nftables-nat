@@ -1794,13 +1794,54 @@ download_file() {
     fi
 }
 
+fetch_text_url() {
+    local url="$1"
+    [[ -n "$url" ]] || return 1
+    if have_cmd curl; then
+        curl -fsSL --connect-timeout 8 --max-time 20 "$url" 2>/dev/null && return 0
+    fi
+    if have_cmd wget; then
+        wget -qO- "$url" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+fetch_github_user_keys() {
+    local gh_user="$1" body="" keys=""
+    [[ -n "$gh_user" ]] || return 1
+    body=$(fetch_text_url "https://github.com/${gh_user}.keys" || true)
+    if [[ -n "$body" && "$body" != "Not Found" ]]; then
+        printf '%s\n' "$body"
+        return 0
+    fi
+    body=$(fetch_text_url "https://api.github.com/users/${gh_user}/keys" || true)
+    [[ -n "$body" ]] || return 1
+    if have_cmd jq; then
+        keys=$(printf '%s' "$body" | jq -r '.[].key // empty' 2>/dev/null)
+    elif have_cmd python3; then
+        keys=$(python3 - <<'PYKEYS' "$body" 2>/dev/null || true
+import json, sys
+body = sys.argv[1]
+try:
+    data = json.loads(body)
+    for item in data if isinstance(data, list) else []:
+        key = item.get("key")
+        if key:
+            print(key)
+except Exception:
+    pass
+PYKEYS
+)
+    fi
+    [[ -n "$keys" ]] || return 1
+    printf '%s\n' "$keys"
+}
+
 github_latest_tag() {
     # github_latest_tag "owner/repo"
     local repo="$1" body="" tag=""
     [[ -n "$repo" ]] || return 1
-    if have_cmd curl; then
-        body=$(curl -fsSL --max-time 10 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null || true)
-    fi
+    body=$(fetch_text_url "https://api.github.com/repos/${repo}/releases/latest" || true)
     if [[ -n "$body" ]] && have_cmd jq; then
         tag=$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null)
     fi
@@ -1814,8 +1855,7 @@ github_release_asset_url() {
     # github_release_asset_url "owner/repo" "tag" "asset_name"
     local repo="$1" tag="$2" asset_name="$3" body="" url=""
     [[ -n "$repo" && -n "$tag" && -n "$asset_name" ]] || return 1
-    have_cmd curl || return 1
-    body=$(curl -fsSL --max-time 12 "https://api.github.com/repos/${repo}/releases/tags/${tag}" 2>/dev/null || true)
+    body=$(fetch_text_url "https://api.github.com/repos/${repo}/releases/tags/${tag}" || true)
     [[ -n "$body" ]] || return 1
     if have_cmd jq; then
         url=$(printf '%s' "$body" | jq -r --arg name "$asset_name" '.assets[]? | select(.name==$name) | .browser_download_url // empty' 2>/dev/null | head -n1)
@@ -2794,8 +2834,8 @@ ssh_key_menu() {
             [[ -n "$gh_user" ]] && {
                 mkdir -p ~/.ssh && chmod 700 ~/.ssh
                 local keys
-                keys=$(curl -s "https://github.com/${gh_user}.keys" 2>/dev/null || true)
-                [[ -n "$keys" && "$keys" != "Not Found" ]] && {
+                keys=$(fetch_github_user_keys "$gh_user" 2>/dev/null || true)
+                [[ -n "$keys" ]] && {
                     echo "$keys" >> ~/.ssh/authorized_keys
                     chmod 600 ~/.ssh/authorized_keys
                     echo -e "${GREEN}✅ 拉取成功！${RESET}"
@@ -6799,12 +6839,15 @@ status_nginx_line() {
 
 status_quic_line() {
     local quic quic_backend
-    quic=$(nft_status_eval get_quic_status_brief 2>/dev/null || echo 未知)
-    quic_backend=$(nft_status_eval get_quic_backend 2>/dev/null || echo unknown)
+    quic=$(get_quic_status_brief 2>/dev/null || echo 未知)
+    quic_backend=$(get_quic_backend 2>/dev/null || echo unknown)
+    [[ "$quic_backend" == "none" ]] && quic_backend="未托管"
     if [[ "$quic" == 已阻断* ]]; then
         echo -e "  QUIC / UDP443: $(status_colorize ok "$quic") / 后端 ${YELLOW}${quic_backend}${RESET}"
     elif [[ "$quic" == 默认放行* ]]; then
         echo -e "  QUIC / UDP443: $(status_colorize warn "$quic") / 后端 ${YELLOW}${quic_backend}${RESET}"
+    elif [[ "$quic" == 未知* || "$quic_backend" == "unknown" ]]; then
+        echo -e "  QUIC / UDP443: $(status_colorize bad '配置异常') / 后端 ${YELLOW}${quic_backend}${RESET}"
     else
         echo -e "  QUIC / UDP443: $(status_colorize info "$quic") / 后端 ${YELLOW}${quic_backend}${RESET}"
     fi
