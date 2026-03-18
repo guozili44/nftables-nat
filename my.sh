@@ -338,6 +338,7 @@ readonly LEGACY_META_DIR="/usr/local/etc/ssr_meta"
 readonly COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
 [[ -f "$COMMON_MODULE_FILE" ]] && source "$COMMON_MODULE_FILE"
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/99-my-auth.conf"
+readonly SSH_PORT_DROPIN="/etc/ssh/sshd_config.d/99-my-port.conf"
 readonly JOURNALD_BACKUP_FILE="${META_DIR}/journald.conf.bak"
 
 readonly DNS_BACKUP_DIR="${SSR_STATE_DIR}/dns"
@@ -534,7 +535,8 @@ replace_or_append_line() {
 }
 
 write_ssh_auth_dropin() {
-    local pass_mode="$1" kb_mode="$2" challenge_mode="$3"
+    local pass_mode="$1" kb_mode="$2" challenge_mode="$3" root_mode="${4:-prohibit-password}"
+    ensure_sshd_dropin_include || true
     mkdir -p "$(dirname "$SSH_AUTH_DROPIN")" 2>/dev/null || true
     cat > "$SSH_AUTH_DROPIN" <<EOF
 # managed by my
@@ -542,13 +544,73 @@ PasswordAuthentication ${pass_mode}
 KbdInteractiveAuthentication ${kb_mode}
 ChallengeResponseAuthentication ${challenge_mode}
 PubkeyAuthentication yes
-PermitRootLogin prohibit-password
+PermitRootLogin ${root_mode}
 UsePAM yes
 EOF
 }
 
 remove_ssh_auth_dropin() {
     rm -f "$SSH_AUTH_DROPIN" 2>/dev/null || true
+}
+
+ensure_sshd_dropin_include() {
+    local cfg="/etc/ssh/sshd_config" tmp
+    [[ -f "$cfg" ]] || return 1
+    grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' "$cfg" 2>/dev/null && return 0
+    tmp=$(mktemp /tmp/sshd_config.include.XXXXXX) || return 1
+    {
+        printf '%s
+' 'Include /etc/ssh/sshd_config.d/*.conf'
+        cat "$cfg"
+    } > "$tmp"
+    cat "$tmp" > "$cfg" && rm -f "$tmp"
+}
+
+write_ssh_port_dropin() {
+    local port="$1"
+    ensure_sshd_dropin_include || true
+    mkdir -p "$(dirname "$SSH_PORT_DROPIN")" 2>/dev/null || true
+    cat > "$SSH_PORT_DROPIN" <<EOF
+# managed by my
+Port ${port}
+EOF
+}
+
+remove_ssh_port_dropin() {
+    rm -f "$SSH_PORT_DROPIN" 2>/dev/null || true
+}
+
+sshd_effective_port() {
+    local port
+    port=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')
+    [[ "$port" =~ ^[0-9]+$ ]] || port=$(get_sshd_effective_value Port 2>/dev/null || true)
+    [[ "$port" =~ ^[0-9]+$ ]] || port=22
+    printf %s "$port"
+}
+
+sshd_effective_value_runtime() {
+    local key="$1"
+    sshd -T 2>/dev/null | awk -v k="$key" '$1==tolower(k) { $1=""; sub(/^[[:space:]]+/, ""); print; exit }'
+}
+
+port_listening_tcp() {
+    local port="$1"
+    ss -lnt "( sport = :${port} )" 2>/dev/null | tail -n +2 | grep -q .
+}
+
+verify_ssh_runtime() {
+    local expected_port="$1" expected_pass="$2" expected_root="$3"
+    local got_port got_pass got_root
+    have_cmd sshd || return 1
+    sshd -t >/dev/null 2>&1 || return 1
+    got_port=$(sshd_effective_port)
+    [[ "$got_port" == "$expected_port" ]] || return 1
+    got_pass=$(sshd_effective_value_runtime passwordauthentication | tr '[:upper:]' '[:lower:]')
+    [[ -z "$expected_pass" || "$got_pass" == "$expected_pass" ]] || return 1
+    got_root=$(sshd_effective_value_runtime permitrootlogin | tr '[:upper:]' '[:lower:]')
+    [[ -z "$expected_root" || "$got_root" == "$expected_root" ]] || return 1
+    port_listening_tcp "$expected_port" || return 1
+    return 0
 }
 
 service_use_systemd() {
@@ -2404,47 +2466,37 @@ dns_status() {
 
 dns_menu() {
     while true; do
-        local dns_brief
-        dns_brief=$(get_dns_brief_status)
         clear
         echo -e "${CYAN}========= DNS 管理中心 =========${RESET}"
-        echo -e "当前状态: ${YELLOW}${dns_brief}${RESET}"
-        echo -e "${GREEN} 1.${RESET} 查看 DNS 状态"
-        echo -e "${GREEN} 2.${RESET} 智能选优：稳定优先"
-        echo -e "${GREEN} 3.${RESET} 智能选优：极致优化"
-        echo -e "${YELLOW} 4.${RESET} 一键设置标准 DNS（不锁）"
-        echo -e "${YELLOW} 5.${RESET} 手动设置 DNS（自定义）"
-        echo -e "${YELLOW} 6.${RESET} 锁定 DNS（尽可能稳健）"
-        echo -e "${YELLOW} 7.${RESET} 一键解锁并恢复（回滚至备份）"
+        echo -e "${GREEN} 1.${RESET} 智能选优：稳定优先"
+        echo -e "${GREEN} 2.${RESET} 智能选优：极致优化"
+        echo -e "${YELLOW} 3.${RESET} 一键设置标准 DNS（不锁）"
+        echo -e "${YELLOW} 4.${RESET} 手动设置 DNS（自定义）"
+        echo -e "${YELLOW} 5.${RESET} 锁定 DNS（尽可能稳健）"
+        echo -e "${YELLOW} 6.${RESET} 一键解锁并恢复（回滚至备份）"
         echo -e " 0. 返回"
-        read -rp "输入 [0-7]: " dn
+        read -rp "输入 [0-6]: " dn
         case "$dn" in
-            1)
-                clear
-                dns_status
-                echo ""
-                read -n 1 -s -r -p "按任意键返回..."
-                ;;
-            2|3)
+            1|2)
                 local profile="stable" dns_mode
-                [[ "$dn" == "3" ]] && profile="extreme"
+                [[ "$dn" == "2" ]] && profile="extreme"
                 read -rp "DNS 模式 [auto/set/lock, 回车 auto]: " dns_mode
                 smart_dns_apply "$profile" "${dns_mode:-auto}"
                 sleep 2
                 ;;
-            4)
+            3)
                 dns_set_or_lock "set" && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
                 sleep 2
                 ;;
-            5)
+            4)
                 dns_manual_set && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
                 sleep 2
                 ;;
-            6)
+            5)
                 dns_set_or_lock "lock" && echo -e "${GREEN}✅ DNS 已锁定/固定。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
                 sleep 2
                 ;;
-            7)
+            6)
                 dns_unlock_restore
                 echo -e "${GREEN}✅ 已解锁并恢复。${RESET}"
                 sleep 2
@@ -2590,11 +2642,6 @@ cf_ddns_menu() {
         clear
         echo -e "${CYAN}========= 🌐 动态域名解析 (Cloudflare DDNS) =========${RESET}"
         if [[ -f "$DDNS_CONF" ]]; then
-            # shellcheck disable=SC1090
-            source "$DDNS_CONF"
-            echo -e "${GREEN}当前状态: 已启用守护${RESET}"
-            echo -e "绑定域名: ${YELLOW}$CF_RECORD${RESET}"
-            echo -e "最近记录 IP: ${YELLOW}$LAST_IP${RESET}"
             echo -e "---------------------------------"
             echo -e "${YELLOW} 1.${RESET} 修改 DDNS 配置"
             echo -e "${YELLOW} 2.${RESET} 手动强制推送更新"
@@ -2610,7 +2657,6 @@ cf_ddns_menu() {
                 0) return ;;
             esac
         else
-            echo -e "${RED}当前状态: 未配置${RESET}"
             echo -e "---------------------------------"
             echo -e "${YELLOW} 1.${RESET} 开启 Cloudflare DDNS"
             echo -e " 0. 返回"
@@ -2626,23 +2672,24 @@ cf_ddns_menu() {
 change_ssh_port() {
     read -rp "新的 SSH 端口号 (1-65535): " new_port
     if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-        local cfg_bak old_port
+        local cfg_bak dropin_bak="" old_port
         backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
         cfg_bak=$(make_runtime_backup /etc/ssh/sshd_config) || { echo -e "${RED}❌ SSH 配置备份失败。${RESET}"; sleep 2; return 1; }
-        old_port=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')
-        [[ "$old_port" =~ ^[0-9]+$ ]] || old_port=22
+        [[ -f "$SSH_PORT_DROPIN" ]] && dropin_bak=$(make_runtime_backup "$SSH_PORT_DROPIN" 2>/dev/null || true)
+        old_port=$(sshd_effective_port 2>/dev/null || echo 22)
         add_firewall_rule "$new_port" tcp || true
-        replace_or_append_line /etc/ssh/sshd_config '^#?Port ' "Port $new_port"
-        if restart_ssh_safe; then
+        write_ssh_port_dropin "$new_port"
+        if restart_ssh_safe && verify_ssh_runtime "$new_port" "" ""; then
             [[ "$old_port" =~ ^[0-9]+$ && "$old_port" != "$new_port" ]] && remove_firewall_rule "$old_port" tcp
-            rm -f "$cfg_bak"
-            echo -e "${GREEN}✅ SSH 端口已修改为 $new_port 。${RESET}"
+            rm -f "$cfg_bak" "$dropin_bak"
+            echo -e "${GREEN}✅ SSH 端口已修改为 $new_port ，并已生效。${RESET}"
         else
             restore_file_strict "$cfg_bak" /etc/ssh/sshd_config >/dev/null 2>&1 || true
+            restore_or_remove_file "$dropin_bak" "$SSH_PORT_DROPIN" >/dev/null 2>&1 || true
             restart_ssh_safe >/dev/null 2>&1 || true
             [[ "$old_port" != "$new_port" ]] && remove_firewall_rule "$new_port" tcp
-            rm -f "$cfg_bak"
-            echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
+            rm -f "$cfg_bak" "$dropin_bak"
+            echo -e "${RED}❌ SSH 端口修改未生效，已回滚。${RESET}"
         fi
     else
         echo -e "${RED}❌ 端口无效。${RESET}"
@@ -2657,7 +2704,12 @@ change_root_password() {
     read -rsp "再次输入确认: " new_pass_confirm
     echo ""
     [[ "$new_pass" != "$new_pass_confirm" ]] && echo -e "${RED}两次密码不一致！${RESET}" && sleep 2 && return
-    echo "root:$new_pass" | chpasswd && echo -e "${GREEN}✅ 密码修改成功！${RESET}"
+    if printf 'root:%s\n' "$new_pass" | chpasswd 2>/dev/null; then
+        echo -e "${GREEN}✅ Root 密码修改成功！${RESET}"
+        echo -e "${YELLOW}提示：若需通过 SSH 使用密码登录，请确认 SSH 密码登录已开启。${RESET}"
+    else
+        echo -e "${RED}❌ Root 密码修改失败。${RESET}"
+    fi
     sleep 2
 }
 
@@ -2676,62 +2728,60 @@ sync_server_time() {
 }
 
 apply_ssh_key_sec() {
-    local cfg_bak dropin_bak=""
+    local cfg_bak dropin_bak="" port_bak=""
+    local eff_port
     backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
     cfg_bak=$(make_runtime_backup /etc/ssh/sshd_config) || { echo -e "${RED}❌ SSH 配置备份失败。${RESET}"; sleep 2; return 1; }
     [[ -f "$SSH_AUTH_DROPIN" ]] && dropin_bak=$(make_runtime_backup "$SSH_AUTH_DROPIN" 2>/dev/null || true)
-    replace_or_append_line /etc/ssh/sshd_config '^#?PasswordAuthentication ' 'PasswordAuthentication no'
-    replace_or_append_line /etc/ssh/sshd_config '^#?KbdInteractiveAuthentication ' 'KbdInteractiveAuthentication no'
-    replace_or_append_line /etc/ssh/sshd_config '^#?ChallengeResponseAuthentication ' 'ChallengeResponseAuthentication no'
+    [[ -f "$SSH_PORT_DROPIN" ]] && port_bak=$(make_runtime_backup "$SSH_PORT_DROPIN" 2>/dev/null || true)
+    eff_port=$(sshd_effective_port 2>/dev/null || echo 22)
     replace_or_append_line /etc/ssh/sshd_config '^#?PubkeyAuthentication ' 'PubkeyAuthentication yes'
     replace_or_append_line /etc/ssh/sshd_config '^#?UsePAM ' 'UsePAM yes'
-    replace_or_append_line /etc/ssh/sshd_config '^#?PermitRootLogin ' 'PermitRootLogin prohibit-password'
-    write_ssh_auth_dropin no no no
-    if ! restart_ssh_safe; then
+    write_ssh_auth_dropin no no no prohibit-password
+    if ! restart_ssh_safe || ! verify_ssh_runtime "$eff_port" no prohibit-password; then
         restore_file_strict "$cfg_bak" /etc/ssh/sshd_config >/dev/null 2>&1 || true
         restore_or_remove_file "$dropin_bak" "$SSH_AUTH_DROPIN" >/dev/null 2>&1 || true
+        restore_or_remove_file "$port_bak" "$SSH_PORT_DROPIN" >/dev/null 2>&1 || true
         restart_ssh_safe >/dev/null 2>&1 || true
-        rm -f "$cfg_bak" "$dropin_bak"
-        echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
+        rm -f "$cfg_bak" "$dropin_bak" "$port_bak"
+        echo -e "${RED}❌ SSH 密钥登录配置未生效，已回滚。${RESET}"
         sleep 2
         return 1
     fi
-    rm -f "$cfg_bak" "$dropin_bak"
+    rm -f "$cfg_bak" "$dropin_bak" "$port_bak"
     echo -e "${GREEN}✅ 已启用密钥登录并禁止密码登录。${RESET}"
     sleep 2
 }
 
 restore_password_login() {
-    local cfg_bak dropin_bak=""
+    local cfg_bak dropin_bak="" port_bak=""
+    local eff_port
     backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
     cfg_bak=$(make_runtime_backup /etc/ssh/sshd_config) || { echo -e "${RED}❌ SSH 配置备份失败。${RESET}"; sleep 2; return 1; }
     [[ -f "$SSH_AUTH_DROPIN" ]] && dropin_bak=$(make_runtime_backup "$SSH_AUTH_DROPIN" 2>/dev/null || true)
-    replace_or_append_line /etc/ssh/sshd_config '^#?PasswordAuthentication ' 'PasswordAuthentication yes'
-    replace_or_append_line /etc/ssh/sshd_config '^#?KbdInteractiveAuthentication ' 'KbdInteractiveAuthentication yes'
-    replace_or_append_line /etc/ssh/sshd_config '^#?ChallengeResponseAuthentication ' 'ChallengeResponseAuthentication yes'
+    [[ -f "$SSH_PORT_DROPIN" ]] && port_bak=$(make_runtime_backup "$SSH_PORT_DROPIN" 2>/dev/null || true)
+    eff_port=$(sshd_effective_port 2>/dev/null || echo 22)
     replace_or_append_line /etc/ssh/sshd_config '^#?PubkeyAuthentication ' 'PubkeyAuthentication yes'
-    remove_ssh_auth_dropin
-    if ! restart_ssh_safe; then
+    replace_or_append_line /etc/ssh/sshd_config '^#?UsePAM ' 'UsePAM yes'
+    write_ssh_auth_dropin yes yes yes yes
+    if ! restart_ssh_safe || ! verify_ssh_runtime "$eff_port" yes yes; then
         restore_file_strict "$cfg_bak" /etc/ssh/sshd_config >/dev/null 2>&1 || true
         restore_or_remove_file "$dropin_bak" "$SSH_AUTH_DROPIN" >/dev/null 2>&1 || true
+        restore_or_remove_file "$port_bak" "$SSH_PORT_DROPIN" >/dev/null 2>&1 || true
         restart_ssh_safe >/dev/null 2>&1 || true
-        rm -f "$cfg_bak" "$dropin_bak"
-        echo -e "${RED}❌ SSH 配置校验失败，已回滚。${RESET}"
+        rm -f "$cfg_bak" "$dropin_bak" "$port_bak"
+        echo -e "${RED}❌ SSH 密码登录恢复未生效，已回滚。${RESET}"
         sleep 2
         return 1
     fi
-    rm -f "$cfg_bak" "$dropin_bak"
+    rm -f "$cfg_bak" "$dropin_bak" "$port_bak"
     echo -e "${GREEN}✅ 已恢复密码登录。${RESET}"
     sleep 2
 }
 
 ssh_key_menu() {
-    local ssh_auth ssh_port
-    ssh_auth=$(get_ssh_auth_brief)
-    ssh_port=$(get_ssh_port_brief)
     clear
     echo -e "${CYAN}========= SSH 密钥登录管理 =========${RESET}"
-    echo -e "当前 SSH: 端口 ${YELLOW}${ssh_port}${RESET} / 登录模式 ${YELLOW}${ssh_auth}${RESET}"
     echo -e "${YELLOW} 1.${RESET} 自动拉取公钥 (GitHub)"
     echo -e "${YELLOW} 2.${RESET} 手动填写公钥"
     echo -e "${YELLOW} 3.${RESET} 一键生成密钥对"
@@ -2769,9 +2819,11 @@ ssh_key_menu() {
             ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
             cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
             chmod 600 ~/.ssh/authorized_keys
-            echo -e "${RED}⚠️ 请保存以下私钥（只显示一次）！⚠️${RESET}\n"
+            echo -e "${RED}⚠️ 请保存以下私钥（只显示一次）！⚠️${RESET}
+"
             cat ~/.ssh/id_ed25519
-            echo -e "\n${YELLOW}========================${RESET}"
+            echo -e "
+${YELLOW}========================${RESET}"
             read -rp "关闭密码登录 (y/N): " confirm
             [[ "$confirm" == "y" || "$confirm" == "Y" ]] && apply_ssh_key_sec
             ;;
@@ -3013,9 +3065,9 @@ unified_node_manager() {
         managed_service_exists "ss-v2ray" && has_v2=1
         managed_service_exists "xray" && has_vless=1
         echo -e "${CYAN}========= 统一节点生命周期管控中心 =========${RESET}"
-        if [[ $has_ss -eq 1 ]]; then echo -e "${GREEN} 1) ⚡ SS-Rust 节点${RESET}"; else echo -e "${RED} 1) ❌ 未部署 SS-Rust${RESET}"; fi
-        if [[ $has_v2 -eq 1 ]]; then echo -e "${GREEN} 2) 🌐 SS2022 + v2ray-plugin${RESET}"; else echo -e "${RED} 2) ❌ 未部署 SS2022 + v2ray-plugin${RESET}"; fi
-        if [[ $has_vless -eq 1 ]]; then echo -e "${GREEN} 3) 🔮 VLESS Reality 节点${RESET}"; else echo -e "${RED} 3) ❌ 未部署 VLESS Reality${RESET}"; fi
+        echo -e "${YELLOW} 1)${RESET} SS-Rust 节点管理"
+        echo -e "${YELLOW} 2)${RESET} SS2022 + v2ray-plugin 管理"
+        echo -e "${YELLOW} 3)${RESET} VLESS Reality 节点管理"
         echo -e "${RED} 4) ☢️ 全局强制核爆${RESET}"
         echo -e " 0) 返回主菜单"
         read -rp "请选择 [0-4]: " node_choice
@@ -3024,7 +3076,6 @@ unified_node_manager() {
                 if [[ $has_ss -eq 1 ]]; then
                     clear
                     local port
-                    show_ss_rust_summary
                     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
                     echo -e "---------------------------------"
                     echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 修改密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
@@ -3060,7 +3111,6 @@ unified_node_manager() {
                 if [[ $has_v2 -eq 1 ]]; then
                     clear
                     local port
-                    show_ss_v2ray_summary
                     port=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
                     echo -e "---------------------------------"
                     echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 修改密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
@@ -3096,7 +3146,6 @@ unified_node_manager() {
                 if [[ $has_vless -eq 1 ]]; then
                     clear
                     local port
-                    show_vless_summary
                     port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
                     echo -e "---------------------------------"
                     echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 重启节点${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
@@ -3439,23 +3488,10 @@ report_update_result() {
     esac
 }
 
-show_core_cache_status() {
-    local ss_inst="未安装" xr_inst="未安装"
-    local ss_cache="无" xr_cache="无"
-    [[ -x /usr/local/bin/ss-rust ]] && ss_inst="$(ss_rust_current_tag || echo installed)"
-    [[ -x /usr/local/bin/xray ]] && xr_inst="$(xray_current_tag || echo installed)"
-    [[ -x "$(cache_current_binary_path ss-rust 2>/dev/null)" ]] && ss_cache="有"
-    [[ -x "$(cache_current_binary_path xray 2>/dev/null)" ]] && xr_cache="有"
-    echo -e "${CYAN}SS-Rust${RESET}    已安装: ${GREEN}${ss_inst}${RESET} | 缓存: ${YELLOW}${ss_cache}${RESET}"
-    echo -e "${CYAN}Xray${RESET}       已安装: ${GREEN}${xr_inst}${RESET} | 缓存: ${YELLOW}${xr_cache}${RESET}"
-    echo -e "${CYAN}说明:${RESET} 创建节点时会优先复用【已安装核心】->【本地缓存】->【联网下载】"
-}
-
 core_cache_menu() {
     while true; do
         clear
         echo -e "${CYAN}========= 核心缓存与更新中心 =========${RESET}"
-        show_core_cache_status
         echo
         echo -e "${GREEN} 1.${RESET} 更新 SS-Rust 核心"
         echo -e "${GREEN} 2.${RESET} 更新 Xray 核心"
@@ -3748,23 +3784,18 @@ manage_quic_udp443() {
 
 quic_menu() {
     while true; do
-        local quic_status
-        quic_status=$(get_quic_status_brief)
         clear
         echo -e "${CYAN}========= QUIC 防火墙管理 (防 QoS) =========${RESET}"
-        echo -e "当前状态: ${YELLOW}${quic_status}${RESET}"
         echo -e "${YELLOW}说明：阻断 UDP 443 可有效防止运营商对 UDP 流量的 QoS 和阻断，${RESET}"
         echo -e "${YELLOW}      强制科学代理流量回退至更稳定的 TCP 协议。${RESET}"
         echo -e "------------------------------------------------"
         echo -e "${RED} 1.${RESET} 一键阻断 UDP 443 (关闭 QUIC - 推荐稳定)${RESET}"
         echo -e "${GREEN} 2.${RESET} 一键放行 UDP 443 (开启 QUIC - 默认状态)${RESET}"
-        echo -e "${CYAN} 3.${RESET} 刷新并重看当前状态"
         echo -e " 0. 返回上一级"
-        read -rp "请选择 [0-3]: " q_num
+        read -rp "请选择 [0-2]: " q_num
         case "$q_num" in
             1) manage_quic_udp443 "block" ;;
             2) manage_quic_udp443 "unblock" ;;
-            3) ;;
             0) return ;;
             *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
         esac
@@ -3775,16 +3806,8 @@ quic_menu() {
 # 系统菜单
 sys_menu() {
     while true; do
-        local ssh_port ssh_auth ddns dns quic
-        ssh_port=$(get_ssh_port_brief)
-        ssh_auth=$(get_ssh_auth_brief)
-        ddns=$(get_cf_ddns_brief_status)
-        dns=$(get_dns_brief_status)
-        quic=$(get_quic_status_brief)
         clear
         echo -e "${CYAN}================== 系统基础与极客管理 ==================${RESET}"
-        echo -e "  SSH: 端口 ${YELLOW}${ssh_port}${RESET} / ${YELLOW}${ssh_auth}${RESET}"
-        echo -e "  DDNS: ${YELLOW}${ddns}${RESET}   DNS: ${YELLOW}${dns}${RESET}   QUIC: ${YELLOW}${quic}${RESET}"
         echo -e "--------------------------------------------------------"
         echo -e "  ${YELLOW}1.${RESET} SSH 端口管理               ${GREEN}5.${RESET} Cloudflare DDNS 管理"
         echo -e "  ${YELLOW}2.${RESET} Root 密码修改              ${YELLOW}6.${RESET} DNS 管理中心（智能/锁定/恢复）"
@@ -3805,81 +3828,6 @@ sys_menu() {
             *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
         esac
     done
-}
-
-
-ssr_deploy_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}============= 节点部署中心 =============${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 原生部署 SS-Rust"
-        echo -e "${YELLOW} 2.${RESET} 自动部署 SS2022 + v2ray-plugin"
-        echo -e "${YELLOW} 3.${RESET} 原生部署 VLESS Reality"
-        echo -e " 0. 返回上一级"
-        echo -e "${CYAN}========================================${RESET}"
-        read -rp "请输入对应数字 [0-3]: " num
-        case "$num" in
-            1) install_ss_rust_native ;;
-            2) install_ss_v2ray_plugin_native ;;
-            3) install_vless_native ;;
-            0) return ;;
-            *) echo -e "${RED}请输入正确的选项！${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-ssr_ops_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}============= 节点运维中心 =============${RESET}"
-        echo -e "${GREEN} 1.${RESET} 统一节点管控中心 (查看 / 修改端口 / 删除 / 核爆)"
-        echo -e "${GREEN} 2.${RESET} 核心缓存与更新中心"
-        echo -e " 0. 返回上一级"
-        echo -e "${CYAN}========================================${RESET}"
-        read -rp "请输入对应数字 [0-2]: " num
-        case "$num" in
-            1) unified_node_manager ;;
-            2) core_cache_menu ;;
-            0) return ;;
-            *) echo -e "${RED}请输入正确的选项！${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-ssr_tools_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}========== 网络优化与维护工具 ===========${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 网络优化与系统清理 (手动常规/NAT + 清理)"
-        echo -e " 0. 返回上一级"
-        echo -e "${CYAN}========================================${RESET}"
-        read -rp "请输入对应数字 [0-1]: " num
-        case "$num" in
-            1) opt_menu ;;
-            0) return ;;
-            *) echo -e "${RED}请输入正确的选项！${RESET}"; sleep 1 ;;
-        esac
-    done
-}
-
-main_menu() {
-    clear
-    echo -e "${CYAN}============================================${RESET}"
-    echo -e "${CYAN}       SSR 综合智能管理脚本 v${SCRIPT_VERSION}${RESET}"
-    echo -e "${CYAN}============================================${RESET}"
-    echo -e "${YELLOW} 1.${RESET} 节点部署中心"
-    echo -e "${GREEN} 2.${RESET} 节点运维中心"
-    echo -e "${YELLOW} 3.${RESET} 网络优化与维护工具"
-    echo -e "${CYAN}============================================${RESET}"
-    echo -e " 0. 返回上级菜单"
-    read -rp "请输入对应数字 [0-3]: " num
-    case "$num" in
-        1) ssr_deploy_menu ;;
-        2) ssr_ops_menu ;;
-        3) ssr_tools_menu ;;
-        0) return 1 ;;
-        *) echo -e "${RED}请输入正确的选项！${RESET}"; sleep 1 ;;
-    esac
 }
 
 SSR_MODULE_EOF
@@ -5150,11 +5098,9 @@ count_forward_rules_brief() {
 
 nft_rule_center_menu() {
     while true; do
-        local rules
-        rules=$(count_forward_rules_brief)
         clear
         echo -e "${GREEN}==========================================${PLAIN}"
-        echo -e "${GREEN}          NFT 规则中心 (当前 ${rules} 条)         ${PLAIN}"
+        echo -e "${GREEN}                NFT 规则中心               ${PLAIN}"
         echo -e "${GREEN}==========================================${PLAIN}"
         echo "1. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
         echo "2. 规则管理 (查看/删除)"
@@ -6695,6 +6641,196 @@ nft_cli() {
     esac
 }
 
+status_timesync_brief() {
+    if have_cmd systemctl; then
+        if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+            printf %s "systemd-timesyncd"
+            return 0
+        elif systemctl is-active --quiet chronyd 2>/dev/null; then
+            printf %s "chronyd"
+            return 0
+        elif systemctl is-active --quiet ntpd 2>/dev/null; then
+            printf %s "ntpd"
+            return 0
+        fi
+    fi
+    printf %s "未启用"
+}
+
+status_cc_brief() {
+    local cc qdisc
+    cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo unknown)
+    qdisc=$(cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo unknown)
+    printf '%s + %s' "$cc" "$qdisc"
+}
+
+status_colorize() {
+    local level="$1" text="$2"
+    case "$level" in
+        ok) echo -e "${GREEN}${text}${RESET}" ;;
+        warn) echo -e "${YELLOW}${text}${RESET}" ;;
+        bad) echo -e "${RED}${text}${RESET}" ;;
+        info|*) echo -e "${CYAN}${text}${RESET}" ;;
+    esac
+}
+
+status_cc_colored() {
+    local cc qdisc
+    cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo unknown)
+    qdisc=$(cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo unknown)
+    if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
+        status_colorize ok "${cc} + ${qdisc}"
+    elif [[ "$cc" == "bbr" || "$qdisc" == "fq" ]]; then
+        status_colorize warn "${cc} + ${qdisc}"
+    else
+        status_colorize bad "${cc} + ${qdisc}"
+    fi
+}
+
+status_service_brief_line() {
+    local name="$1" label="$2"
+    local match pid_file port state extra="" level="info"
+    match=$(managed_service_match "$name" 2>/dev/null || true)
+    pid_file=$(managed_service_pid "$name" 2>/dev/null || true)
+    if managed_service_exists "$name"; then
+        port=$(managed_service_current_port "$name" 2>/dev/null || true)
+        [[ "$port" =~ ^[0-9]+$ ]] && extra=" / 端口 ${port}"
+        if service_is_running "$name" "$match" "$pid_file"; then
+            if [[ "$port" =~ ^[0-9]+$ ]] && ! port_in_use "$port" tcp 2>/dev/null; then
+                state="配置异常/端口未监听"
+                level="bad"
+            else
+                state="运行中"
+                level="ok"
+            fi
+        else
+            if [[ "$port" =~ ^[0-9]+$ ]] && port_in_use "$port" tcp 2>/dev/null; then
+                state="端口冲突"
+                level="bad"
+            else
+                state="已部署/未运行"
+                level="warn"
+            fi
+        fi
+    else
+        state="未部署"
+        level="bad"
+    fi
+    echo -e "  ${CYAN}${label}${RESET}: $(status_colorize "$level" "$state")${extra}"
+}
+
+status_ssh_line() {
+    local ssh_port ssh_auth
+    ssh_port=$(get_ssh_port_brief 2>/dev/null || echo 22)
+    ssh_auth=$(get_ssh_auth_brief 2>/dev/null || echo 未知)
+    if have_cmd sshd && ! sshd -t >/dev/null 2>&1; then
+        echo -e "  SSH: 端口 ${YELLOW}${ssh_port}${RESET} / $(status_colorize bad '配置异常') / ${YELLOW}${ssh_auth}${RESET}"
+    elif [[ "$ssh_port" =~ ^[0-9]+$ ]] && ! port_in_use "$ssh_port" tcp 2>/dev/null; then
+        echo -e "  SSH: 端口 ${YELLOW}${ssh_port}${RESET} / $(status_colorize bad '端口未监听') / ${YELLOW}${ssh_auth}${RESET}"
+    else
+        echo -e "  SSH: 端口 ${YELLOW}${ssh_port}${RESET} / $(status_colorize ok '正常') / ${YELLOW}${ssh_auth}${RESET}"
+    fi
+}
+
+status_nginx_line() {
+    local domains
+    domains=$(get_nginx_domains_brief 2>/dev/null || echo 0)
+    if have_cmd nginx && ! nginx -t >/dev/null 2>&1; then
+        echo -e "  Nginx 状态: $(status_colorize bad '配置异常') / 站点 ${YELLOW}${domains}${RESET}"
+    elif systemctl is-active --quiet nginx 2>/dev/null; then
+        echo -e "  Nginx 状态: $(status_colorize ok '运行中') / 站点 ${YELLOW}${domains}${RESET}"
+    elif [[ "$domains" =~ ^[0-9]+$ && "$domains" -gt 0 ]]; then
+        echo -e "  Nginx 状态: $(status_colorize warn '已配置未运行') / 站点 ${YELLOW}${domains}${RESET}"
+    else
+        echo -e "  Nginx 状态: $(status_colorize bad '未部署') / 站点 ${YELLOW}${domains}${RESET}"
+    fi
+}
+
+status_quic_line() {
+    local quic quic_backend
+    quic=$(get_quic_status_brief 2>/dev/null || echo 未知)
+    quic_backend=$(get_quic_backend 2>/dev/null || echo unknown)
+    if [[ "$quic" == 已阻断* ]]; then
+        echo -e "  QUIC / UDP443: $(status_colorize ok "$quic") / 后端 ${YELLOW}${quic_backend}${RESET}"
+    elif [[ "$quic" == 默认放行* ]]; then
+        echo -e "  QUIC / UDP443: $(status_colorize warn "$quic") / 后端 ${YELLOW}${quic_backend}${RESET}"
+    else
+        echo -e "  QUIC / UDP443: $(status_colorize info "$quic") / 后端 ${YELLOW}${quic_backend}${RESET}"
+    fi
+}
+
+status_page_loop() {
+    while true; do
+        local cc_brief ddns dns nft_rules nft_mode timesync ss_ver xr_ver
+        cc_brief=$(status_cc_brief)
+        ddns=$(get_cf_ddns_brief_status 2>/dev/null || echo "未知")
+        dns=$(get_dns_brief_status 2>/dev/null || echo "未知")
+        nft_rules=$(count_forward_rules_brief 2>/dev/null || echo 0)
+        nft_mode=$(settings_get "PERSIST_MODE" 2>/dev/null || echo "service")
+        timesync=$(status_timesync_brief)
+        ss_ver=$(ss_rust_current_tag 2>/dev/null || echo "-")
+        xr_ver=$(xray_current_tag 2>/dev/null || echo "-")
+
+        clear
+        echo -e "${CYAN}============================================================${RESET}"
+        echo -e "${CYAN}                    统一状态页 / 管理导航                   ${RESET}"
+        echo -e "${CYAN}============================================================${RESET}"
+        echo -e "${GREEN}网络调优${RESET}"
+        echo -e "  拥塞控制 / 队列: $(status_cc_colored)"
+        echo -e "  时间同步服务: ${YELLOW}${timesync}${RESET}"
+        echo -e ""
+        echo -e "${GREEN}代理节点${RESET}"
+        status_service_brief_line "ss-rust" "SS-Rust"
+        echo -e "  ${CYAN}SS-Rust 版本${RESET}: ${YELLOW}${ss_ver}${RESET}"
+        status_service_brief_line "ss-v2ray" "SS2022 + v2ray-plugin"
+        status_service_brief_line "xray" "VLESS Reality"
+        echo -e "  ${CYAN}Xray 版本${RESET}: ${YELLOW}${xr_ver}${RESET}"
+        echo -e ""
+        echo -e "${GREEN}端口转发 / Nginx${RESET}"
+        if [[ "$nft_rules" =~ ^[0-9]+$ && "$nft_rules" -gt 0 ]]; then
+            echo -e "  NFT 转发规则: $(status_colorize ok "$nft_rules 条") / 持久化模式 ${YELLOW}${nft_mode}${RESET}"
+        else
+            echo -e "  NFT 转发规则: $(status_colorize warn "0 条") / 持久化模式 ${YELLOW}${nft_mode}${RESET}"
+        fi
+        status_quic_line
+        status_nginx_line
+        echo -e ""
+        echo -e "${GREEN}系统基础与极客管理${RESET}"
+        status_ssh_line
+        echo -e "  DDNS: ${YELLOW}${ddns}${RESET}"
+        echo -e "  DNS: ${YELLOW}${dns}${RESET}"
+        echo -e ""
+        echo -e "${CYAN}快捷导航${RESET}"
+        echo -e "  ${YELLOW}1.${RESET} 代理节点与热更中心    ${YELLOW}4.${RESET} Nginx 反向代理"
+        echo -e "  ${YELLOW}2.${RESET} 端口转发 / NFT 中心  ${YELLOW}5.${RESET} DD / 重装系统中心"
+        echo -e "  ${YELLOW}3.${RESET} 系统基础与极客管理  ${YELLOW}6.${RESET} 刷新状态页"
+        echo -e "  0. 返回主菜单"
+        echo -e "${CYAN}============================================================${RESET}"
+        read -rp "请输入数字 [0-6]: " choice
+        case "$choice" in
+            1) run_ssr_module_menu ;;
+            2) run_nft_module_menu ;;
+            3) run_system_module_menu ;;
+            4) run_nginx_module_menu ;;
+            5) dd_menu ;;
+            6) ;;
+            0) return ;;
+            *) msg_err "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+run_status_page() {
+    ensure_runtime_ready_for_cli
+    (
+      source "${COMMON_MODULE_FILE}" || exit 1
+      source "${SSR_MODULE_FILE}" || exit 1
+      source "${NFT_MODULE_FILE}" || exit 1
+      source "${NGX_MODULE_FILE}" || exit 1
+      status_page_loop
+    )
+}
+
 # --------------------------
 # 综合管理目录
 # --------------------------
@@ -6728,20 +6864,22 @@ main_menu() {
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${CYAN}      综合管理脚本 my  v${MY_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${YELLOW} 1.${RESET} 代理节点与热更中心 (SSR)"
-    echo -e "${YELLOW} 2.${RESET} 端口转发 / NFT 中心"
-    echo -e "${YELLOW} 3.${RESET} 系统 / 建站 / 重装中心"
-    echo -e "${YELLOW} 4.${RESET} GitHub 一键更新"
-    echo -e "${YELLOW} 5.${RESET} 一键卸载"
+    echo -e "${YELLOW} 1.${RESET} 统一状态页 / 管理导航"
+    echo -e "${YELLOW} 2.${RESET} 代理节点与热更中心 (SSR)"
+    echo -e "${YELLOW} 3.${RESET} 端口转发 / NFT 中心"
+    echo -e "${YELLOW} 4.${RESET} 系统 / 建站 / 重装中心"
+    echo -e "${YELLOW} 5.${RESET} GitHub 一键更新"
+    echo -e "${YELLOW} 6.${RESET} 一键卸载"
     echo -e " 0. 退出"
     echo -e "${CYAN}--------------------------------------------${RESET}"
-    read -rp "请输入数字 [0-5]: " choice
+    read -rp "请输入数字 [0-6]: " choice
     case "$choice" in
-        1) run_ssr_module_menu ;;
-        2) run_nft_module_menu ;;
-        3) comprehensive_menu ;;
-        4) github_update ;;
-        5) uninstall_menu ;;
+        1) run_status_page ;;
+        2) run_ssr_module_menu ;;
+        3) run_nft_module_menu ;;
+        4) comprehensive_menu ;;
+        5) github_update ;;
+        6) uninstall_menu ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
@@ -6769,7 +6907,7 @@ ensure_runtime_ready_for_cli() {
     require_root
     install_self_command
     mkdir -p "${MY_STATE_DIR}" "${MY_SSR_STATE_DIR}" "${MY_NGX_STATE_DIR}" 2>/dev/null || true
-    [[ -f "${COMMON_MODULE_FILE}" && -f "${SSR_MODULE_FILE}" && -f "${NFT_MODULE_FILE}" && -f "${NGX_MODULE_FILE}" ]] || install_modules
+    install_modules
 }
 
 if [[ $# -gt 0 ]]; then
@@ -6803,13 +6941,17 @@ if [[ $# -gt 0 ]]; then
             dd_cli "$@"
             exit $?
             ;;
+        status)
+            run_status_page
+            exit $?
+            ;;
         update)
             ensure_runtime_ready_for_cli
             github_update
             exit $?
             ;;
         *)
-            msg_err "未知参数。可用: my clean | my ssr ... | my nft ... | my nginx <menu|list|delete <domain>|repair> | my dd <menu|debian13|debian12|ubuntu2404> | my update"
+            msg_err "未知参数。可用: my clean | my status | my ssr ... | my nft ... | my nginx <menu|list|delete <domain>|repair> | my dd <menu|debian13|debian12|ubuntu2404> | my update"
             exit 1
             ;;
     esac
