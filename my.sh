@@ -339,6 +339,8 @@ COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
 [[ -f "$COMMON_MODULE_FILE" ]] && source "$COMMON_MODULE_FILE"
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/99-my-auth.conf"
 readonly SSH_PORT_DROPIN="/etc/ssh/sshd_config.d/99-my-port.conf"
+readonly ROOT_SSH_DIR="/root/.ssh"
+readonly ROOT_AUTH_KEYS_FILE="${ROOT_SSH_DIR}/authorized_keys"
 readonly JOURNALD_BACKUP_FILE="${META_DIR}/journald.conf.bak"
 
 readonly DNS_BACKUP_DIR="${SSR_STATE_DIR}/dns"
@@ -588,9 +590,16 @@ sshd_effective_port() {
     printf %s "$port"
 }
 
+sshd_runtime_dump() {
+    have_cmd sshd || return 1
+    sshd -T -C user=root -C host=localhost -C addr=127.0.0.1 2>/dev/null && return 0
+    sshd -T 2>/dev/null && return 0
+    return 1
+}
+
 sshd_effective_value_runtime() {
     local key="$1"
-    sshd -T 2>/dev/null | awk -v k="$key" '$1==tolower(k) { $1=""; sub(/^[[:space:]]+/, ""); print; exit }'
+    sshd_runtime_dump 2>/dev/null | awk -v k="$key" '$1==tolower(k) { $1=""; sub(/^[[:space:]]+/, ""); print; exit }'
 }
 
 normalize_ssh_root_login_mode() {
@@ -606,23 +615,46 @@ normalize_ssh_root_login_mode() {
 
 port_listening_tcp() {
     local port="$1"
-    ss -lnt "( sport = :${port} )" 2>/dev/null | tail -n +2 | grep -q .
+    if have_cmd ss; then
+        ss -lnt "( sport = :${port} )" 2>/dev/null | tail -n +2 | grep -q . && return 0
+    fi
+    if have_cmd netstat; then
+        netstat -lnt 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END{exit !found}' && return 0
+    fi
+    if have_cmd lsof; then
+        lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | tail -n +2 | grep -q . && return 0
+    fi
+    return 1
+}
+
+ensure_root_authorized_keys() {
+    mkdir -p "$ROOT_SSH_DIR" 2>/dev/null || return 1
+    chmod 700 "$ROOT_SSH_DIR" 2>/dev/null || true
+    touch "$ROOT_AUTH_KEYS_FILE" 2>/dev/null || return 1
+    chmod 600 "$ROOT_AUTH_KEYS_FILE" 2>/dev/null || true
+    return 0
 }
 
 verify_ssh_runtime() {
     local expected_port="$1" expected_pass="$2" expected_root="$3"
-    local got_port got_pass got_root
+    local got_port got_pass got_root got_pub ok="0" i
     have_cmd sshd || return 1
     sshd -t >/dev/null 2>&1 || return 1
-    got_port=$(sshd_effective_port)
-    [[ "$got_port" == "$expected_port" ]] || return 1
-    got_pass=$(sshd_effective_value_runtime passwordauthentication | tr '[:upper:]' '[:lower:]')
-    [[ -z "$expected_pass" || "$got_pass" == "$expected_pass" ]] || return 1
-    got_root=$(normalize_ssh_root_login_mode "$(sshd_effective_value_runtime permitrootlogin)")
     expected_root=$(normalize_ssh_root_login_mode "$expected_root")
-    [[ -z "$expected_root" || "$got_root" == "$expected_root" ]] || return 1
-    port_listening_tcp "$expected_port" || return 1
-    return 0
+    for i in 1 2 3 4 5; do
+        got_port=$(sshd_effective_port)
+        got_pass=$(sshd_effective_value_runtime passwordauthentication | tr '[:upper:]' '[:lower:]')
+        got_pub=$(sshd_effective_value_runtime pubkeyauthentication | tr '[:upper:]' '[:lower:]')
+        got_root=$(normalize_ssh_root_login_mode "$(sshd_effective_value_runtime permitrootlogin)")
+        [[ -z "$got_pass" ]] && got_pass="yes"
+        [[ -z "$got_pub" ]] && got_pub="yes"
+        if [[ "$got_port" == "$expected_port" ]]            && [[ -z "$expected_pass" || "$got_pass" == "$expected_pass" ]]            && [[ "$got_pub" == "yes" ]]            && [[ -z "$expected_root" || "$got_root" == "$expected_root" ]]            && port_listening_tcp "$expected_port"; then
+            ok="1"
+            break
+        fi
+        sleep 1
+    done
+    [[ "$ok" == "1" ]]
 }
 
 service_use_systemd() {
@@ -2782,6 +2814,12 @@ sync_server_time() {
 apply_ssh_key_sec() {
     local cfg_bak dropin_bak="" port_bak=""
     local eff_port
+    ensure_root_authorized_keys || { echo -e "${RED}❌ 无法初始化 root 的 authorized_keys。${RESET}"; sleep 2; return 1; }
+    if ! grep -qE '^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp(256|384|521)) ' "$ROOT_AUTH_KEYS_FILE" 2>/dev/null; then
+        echo -e "${RED}❌ 未找到有效的 root 公钥，未启用仅密钥登录。${RESET}"
+        sleep 2
+        return 1
+    fi
     backup_file_once /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
     cfg_bak=$(make_runtime_backup /etc/ssh/sshd_config) || { echo -e "${RED}❌ SSH 配置备份失败。${RESET}"; sleep 2; return 1; }
     [[ -f "$SSH_AUTH_DROPIN" ]] && dropin_bak=$(make_runtime_backup "$SSH_AUTH_DROPIN" 2>/dev/null || true)
@@ -2844,15 +2882,15 @@ ssh_key_menu() {
         1)
             read -rp "GitHub用户名: " gh_user
             if [[ -n "$gh_user" ]]; then
-                mkdir -p ~/.ssh && chmod 700 ~/.ssh
-                touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+                ensure_root_authorized_keys || { echo -e "${RED}❌ 无法初始化 root 的 SSH 目录。${RESET}"; sleep 2; return; }
                 local keys
                 keys=$(fetch_github_user_keys "$gh_user" 2>/dev/null || true)
                 if [[ -n "$keys" ]]; then
-                    printf '%s\n' "$keys" >> ~/.ssh/authorized_keys
-                    sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys 2>/dev/null || true
+                    printf '%s
+' "$keys" >> "$ROOT_AUTH_KEYS_FILE"
+                    sort -u "$ROOT_AUTH_KEYS_FILE" -o "$ROOT_AUTH_KEYS_FILE" 2>/dev/null || true
                     echo -e "${GREEN}✅ 拉取成功！${RESET}"
-                    apply_ssh_key_sec || true
+                    apply_ssh_key_sec
                 else
                     echo -e "${RED}❌ 未找到公钥。${RESET}"
                     sleep 2
@@ -2862,26 +2900,24 @@ ssh_key_menu() {
         2)
             read -rp "粘贴公钥: " manual_key
             [[ -n "$manual_key" ]] && {
-                mkdir -p ~/.ssh && chmod 700 ~/.ssh
-                touch ~/.ssh/authorized_keys
-                echo "$manual_key" >> ~/.ssh/authorized_keys
-                sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys 2>/dev/null || true
-                chmod 600 ~/.ssh/authorized_keys
+                ensure_root_authorized_keys || { echo -e "${RED}❌ 无法初始化 root 的 SSH 目录。${RESET}"; sleep 2; return; }
+                echo "$manual_key" >> "$ROOT_AUTH_KEYS_FILE"
+                sort -u "$ROOT_AUTH_KEYS_FILE" -o "$ROOT_AUTH_KEYS_FILE" 2>/dev/null || true
+                chmod 600 "$ROOT_AUTH_KEYS_FILE"
                 echo -e "${GREEN}✅ 成功！${RESET}"
                 apply_ssh_key_sec
             }
             ;;
         3)
-            mkdir -p ~/.ssh && chmod 700 ~/.ssh
-            rm -f ~/.ssh/id_ed25519*
-            ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
-            touch ~/.ssh/authorized_keys
-            cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
-            sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys 2>/dev/null || true
-            chmod 600 ~/.ssh/authorized_keys
+            ensure_root_authorized_keys || { echo -e "${RED}❌ 无法初始化 root 的 SSH 目录。${RESET}"; sleep 2; return; }
+            rm -f "$ROOT_SSH_DIR"/id_ed25519*
+            ssh-keygen -t ed25519 -f "$ROOT_SSH_DIR/id_ed25519" -N "" -q
+            cat "$ROOT_SSH_DIR/id_ed25519.pub" >> "$ROOT_AUTH_KEYS_FILE"
+            sort -u "$ROOT_AUTH_KEYS_FILE" -o "$ROOT_AUTH_KEYS_FILE" 2>/dev/null || true
+            chmod 600 "$ROOT_AUTH_KEYS_FILE"
             echo -e "${RED}⚠️ 请保存以下私钥（只显示一次）！⚠️${RESET}
 "
-            cat ~/.ssh/id_ed25519
+            cat "$ROOT_SSH_DIR/id_ed25519"
             echo -e "
 ${YELLOW}========================${RESET}"
             read -rp "关闭密码登录 (y/N): " confirm
@@ -3659,7 +3695,7 @@ get_ssh_auth_brief() {
         pass=$(get_sshd_effective_value PasswordAuthentication)
         pub=$(get_sshd_effective_value PubkeyAuthentication)
     fi
-    [[ -s /root/.ssh/authorized_keys ]] && has_keys="1"
+    [[ -s "$ROOT_AUTH_KEYS_FILE" ]] && has_keys="1"
     [[ -z "$pass" ]] && pass="yes"
     [[ -z "$pub" ]] && pub="yes"
     pass=$(printf %s "$pass" | tr '[:upper:]' '[:lower:]')
