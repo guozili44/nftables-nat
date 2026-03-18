@@ -347,7 +347,7 @@ readonly DNS_BACKUP_DIR="${SSR_STATE_DIR}/dns"
 readonly LEGACY_DNS_BACKUP_DIR="/usr/local/etc/ssr_dns_backup"
 readonly DNS_META="${DNS_BACKUP_DIR}/meta.conf"
 readonly DNS_FILE_BAK="${DNS_BACKUP_DIR}/resolv.conf.bak"
-readonly RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/ssr-dns.conf"
+readonly RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/99-ssr-dns.conf"
 
 trap 'echo -e "\n${GREEN}已安全退出脚本。${RESET}"; exit 0' SIGINT
 
@@ -692,6 +692,29 @@ restart_ssh_safe() {
         return 0
     fi
     return 1
+}
+
+ssh_takeover_socket_activation() {
+    local svc=""
+    have_cmd systemctl || return 0
+
+    if systemctl list-unit-files --type=socket 2>/dev/null | grep -q '^ssh\.socket'; then
+        if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+            systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ssh\.service'; then
+        svc="ssh"
+    elif systemctl list-unit-files --type=service 2>/dev/null | grep -q '^sshd\.service'; then
+        svc="sshd"
+    fi
+
+    if [[ -n "$svc" ]]; then
+        systemctl enable "$svc" >/dev/null 2>&1 || true
+        systemctl start "$svc" >/dev/null 2>&1 || true
+    fi
+    return 0
 }
 
 json_get_path() {
@@ -1201,7 +1224,7 @@ nft_frontlayer_comment() {
 
 nft_frontlayer_ensure() {
     nft list table inet ssr_hot >/dev/null 2>&1 || nft add table inet ssr_hot >/dev/null 2>&1 || return 1
-    nft list chain inet ssr_hot prerouting >/dev/null 2>&1 || nft 'add chain inet ssr_hot prerouting { type nat hook prerouting priority dstnat; policy accept; }' >/dev/null 2>&1 || return 1
+    nft list chain inet ssr_hot prerouting >/dev/null 2>&1 || nft 'add chain inet ssr_hot prerouting { type nat hook prerouting priority -105; policy accept; }' >/dev/null 2>&1 || return 1
     return 0
 }
 
@@ -1435,13 +1458,13 @@ hot_handoff_named_service() {
     temp_cfg=$(mktemp "/tmp/${name}.handoff.XXXXXX.json") || return 1
     temp_pid=$(mktemp "/tmp/${name}.handoff.XXXXXX.pid") || { rm -f "$temp_cfg"; return 1; }
     temp_log="/var/log/${name}.handoff.${standby_port}.log"
-    cp -a "$cfg" "$temp_cfg" 2>/dev/null || { rm -f "$temp_cfg" "$temp_pid"; return 1; }
-    json_set_path "$temp_cfg" "$port_path" "$standby_port" number || { rm -f "$temp_cfg" "$temp_pid"; return 1; }
-    managed_service_validate_with_binary "$name" "$bin_path" "$temp_cfg" || { rm -f "$temp_cfg" "$temp_pid"; return 1; }
-    managed_service_launch_temp "$name" "$bin_path" "$temp_cfg" "$temp_log" "$temp_pid" || { rm -f "$temp_cfg" "$temp_pid"; return 1; }
+    cp -a "$cfg" "$temp_cfg" 2>/dev/null || { rm -f "$temp_cfg" "$temp_pid" "$temp_log"; return 1; }
+    json_set_path "$temp_cfg" "$port_path" "$standby_port" number || { rm -f "$temp_cfg" "$temp_pid" "$temp_log"; return 1; }
+    managed_service_validate_with_binary "$name" "$bin_path" "$temp_cfg" || { rm -f "$temp_cfg" "$temp_pid" "$temp_log"; return 1; }
+    managed_service_launch_temp "$name" "$bin_path" "$temp_cfg" "$temp_log" "$temp_pid" || { rm -f "$temp_cfg" "$temp_pid" "$temp_log"; return 1; }
     wait_port_listening "$standby_port" "$proto" 15 || {
         managed_service_stop_temp "$temp_pid"
-        rm -f "$temp_cfg"
+        rm -f "$temp_cfg" "$temp_pid" "$temp_log"
         return 1
     }
 
@@ -1449,7 +1472,7 @@ hot_handoff_named_service() {
     if ! frontlayer_redirect_upsert "$name" "$public_port" "$standby_port" "$proto"; then
         managed_service_stop_temp "$temp_pid"
         remove_firewall_rule "$standby_port" "$proto" >/dev/null 2>&1 || true
-        rm -f "$temp_cfg"
+        rm -f "$temp_cfg" "$temp_pid" "$temp_log"
         return 1
     fi
 
@@ -1463,7 +1486,7 @@ hot_handoff_named_service() {
         frontlayer_redirect_remove "$name" "$public_port" "$proto" >/dev/null 2>&1 || true
         managed_service_stop_temp "$temp_pid"
         remove_firewall_rule "$standby_port" "$proto" >/dev/null 2>&1 || true
-        rm -f "$temp_cfg"
+        rm -f "$temp_cfg" "$temp_pid" "$temp_log"
         return 1
     fi
 
@@ -1471,7 +1494,7 @@ hot_handoff_named_service() {
     wait_backend_drain "$standby_port" "$proto"
     managed_service_stop_temp "$temp_pid"
     remove_firewall_rule "$standby_port" "$proto" >/dev/null 2>&1 || true
-    rm -f "$temp_cfg"
+    rm -f "$temp_cfg" "$temp_pid" "$temp_log"
     return 0
 }
 
@@ -1881,6 +1904,27 @@ PYKEYS
     printf '%s\n' "$keys" | sed 's/\r$//' | sed '/^[[:space:]]*$/d'
 }
 
+github_latest_release_redirect_tag() {
+    # github_latest_release_redirect_tag "owner/repo"
+    local repo="$1" headers="" loc="" tag=""
+    [[ -n "$repo" ]] || return 1
+    if have_cmd curl; then
+        headers=$(curl -fsSI --connect-timeout 8 --max-time 20 "https://github.com/${repo}/releases/latest" 2>/dev/null || true)
+        loc=$(printf '%s
+' "$headers" | tr -d '
+' | awk 'BEGIN{IGNORECASE=1} /^location:[[:space:]]*/{sub(/^[Ll]ocation:[[:space:]]*/, ""); print; exit}')
+    fi
+    if [[ -z "$loc" ]] && have_cmd wget; then
+        headers=$(wget -S --max-redirect=0 -O /dev/null "https://github.com/${repo}/releases/latest" 2>&1 || true)
+        loc=$(printf '%s
+' "$headers" | tr -d '
+' | awk 'BEGIN{IGNORECASE=1} /^  [Ll]ocation:[[:space:]]*/{sub(/^  [Ll]ocation:[[:space:]]*/, ""); print; exit}')
+    fi
+    [[ -n "$loc" ]] || return 1
+    tag=$(printf '%s' "$loc" | sed -n 's#.*\/releases\/tag\/##p' | head -n1)
+    [[ -n "$tag" ]] && echo "$tag"
+}
+
 github_latest_tag() {
     # github_latest_tag "owner/repo"
     local repo="$1" body="" tag=""
@@ -1890,7 +1934,10 @@ github_latest_tag() {
         tag=$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null)
     fi
     if [[ -z "$tag" && -n "$body" ]]; then
-        tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+        tag=$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*//p' | head -n1)
+    fi
+    if [[ -z "$tag" || "$tag" == "null" ]]; then
+        tag=$(github_latest_release_redirect_tag "$repo" || true)
     fi
     [[ -n "$tag" && "$tag" != "null" ]] && echo "$tag"
 }
@@ -1900,11 +1947,10 @@ github_release_asset_url() {
     local repo="$1" tag="$2" asset_name="$3" body="" url=""
     [[ -n "$repo" && -n "$tag" && -n "$asset_name" ]] || return 1
     body=$(fetch_text_url "https://api.github.com/repos/${repo}/releases/tags/${tag}" || true)
-    [[ -n "$body" ]] || return 1
-    if have_cmd jq; then
+    if [[ -n "$body" ]] && have_cmd jq; then
         url=$(printf '%s' "$body" | jq -r --arg name "$asset_name" '.assets[]? | select(.name==$name) | .browser_download_url // empty' 2>/dev/null | head -n1)
     fi
-    if [[ -z "$url" ]] && have_cmd python3; then
+    if [[ -z "$url" && -n "$body" ]] && have_cmd python3; then
         url=$(python3 - "$asset_name" "$body" <<'PYURL'
 import json, sys
 asset = sys.argv[1]
@@ -1919,6 +1965,9 @@ except Exception:
     pass
 PYURL
 )
+    fi
+    if [[ -z "$url" ]]; then
+        url="https://github.com/${repo}/releases/download/${tag}/${asset_name}"
     fi
     [[ -n "$url" ]] && echo "$url"
 }
@@ -2623,6 +2672,7 @@ CF_TOKEN="${cf_token}"
 CF_ZONE_ID="${zone_id}"
 CF_RECORD="${cf_record}"
 LAST_IP=""
+LAST_TYPE=""
 EOF
     chmod 600 "$DDNS_CONF" 2>/dev/null || true
 
@@ -2643,41 +2693,52 @@ run_cf_ddns() {
     # shellcheck disable=SC1090
     source "$DDNS_CONF"
 
-    local current_ip
-    current_ip=$(curl -s4m8 https://api.ipify.org 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || true)
+    local current_v4="" current_v6="" current_ip="" record_type=""
+    current_v4=$(curl -s4m8 https://api.ipify.org 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || true)
+    current_v6=$(curl -s6m8 https://api64.ipify.org 2>/dev/null || curl -s6m8 ifconfig.me 2>/dev/null || true)
 
-    if [[ -z "$current_ip" ]]; then
+    if [[ -n "$current_v4" ]]; then
+        current_ip="$current_v4"
+        record_type="A"
+    elif [[ -n "$current_v6" ]]; then
+        current_ip="$current_v6"
+        record_type="AAAA"
+    fi
+
+    if [[ -z "$current_ip" || -z "$record_type" ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') - [错误] 无法获取公网 IP" >> "$DDNS_LOG"
+        [[ "$mode" == "manual" ]] && echo -e "${RED}❌ 无法获取公网 IPv4/IPv6。${RESET}"
         return
     fi
 
-    if [[ "$current_ip" == "$LAST_IP" && "$mode" != "manual" ]]; then
+    if [[ "$current_ip" == "$LAST_IP" && "$record_type" == "${LAST_TYPE:-}" && "$mode" != "manual" ]]; then
         return
     fi
 
-    [[ "$mode" == "manual" ]] && echo -e "${YELLOW}获取到当前 IP: $current_ip ，正在通信...${RESET}"
+    [[ "$mode" == "manual" ]] && echo -e "${YELLOW}获取到当前 ${record_type} IP: $current_ip ，正在通信...${RESET}"
 
     local record_response record_id api_result success
-    record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=A" \
-        -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
+    record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=${record_type}"         -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
     record_id=$(echo "$record_response" | jq -r '.result[0].id' 2>/dev/null)
 
     if [[ -z "$record_id" || "$record_id" == "null" ]]; then
-        api_result=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
-            -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-            --data "{\"type\":\"A\",\"name\":\"${CF_RECORD}\",\"content\":\"${current_ip}\",\"ttl\":60,\"proxied\":false}")
+        api_result=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"             -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json"             --data "{"type":"${record_type}","name":"${CF_RECORD}","content":"${current_ip}","ttl":60,"proxied":false}")
     else
-        api_result=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
-            -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-            --data "{\"type\":\"A\",\"name\":\"${CF_RECORD}\",\"content\":\"${current_ip}\",\"ttl\":60,\"proxied\":false}")
+        api_result=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}"             -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json"             --data "{"type":"${record_type}","name":"${CF_RECORD}","content":"${current_ip}","ttl":60,"proxied":false}")
     fi
 
     success=$(echo "$api_result" | jq -r '.success' 2>/dev/null)
     if [[ "$success" == "true" ]]; then
-        sed -i "s/^LAST_IP=.*/LAST_IP=\"${current_ip}\"/g" "$DDNS_CONF"
+        sed -i "s/^LAST_IP=.*/LAST_IP="${current_ip}"/g" "$DDNS_CONF"
+        if grep -q '^LAST_TYPE=' "$DDNS_CONF" 2>/dev/null; then
+            sed -i "s/^LAST_TYPE=.*/LAST_TYPE="${record_type}"/g" "$DDNS_CONF"
+        else
+            printf 'LAST_TYPE="%s"
+' "$record_type" >> "$DDNS_CONF"
+        fi
         chmod 600 "$DDNS_CONF" 2>/dev/null || true
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - [成功] IP 更新为: $current_ip" >> "$DDNS_LOG"
-        [[ "$mode" == "manual" ]] && echo -e "${GREEN}✅ 解析已更新为: $current_ip${RESET}"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [成功] ${record_type} 更新为: $current_ip" >> "$DDNS_LOG"
+        [[ "$mode" == "manual" ]] && echo -e "${GREEN}✅ ${record_type} 解析已更新为: $current_ip${RESET}"
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') - [失败] API响应: $api_result" >> "$DDNS_LOG"
         [[ "$mode" == "manual" ]] && echo -e "${RED}❌ 更新失败！${RESET}"
@@ -2703,16 +2764,14 @@ remove_cf_ddns() {
 
     echo -e "${CYAN}>>> 正在销毁云端解析记录...${RESET}"
     local record_response record_id
-    record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=A" \
-        -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
-
-    record_id=$(echo "$record_response" | jq -r '.result[0].id' 2>/dev/null)
-
-    if [[ -n "$record_id" && "$record_id" != "null" ]]; then
-        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
-            -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" > /dev/null 2>&1 || true
-        echo -e "${GREEN}✅ 云端记录已删除（若 API 权限允许）。${RESET}"
-    fi
+    for _rtype in A AAAA; do
+        record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=${_rtype}"             -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
+        while IFS= read -r record_id; do
+            [[ -z "$record_id" || "$record_id" == "null" ]] && continue
+            curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}"                 -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" > /dev/null 2>&1 || true
+        done < <(echo "$record_response" | jq -r '.result[]?.id' 2>/dev/null)
+    done
+    echo -e "${GREEN}✅ 云端记录已删除（若 API 权限允许）。${RESET}"
 
     rm -f "$DDNS_CONF" "$DDNS_LOG"
     crontab -l 2>/dev/null | grep -vE "(^|\s)(/usr/local/bin/my\s+ssr\s+ddns|/usr/local/bin/ssr\s+ddns)(\s|$)" | crontab - 2>/dev/null || true
@@ -2761,6 +2820,7 @@ change_ssh_port() {
         cfg_bak=$(make_runtime_backup /etc/ssh/sshd_config) || { echo -e "${RED}❌ SSH 配置备份失败。${RESET}"; sleep 2; return 1; }
         [[ -f "$SSH_PORT_DROPIN" ]] && dropin_bak=$(make_runtime_backup "$SSH_PORT_DROPIN" 2>/dev/null || true)
         old_port=$(sshd_effective_port 2>/dev/null || echo 22)
+        ssh_takeover_socket_activation >/dev/null 2>&1 || true
         add_firewall_rule "$new_port" tcp || true
         write_ssh_port_dropin "$new_port"
         if restart_ssh_safe && verify_ssh_runtime "$new_port" "" ""; then
@@ -3038,7 +3098,20 @@ install_vless_native() {
 
     mkdir -p /usr/local/etc/xray
     local uuid keys priv pub short_id
-    uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '\r')
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        uuid=$(tr -d '\r\n' < /proc/sys/kernel/random/uuid 2>/dev/null)
+    elif have_cmd uuidgen; then
+        uuid=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' | tr -d '\r\n')
+    elif have_cmd python3; then
+        uuid=$(python3 - <<'PYUUID' 2>/dev/null
+import uuid
+print(uuid.uuid4())
+PYUUID
+)
+        uuid=$(printf '%s' "$uuid" | tr -d '\r\n')
+    else
+        uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '\r')
+    fi
     keys=$(/usr/local/bin/xray x25519 2>&1 | tr -d '\r')
     priv=$(xray_extract_reality_private_key "$keys")
     pub=$(xray_extract_reality_public_key "$keys")
@@ -3399,7 +3472,7 @@ apply_profile_core() {
 
     render_sysctl_profile "$target" "$env" "$mode" "$tier"
     filter_supported_sysctl_file "$target"
-    sysctl --system >/dev/null 2>&1 || true
+    sysctl -e --system >/dev/null 2>&1 || true
     meta_set "SYSCTL_PROFILE" "${env}-${mode}"
     meta_set "SYSCTL_TIER" "$tier"
     echo -e "${GREEN}✅ 已应用 ${env} / $(profile_title "$mode") / ${tier} 档调优。${RESET}"
@@ -4465,8 +4538,59 @@ ensure_forwarding() {
         else
             echo "net.ipv4.ip_forward = 1" >> "$SYSCTL_FILE"
         fi
-        sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+        sysctl -e --system >/dev/null 2>&1 || sysctl -e -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
     fi
+}
+
+is_loopback_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^127\.([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]
+}
+
+nft_primary_uplink_iface() {
+    ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}'
+}
+
+nft_config_requires_route_localnet() {
+    local lp addr tp last_ip proto ip
+    while IFS='|' read -r lp addr tp last_ip proto; do
+        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
+        ip="$last_ip"
+        [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
+        is_loopback_ipv4 "$ip" && return 0
+    done < "$CONFIG_FILE"
+    return 1
+}
+
+nft_enable_route_localnet() {
+    local iface key val
+    mkdir -p /etc/sysctl.d 2>/dev/null || true
+    touch "$SYSCTL_FILE" 2>/dev/null || true
+
+    for key in net.ipv4.conf.all.route_localnet net.ipv4.conf.default.route_localnet; do
+        nft_sysctl_key_supported "$key" || continue
+        if grep -qE "^\s*${key//./\.}\s*=" "$SYSCTL_FILE" 2>/dev/null; then
+            sed -i "s|^\s*${key//./\.}\s*=.*|${key} = 1|g" "$SYSCTL_FILE"
+        else
+            echo "${key} = 1" >> "$SYSCTL_FILE"
+        fi
+        sysctl -w "${key}=1" >/dev/null 2>&1 || true
+    done
+
+    iface="$(nft_primary_uplink_iface)"
+    if [[ -n "$iface" ]]; then
+        key="net.ipv4.conf.${iface}.route_localnet"
+        if nft_sysctl_key_supported "$key"; then
+            if grep -qE "^\s*${key//./\.}\s*=" "$SYSCTL_FILE" 2>/dev/null; then
+                sed -i "s|^\s*${key//./\.}\s*=.*|${key} = 1|g" "$SYSCTL_FILE"
+            else
+                echo "${key} = 1" >> "$SYSCTL_FILE"
+            fi
+            sysctl -w "${key}=1" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    sysctl -e --system >/dev/null 2>&1 || sysctl -e -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
 }
 
 nft_apply_profile() {
@@ -4519,7 +4643,7 @@ nft_apply_profile() {
         nft_write_sysctl_line "$SYSCTL_FILE" "net.ipv4.tcp_notsent_lowat" "16384"
     fi
 
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+    sysctl -e --system >/dev/null 2>&1 || sysctl -e -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
 
     if have_cmd systemctl; then
         systemctl enable --now nftables >/dev/null 2>&1 || true
@@ -4685,6 +4809,7 @@ generate_nft_conf() {
 # --------------------------
 apply_rules_impl() {
     ensure_forwarding
+    nft_config_requires_route_localnet && nft_enable_route_localnet
     ensure_nft_mgr_service
 
     local tmp
@@ -4838,6 +4963,10 @@ add_forward_impl() {
     echo -e "${CYAN}正在解析并验证目标地址...${PLAIN}"
     tip="$(get_ip "$taddr")"
     [[ -z "$tip" ]] && { msg_err "错误: 解析失败，请检查域名或服务器网络/DNS。"; sleep 2; return 1; }
+
+    if is_loopback_ipv4 "$tip"; then
+        msg_info "检测到目标为本地回环地址 ${tip}：将自动开启 route_localnet 以允许外部流量 DNAT 到本机回环服务。"
+    fi
 
     local conf_bak
     conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
@@ -5299,6 +5428,11 @@ readonly NGX_TMP_DIR="${NGX_WORKDIR}/tmp"
 readonly NGX_LOG_DIR="/var/log/nginx"
 
 ngx_have_cmd() { command -v "$1" >/dev/null 2>&1; }
+ngx_certbot_deploy_hook_cmd() {
+    cat <<'EOF'
+sh -c 'if command -v nginx >/dev/null 2>&1; then nginx -s reload >/dev/null 2>&1 && exit 0; fi; if command -v systemctl >/dev/null 2>&1; then systemctl reload nginx >/dev/null 2>&1 && exit 0; systemctl restart nginx >/dev/null 2>&1 && exit 0; fi; if command -v service >/dev/null 2>&1; then service nginx reload >/dev/null 2>&1 && exit 0; service nginx restart >/dev/null 2>&1 && exit 0; fi; if command -v rc-service >/dev/null 2>&1; then rc-service nginx reload >/dev/null 2>&1 && exit 0; rc-service nginx restart >/dev/null 2>&1 && exit 0; fi; exit 0'
+EOF
+}
 ngx_msg_ok() { echo -e "${GREEN}$*${RESET}"; }
 ngx_msg_warn() { echo -e "${YELLOW}$*${RESET}"; }
 ngx_msg_err() { echo -e "${RED}$*${RESET}"; }
@@ -5571,6 +5705,8 @@ ngx_write_common_conf() {
     chmod 755 "$NGX_WEBROOT" 2>/dev/null || true
     cat > "$NGX_COMMON_CONF" <<'EOF'
 # managed-by=my-nginx-proxy
+server_names_hash_bucket_size 128;
+server_names_hash_max_size 4096;
 map $http_upgrade $my_proxy_connection_upgrade {
     default upgrade;
     ''      close;
@@ -5611,15 +5747,22 @@ ngx_domain_dns_hint() {
     [[ -n "$pub6" && -n "$dns6" && ",$dns6," != *",$pub6,"* ]] && ngx_msg_warn "提示：${domain} 的 IPv6 DNS 未命中本机公网 IPv6 ${pub6}。"
 }
 
+ngx_ipv6_supported() {
+    [[ -s /proc/net/if_inet6 ]]
+}
+
 ngx_render_http_conf() {
-    local domain="$1"
+    local domain="$1" v6_http=""
+    if ngx_ipv6_supported; then
+        v6_http='    listen [::]:80;'
+    fi
     cat <<EOF
 # managed-by=${MY_NGX_ID}
 # domain=${domain}
 # backend=${NGX_BACKEND_RAW}
 server {
     listen 80;
-    listen [::]:80;
+${v6_http}
     server_name ${domain};
 
     access_log ${NGX_LOG_DIR}/${domain}_access.log;
@@ -5651,14 +5794,18 @@ EOF
 }
 
 ngx_render_https_conf() {
-    local domain="$1"
+    local domain="$1" v6_http="" v6_https=""
+    if ngx_ipv6_supported; then
+        v6_http='    listen [::]:80;'
+        v6_https='    listen [::]:443 ssl http2 fastopen=256;'
+    fi
     cat <<EOF
 # managed-by=${MY_NGX_ID}
 # domain=${domain}
 # backend=${NGX_BACKEND_RAW}
 server {
     listen 80;
-    listen [::]:80;
+${v6_http}
     server_name ${domain};
 
     location ^~ /.well-known/acme-challenge/ {
@@ -5672,8 +5819,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl http2 fastopen=256;
+${v6_https}
     server_name ${domain};
 
     access_log ${NGX_LOG_DIR}/${domain}_access.log;
@@ -5890,7 +6037,7 @@ ngx_add_proxy() {
     fi
 
     ngx_msg_info "开始申请 SSL 证书..."
-    if ! certbot certonly --webroot -w "$NGX_WEBROOT" --non-interactive --agree-tos "${email_args[@]}" -d "$domain_name" >/dev/null 2>&1; then
+    if ! certbot certonly --webroot -w "$NGX_WEBROOT" --non-interactive --agree-tos --deploy-hook "$(ngx_certbot_deploy_hook_cmd)" "${email_args[@]}" -d "$domain_name" >/dev/null 2>&1; then
         ngx_delete_cert_if_exists "$domain_name"
         txn_abort "$txn"
         ngx_msg_err "SSL 证书申请失败，站点配置已通过事务回滚。"
