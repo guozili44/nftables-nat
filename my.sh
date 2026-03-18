@@ -460,17 +460,21 @@ cached_latest_tag() {
     if [[ -s "$file" ]]; then
         mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
         if [[ -n "$mtime" ]] && (( now - mtime < CORE_TAG_TTL )); then
-            cat "$file"
-            return 0
+            tag=$(tr -d '[:space:]' < "$file" 2>/dev/null || true)
+            [[ -n "$tag" ]] && { echo "$tag"; return 0; }
         fi
     fi
     tag=$(github_latest_tag "$repo" 2>/dev/null || true)
+    tag=$(printf '%s' "$tag" | tr -d '[:space:]')
     if [[ -n "$tag" && "$tag" != "null" ]]; then
         printf '%s' "$tag" > "$file"
         echo "$tag"
         return 0
     fi
-    [[ -s "$file" ]] && cat "$file"
+    if [[ -s "$file" ]]; then
+        tag=$(tr -d '[:space:]' < "$file" 2>/dev/null || true)
+        [[ -n "$tag" ]] && echo "$tag"
+    fi
 }
 
 ss_rust_current_tag() {
@@ -1918,8 +1922,7 @@ github_latest_release_redirect_tag() {
     if have_cmd curl; then
         final_url=$(curl -A 'Mozilla/5.0' -fsSL -o /dev/null -w '%{url_effective}' --connect-timeout 8 --max-time 20 "https://github.com/${repo}/releases/latest" 2>/dev/null || true)
     elif have_cmd wget; then
-        final_url=$(wget --user-agent='Mozilla/5.0' -O /dev/null -S "https://github.com/${repo}/releases/latest" 2>&1 | awk '/^  Location: /{loc=$2} END{gsub(/
-/,"",loc); print loc}' || true)
+        final_url=$(wget --user-agent='Mozilla/5.0' -O /dev/null -S "https://github.com/${repo}/releases/latest" 2>&1 | awk '/^  Location: /{loc=$2} END{gsub(/\r/,"",loc); gsub(/\n/,"",loc); print loc}' || true)
     fi
     [[ -n "$final_url" ]] || return 1
     tag=$(printf '%s' "$final_url" | sed -n 's#.*\/releases\/tag\/##p' | head -n1)
@@ -3250,18 +3253,30 @@ install_vless_native() {
     else
         echo -e "${CYAN}>>> 本地无可用 Xray 核心，开始联网下载...${RESET}"
         xray_latest=$(cached_latest_tag "XTLS/Xray-core" "xray")
+        xray_latest=$(printf '%s' "$xray_latest" | tr -d '[:space:]')
         [[ -z "$xray_latest" ]] && xray_latest="v26.2.6"
 
         tmpdir=$(mktemp -d /tmp/ssr-xray.XXXXXX)
         zipf="${tmpdir}/xray.zip"
-        local asset_name official_url api_url proxy_url
+        local asset_name official_url api_url proxy_url latest_url latest_proxy try_tag ok_url=""
         asset_name="Xray-linux-${xray_arch}.zip"
-        official_url="https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/${asset_name}"
-        api_url=$(github_release_asset_url "XTLS/Xray-core" "$xray_latest" "$asset_name" 2>/dev/null || true)
-        proxy_url="https://ghproxy.net/${official_url#https://}"
+        latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
+        latest_proxy="https://ghproxy.net/${latest_url#https://}"
 
-        echo -e "${CYAN}>>> 下载核心: ${xray_latest} (linux-${xray_arch}) ...${RESET}"
-        if ! download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
+        echo -e "${CYAN}>>> 下载核心: ${xray_latest:-latest} (linux-${xray_arch}) ...${RESET}"
+        for try_tag in "$xray_latest" "v26.2.6"; do
+            [[ -n "$try_tag" ]] || continue
+            official_url="https://github.com/XTLS/Xray-core/releases/download/${try_tag}/${asset_name}"
+            api_url=$(github_release_asset_url "XTLS/Xray-core" "$try_tag" "$asset_name" 2>/dev/null || true)
+            proxy_url="https://ghproxy.net/${official_url#https://}"
+            rm -f "$zipf" >/dev/null 2>&1 || true
+            if download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" "$latest_url" "$latest_proxy" && [[ -s "$zipf" ]] && unzip -t "$zipf" >/dev/null 2>&1; then
+                xray_latest="$try_tag"
+                ok_url=1
+                break
+            fi
+        done
+        if [[ -z "$ok_url" ]]; then
             echo -e "${RED}❌ 核心下载或校验失败。${RESET}"
             rm -rf "$tmpdir"
             sleep 3
@@ -3806,32 +3821,41 @@ update_xray_if_needed() {
     esac
 
     local latest; latest=$(cached_latest_tag "XTLS/Xray-core" "xray")
-    [[ -z "$latest" ]] && return 2
+    latest=$(printf '%s' "$latest" | tr -d '[:space:]')
 
     local current; current=$(meta_get "XRAY_TAG" || true)
     [[ -z "$current" ]] && current=$(xray_current_tag || true)
-    [[ -n "$current" && "$current" == "$latest" ]] && return 3
+    [[ -n "$latest" && -n "$current" && "$current" == "$latest" ]] && return 3
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-xray.XXXXXX)
     local zipf="${tmpdir}/xray.zip" candidate="${tmpdir}/xray"
-    local asset_name official_url api_url proxy_url
+    local asset_name official_url api_url proxy_url latest_url latest_proxy try_tag ok_tag=""
     asset_name="Xray-linux-${xray_arch}.zip"
-    official_url="https://github.com/XTLS/Xray-core/releases/download/${latest}/${asset_name}"
-    api_url=$(github_release_asset_url "XTLS/Xray-core" "$latest" "$asset_name" 2>/dev/null || true)
-    proxy_url="https://ghproxy.net/${official_url#https://}"
+    latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
+    latest_proxy="https://ghproxy.net/${latest_url#https://}"
 
-    if cache_restore_binary_tag "xray" "$latest" "$candidate" && run_with_timeout 3 "$candidate" version >/dev/null 2>&1 && run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1; then
-        :
+    if [[ -n "$latest" ]] && cache_restore_binary_tag "xray" "$latest" "$candidate" && run_with_timeout 3 "$candidate" version >/dev/null 2>&1 && run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1; then
+        ok_tag="$latest"
     else
-        if ! download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
-            rm -rf "$tmpdir"
-            return 2
-        fi
-        unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
-        [[ -x "$candidate" ]] || { rm -rf "$tmpdir"; return 2; }
-        run_with_timeout 3 "$candidate" version >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
-        run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
+        for try_tag in "$latest" "v26.2.6"; do
+            [[ -n "$try_tag" ]] || continue
+            official_url="https://github.com/XTLS/Xray-core/releases/download/${try_tag}/${asset_name}"
+            api_url=$(github_release_asset_url "XTLS/Xray-core" "$try_tag" "$asset_name" 2>/dev/null || true)
+            proxy_url="https://ghproxy.net/${official_url#https://}"
+            rm -f "$zipf" "$candidate" >/dev/null 2>&1 || true
+            if ! download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" "$latest_url" "$latest_proxy" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
+                continue
+            fi
+            unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
+            [[ -x "$candidate" ]] || continue
+            run_with_timeout 3 "$candidate" version >/dev/null 2>&1 || continue
+            run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1 || continue
+            ok_tag="$try_tag"
+            break
+        done
+        [[ -n "$ok_tag" ]] || { rm -rf "$tmpdir"; return 2; }
     fi
+    latest="$ok_tag"
 
     activate_binary_with_rollback "xray" "$latest" "$candidate" /usr/local/bin/xray "XRAY_TAG" "xray" "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/log/xray.log" "/var/run/xray.pid"
     local rc=$?
