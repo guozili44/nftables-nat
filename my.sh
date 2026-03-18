@@ -335,7 +335,7 @@ readonly SS_V2RAY_STATE="${META_DIR}/ss_v2ray.conf"
 readonly SWAP_MARK_FILE="${META_DIR}/swap_created_by_ssr"
 readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
 readonly LEGACY_META_DIR="/usr/local/etc/ssr_meta"
-readonly COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
+COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
 [[ -f "$COMMON_MODULE_FILE" ]] && source "$COMMON_MODULE_FILE"
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/99-my-auth.conf"
 readonly SSH_PORT_DROPIN="/etc/ssh/sshd_config.d/99-my-port.conf"
@@ -2344,7 +2344,7 @@ EOF
 
 dns_manual_set() {
     dns_backup
-    clear
+    clear 2>/dev/null || true
     echo -e "${CYAN}========= 手动设置 DNS =========${RESET}"
     echo -e "请输入 DNS 服务器地址（空格/逗号分隔），例如：${YELLOW}1.1.1.1 8.8.8.8${RESET}"
     echo -e "支持 IPv4/IPv6；留空回车取消。\n"
@@ -2466,7 +2466,7 @@ dns_status() {
 
 dns_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}========= DNS 管理中心 =========${RESET}"
         echo -e "${GREEN} 1.${RESET} 智能选优：稳定优先"
         echo -e "${GREEN} 2.${RESET} 智能选优：极致优化"
@@ -2507,7 +2507,7 @@ dns_menu() {
 }
 
 setup_cf_ddns() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${CYAN}========= 🌐 原生 Cloudflare DDNS 配置 =========${RESET}"
     echo -e "${YELLOW}前提：域名已托管到 Cloudflare，并准备好 API Token（需 Zone.DNS 读写权限）。${RESET}\n"
 
@@ -2639,7 +2639,7 @@ remove_cf_ddns() {
 
 cf_ddns_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}========= 🌐 动态域名解析 (Cloudflare DDNS) =========${RESET}"
         if [[ -f "$DDNS_CONF" ]]; then
             echo -e "---------------------------------"
@@ -2780,7 +2780,7 @@ restore_password_login() {
 }
 
 ssh_key_menu() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${CYAN}========= SSH 密钥登录管理 =========${RESET}"
     echo -e "${YELLOW} 1.${RESET} 自动拉取公钥 (GitHub)"
     echo -e "${YELLOW} 2.${RESET} 手动填写公钥"
@@ -2835,7 +2835,7 @@ ${YELLOW}========================${RESET}"
 }
 
 install_ss_rust_native() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${CYAN}========= 原生交互安装 SS-Rust =========${RESET}"
     read -rp "端口 [留空随机]: " port
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
@@ -2867,7 +2867,7 @@ EOF
 }
 
 install_vless_native() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${CYAN}========= 原生交互安装 VLESS Reality =========${RESET}"
     rm -f /etc/systemd/system/xray.service
 
@@ -2989,7 +2989,7 @@ EOF
 }
 
 install_ss_v2ray_plugin_native() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${CYAN}========= 自动部署 SS2022 + v2ray-plugin =========${RESET}"
     read -rp "端口 [留空随机]: " port
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
@@ -3059,7 +3059,7 @@ EOF
 
 unified_node_manager() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         local has_ss=0 has_v2=0 has_vless=0
         managed_service_exists "ss-rust" && has_ss=1
         managed_service_exists "ss-v2ray" && has_v2=1
@@ -3074,7 +3074,7 @@ unified_node_manager() {
         case "$node_choice" in
             1)
                 if [[ $has_ss -eq 1 ]]; then
-                    clear
+                    clear 2>/dev/null || true
                     local port
                     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
                     echo -e "---------------------------------"
@@ -3109,7 +3109,7 @@ unified_node_manager() {
                 ;;
             2)
                 if [[ $has_v2 -eq 1 ]]; then
-                    clear
+                    clear 2>/dev/null || true
                     local port
                     port=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
                     echo -e "---------------------------------"
@@ -3144,7 +3144,7 @@ unified_node_manager() {
                 ;;
             3)
                 if [[ $has_vless -eq 1 ]]; then
-                    clear
+                    clear 2>/dev/null || true
                     local port
                     port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
                     echo -e "---------------------------------"
@@ -3177,7 +3177,7 @@ unified_node_manager() {
                 ;;
             4)
                 while true; do
-                    clear
+                    clear 2>/dev/null || true
                     echo -e "${CYAN}========= ☢️ 全局强制核爆中心 =========${RESET}"
                     echo -e "${YELLOW}已改为序号选择，直接核爆已识别到的节点残留。${RESET}"
                     echo -e "---------------------------------"
@@ -3320,7 +3320,7 @@ apply_regular_profile() {
 
 opt_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}========= 网络优化与系统清理中心 =========${RESET}"
         echo -e "${GREEN} 1.${RESET} 常规机器调优：稳定优先"
         echo -e "${GREEN} 2.${RESET} 常规机器调优：极致优化"
@@ -3490,7 +3490,7 @@ report_update_result() {
 
 core_cache_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}========= 核心缓存与更新中心 =========${RESET}"
         echo
         echo -e "${GREEN} 1.${RESET} 更新 SS-Rust 核心"
@@ -3784,7 +3784,7 @@ manage_quic_udp443() {
 
 quic_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}========= QUIC 防火墙管理 (防 QoS) =========${RESET}"
         echo -e "${YELLOW}说明：阻断 UDP 443 可有效防止运营商对 UDP 流量的 QoS 和阻断，${RESET}"
         echo -e "${YELLOW}      强制科学代理流量回退至更稳定的 TCP 协议。${RESET}"
@@ -3806,7 +3806,7 @@ quic_menu() {
 # 系统菜单
 sys_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}================== 系统基础与极客管理 ==================${RESET}"
         echo -e "--------------------------------------------------------"
         echo -e "  ${YELLOW}1.${RESET} SSH 端口管理               ${GREEN}5.${RESET} Cloudflare DDNS 管理"
@@ -4423,7 +4423,7 @@ nft_apply_profile() {
 }
 
 optimize_system() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${GREEN}--- NFT 智能调优中心 ---${PLAIN}"
     echo "1) 稳定优先：保守提升转发与并发"
     echo "2) 极致优化：激进提升队列/并发/连接追踪"
@@ -4763,7 +4763,7 @@ add_forward() { with_lock add_forward_impl; }
 # 规则管理（查看/删除）
 # --------------------------
 view_and_del_forward_impl() {
-    clear
+    clear 2>/dev/null || true
     if [[ ! -s "$CONFIG_FILE" ]]; then
         msg_warn "当前没有任何转发规则。"
         read -rp "按回车返回主菜单..."
@@ -4918,7 +4918,7 @@ ddns_update() { with_lock ddns_update_impl; }
 # 定时任务管理（DDNS）
 # --------------------------
 manage_cron() {
-    clear
+    clear 2>/dev/null || true
     local my_cmd="/usr/local/bin/my"
     if crontab -l 2>/dev/null | grep -Fq "${my_cmd} nft --cron"; then
         echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) --- [已启用]${PLAIN}"
@@ -4951,7 +4951,7 @@ manage_cron() {
             sleep 2
             ;;
         3)
-            clear
+            clear 2>/dev/null || true
             if [[ -d "$LOG_DIR" ]] && ls "$LOG_DIR"/*.log >/dev/null 2>&1; then
                 echo -e "${GREEN}--- 近 7 天 DDNS 变动日志（末20行） ---${PLAIN}"
                 cat "$LOG_DIR"/*.log 2>/dev/null | tail -n 20
@@ -5071,7 +5071,7 @@ cleanup_nft_artifacts() {
 }
 
 uninstall_script_impl() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${RED}--- 卸载 nftables 端口转发管理面板 ---${PLAIN}"
     read -rp "警告: 此操作将删除本脚本、规则配置、定时任务、systemd 服务，并移除本脚本创建的 nft 表。确认？[y/N]: " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
@@ -5098,7 +5098,7 @@ count_forward_rules_brief() {
 
 nft_rule_center_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${GREEN}==========================================${PLAIN}"
         echo -e "${GREEN}                NFT 规则中心               ${PLAIN}"
         echo -e "${GREEN}==========================================${PLAIN}"
@@ -5121,7 +5121,7 @@ nft_rule_center_menu() {
 
 nft_tools_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${GREEN}==========================================${PLAIN}"
         echo -e "${GREEN}             NFT 工具与维护中心            ${PLAIN}"
         echo -e "${GREEN}==========================================${PLAIN}"
@@ -5144,7 +5144,7 @@ nft_tools_menu() {
 # 主菜单
 # --------------------------
 main_menu() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${GREEN}==========================================${PLAIN}"
     echo -e "${GREEN}     nftables 端口转发管理面板 (Pro)      ${PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
@@ -5856,7 +5856,7 @@ nginx_cleanup_artifacts() {
 
 nginx_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}================================================${RESET}"
         echo -e "${GREEN}      Nginx 反向代理与 HTTPS 管理中心         ${RESET}"
         echo -e "${CYAN}================================================${RESET}"
@@ -6107,7 +6107,7 @@ uninstall_all() {
 
 uninstall_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}========= 一键卸载中心 =========${RESET}"
         echo -e "${YELLOW} 1.${RESET} 一键卸载所有（SSR + NFT + Nginx + DD 临时文件 + my）"
         echo -e "${YELLOW} 2.${RESET} 一键卸载 SSR"
@@ -6139,21 +6139,65 @@ uninstall_menu() {
     done
 }
 
+ssr_deploy_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${CYAN}           代理节点部署中心 (SSR)          ${RESET}"
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${YELLOW} 1.${RESET} 安装 SS-Rust"
+        echo -e "${YELLOW} 2.${RESET} 安装 SS2022 + v2ray-plugin"
+        echo -e "${YELLOW} 3.${RESET} 安装 VLESS Reality"
+        echo -e " 0. 返回上一级"
+        echo -e "${CYAN}--------------------------------------------${RESET}"
+        read -rp "请输入数字 [0-3]: " choice
+        case "$choice" in
+            1) install_ss_rust_native ;;
+            2) install_ss_v2ray_plugin_native ;;
+            3) install_vless_native ;;
+            0) return ;;
+            *) msg_err "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+ssr_hub_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${CYAN}           代理节点与热更中心 (SSR)       ${RESET}"
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${YELLOW} 1.${RESET} 节点部署中心"
+        echo -e "${YELLOW} 2.${RESET} 节点运维中心"
+        echo -e "${YELLOW} 3.${RESET} 网络优化与系统清理中心"
+        echo -e "${YELLOW} 4.${RESET} 核心缓存与更新中心"
+        echo -e "${YELLOW} 5.${RESET} 系统基础与极客管理"
+        echo -e " 0. 返回主菜单"
+        echo -e "${CYAN}--------------------------------------------${RESET}"
+        read -rp "请输入数字 [0-5]: " choice
+        case "$choice" in
+            1) ssr_deploy_menu ;;
+            2) unified_node_manager ;;
+            3) opt_menu ;;
+            4) core_cache_menu ;;
+            5) sys_menu ;;
+            0) return ;;
+            *) msg_err "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
 run_ssr_module_menu() {
     my_enable_ssr_cron_tasks
     (
       source "${SSR_MODULE_FILE}" || exit 1
-      check_env
-      while true; do
-          main_menu || break
-      done
+      ssr_hub_menu
     )
 }
 
 run_system_module_menu() {
     (
       source "${SSR_MODULE_FILE}" || exit 1
-      check_env
       sys_menu
     )
 }
@@ -6162,7 +6206,6 @@ run_nft_module_menu() {
     (
       source "${NFT_MODULE_FILE}" || exit 1
       require_root
-      check_env
       # 自动检测并完成持久化设置（无单独菜单项）
       auto_persist_setup
       while true; do
@@ -6396,7 +6439,7 @@ ddtool_health_check() {
     global_ms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_GLOBAL" 2>/dev/null || true)"
     cn_ms="$(ddtool_measure_url_ms "$REINSTALL_UPSTREAM_CN" 2>/dev/null || true)"
 
-    clear
+    clear 2>/dev/null || true
     echo -e "${CYAN}========= 安装前网络与磁盘条件体检 =========${RESET}"
     echo -e "虚拟化: ${GREEN}${virt}${RESET}"
     echo -e "启动模式: ${GREEN}${boot}${RESET}"
@@ -6481,7 +6524,7 @@ ddtool_execute() {
     echo -e "${RED}如机器可用 IPMI/U盘/控制台，优先使用更稳妥的方式。${RESET}"
     echo
     ddtool_confirm_exec "确认继续请输入 YES: " || { ddtool_cleanup_temp; msg_warn "已取消，临时文件已清理。"; sleep 1; return 1; }
-    clear
+    clear 2>/dev/null || true
     echo -e "${CYAN}>>> 已开始执行：${action_desc}${RESET}"
     "${cmd[@]}"
     local rc=$?
@@ -6510,7 +6553,7 @@ ddtool_run_linux_reinstall() {
 
 dd_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}========= DD / 重装系统中心 =========${RESET}"
         echo -e "${GREEN} 1.${RESET} 一键重装 Debian 13"
         echo -e "${GREEN} 2.${RESET} 一键重装 Debian 12"
@@ -6641,6 +6684,14 @@ nft_cli() {
     esac
 }
 
+nft_status_eval() {
+    ( source "${NFT_MODULE_FILE}" >/dev/null 2>&1 || exit 1; "$@" )
+}
+
+nginx_status_eval() {
+    ( source "${NGX_MODULE_FILE}" >/dev/null 2>&1 || exit 1; "$@" )
+}
+
 status_timesync_brief() {
     if have_cmd systemctl; then
         if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
@@ -6734,7 +6785,7 @@ status_ssh_line() {
 
 status_nginx_line() {
     local domains
-    domains=$(get_nginx_domains_brief 2>/dev/null || echo 0)
+    domains=$(nginx_status_eval get_nginx_domains_brief 2>/dev/null || echo 0)
     if have_cmd nginx && ! nginx -t >/dev/null 2>&1; then
         echo -e "  Nginx 状态: $(status_colorize bad '配置异常') / 站点 ${YELLOW}${domains}${RESET}"
     elif systemctl is-active --quiet nginx 2>/dev/null; then
@@ -6748,8 +6799,8 @@ status_nginx_line() {
 
 status_quic_line() {
     local quic quic_backend
-    quic=$(get_quic_status_brief 2>/dev/null || echo 未知)
-    quic_backend=$(get_quic_backend 2>/dev/null || echo unknown)
+    quic=$(nft_status_eval get_quic_status_brief 2>/dev/null || echo 未知)
+    quic_backend=$(nft_status_eval get_quic_backend 2>/dev/null || echo unknown)
     if [[ "$quic" == 已阻断* ]]; then
         echo -e "  QUIC / UDP443: $(status_colorize ok "$quic") / 后端 ${YELLOW}${quic_backend}${RESET}"
     elif [[ "$quic" == 默认放行* ]]; then
@@ -6765,13 +6816,13 @@ status_page_loop() {
         cc_brief=$(status_cc_brief)
         ddns=$(get_cf_ddns_brief_status 2>/dev/null || echo "未知")
         dns=$(get_dns_brief_status 2>/dev/null || echo "未知")
-        nft_rules=$(count_forward_rules_brief 2>/dev/null || echo 0)
-        nft_mode=$(settings_get "PERSIST_MODE" 2>/dev/null || echo "service")
+        nft_rules=$(nft_status_eval count_forward_rules_brief 2>/dev/null || echo 0)
+        nft_mode=$(nft_status_eval settings_get "PERSIST_MODE" 2>/dev/null || echo "service")
         timesync=$(status_timesync_brief)
         ss_ver=$(ss_rust_current_tag 2>/dev/null || echo "-")
         xr_ver=$(xray_current_tag 2>/dev/null || echo "-")
 
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}============================================================${RESET}"
         echo -e "${CYAN}                    统一状态页 / 管理导航                   ${RESET}"
         echo -e "${CYAN}============================================================${RESET}"
@@ -6825,8 +6876,6 @@ run_status_page() {
     (
       source "${COMMON_MODULE_FILE}" || exit 1
       source "${SSR_MODULE_FILE}" || exit 1
-      source "${NFT_MODULE_FILE}" || exit 1
-      source "${NGX_MODULE_FILE}" || exit 1
       status_page_loop
     )
 }
@@ -6836,7 +6885,7 @@ run_status_page() {
 # --------------------------
 comprehensive_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${CYAN}============================================${RESET}"
         echo -e "${CYAN}         系统 / 建站 / 重装中心            ${RESET}"
         echo -e "${CYAN}============================================${RESET}"
@@ -6860,7 +6909,7 @@ comprehensive_menu() {
 # 主菜单
 # --------------------------
 main_menu() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${CYAN}      综合管理脚本 my  v${MY_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
