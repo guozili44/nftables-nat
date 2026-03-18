@@ -2857,17 +2857,196 @@ change_root_password() {
     sleep 2
 }
 
-sync_server_time() {
-    echo -e "${CYAN}>>> 正在同步时间...${RESET}"
-    if have_cmd apt-get; then
-        apt-get update -qq
-        apt-get install -yqq systemd-timesyncd >/dev/null 2>&1 || true
-        systemctl enable --now systemd-timesyncd 2>/dev/null || true
-    elif have_cmd yum; then
-        yum install -yq chrony >/dev/null 2>&1 || true
-        systemctl enable --now chronyd 2>/dev/null || true
+timesync_unit_exists() {
+    local svc="$1"
+    [[ -z "$svc" ]] && return 1
+    if have_cmd systemctl; then
+        systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 && return 0
+        systemctl cat "${svc}.service" >/dev/null 2>&1 && return 0
     fi
-    echo -e "${GREEN}✅ 同步服务已启动（若系统支持）。${RESET}"
+    case "$svc" in
+        systemd-timesyncd)
+            [[ -f /lib/systemd/system/systemd-timesyncd.service || -f /usr/lib/systemd/system/systemd-timesyncd.service || -x /lib/systemd/systemd-timesyncd || -x /usr/lib/systemd/systemd-timesyncd ]] && return 0
+            ;;
+        chronyd|chrony)
+            [[ -f /lib/systemd/system/chronyd.service || -f /usr/lib/systemd/system/chronyd.service || -f /lib/systemd/system/chrony.service || -f /usr/lib/systemd/system/chrony.service || -x /usr/sbin/chronyd || -x /usr/bin/chronyd ]] && return 0
+            ;;
+        ntpd|ntp)
+            [[ -f /lib/systemd/system/ntpd.service || -f /usr/lib/systemd/system/ntpd.service || -f /lib/systemd/system/ntp.service || -f /usr/lib/systemd/system/ntp.service || -x /usr/sbin/ntpd || -x /usr/bin/ntpd ]] && return 0
+            ;;
+    esac
+    return 1
+}
+
+timesync_active_service() {
+    local svc
+    for svc in systemd-timesyncd chronyd chrony ntpd ntp; do
+        if have_cmd systemctl; then
+            if systemctl is-active --quiet "$svc" 2>/dev/null || systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
+                printf '%s' "$svc"
+                return 0
+            fi
+        else
+            pgrep -x "$svc" >/dev/null 2>&1 && { printf '%s' "$svc"; return 0; }
+        fi
+    done
+    return 1
+}
+
+timesync_enabled_service() {
+    local svc
+    for svc in systemd-timesyncd chronyd chrony ntpd ntp; do
+        if have_cmd systemctl; then
+            if systemctl is-enabled --quiet "$svc" 2>/dev/null || systemctl is-enabled --quiet "${svc}.service" 2>/dev/null; then
+                printf '%s' "$svc"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+timesync_preferred_service() {
+    local svc
+    for svc in systemd-timesyncd chronyd chrony ntpd ntp; do
+        timesync_unit_exists "$svc" && { printf '%s' "$svc"; return 0; }
+    done
+    return 1
+}
+
+timesync_enable_service() {
+    local svc="$1"
+    [[ -z "$svc" ]] && return 1
+    if have_cmd systemctl; then
+        systemctl enable --now "$svc" >/dev/null 2>&1 && return 0
+        systemctl enable --now "${svc}.service" >/dev/null 2>&1 && return 0
+    fi
+    if have_cmd service; then
+        service "$svc" start >/dev/null 2>&1 && return 0
+    fi
+    if have_cmd rc-service; then
+        rc-service "$svc" start >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+timesync_probe_status() {
+    local virt active_svc enabled_svc ntp synced
+    virt="$(ddtool_get_virt_type 2>/dev/null || echo unknown)"
+    active_svc="$(timesync_active_service 2>/dev/null || true)"
+    enabled_svc="$(timesync_enabled_service 2>/dev/null || true)"
+    ntp=""
+    synced=""
+    if have_cmd timedatectl; then
+        ntp="$(timedatectl show -p NTP --value 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+        synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+    fi
+    if [[ "$synced" == "yes" ]]; then
+        printf 'synced|%s|%s|%s' "${active_svc:-${enabled_svc:-ntp}}" "$ntp" "$virt"
+        return 0
+    fi
+    if [[ -n "$active_svc" ]]; then
+        if [[ "$ntp" == "yes" ]]; then
+            printf 'running|%s|%s|%s' "$active_svc" "$ntp" "$virt"
+        else
+            printf 'service_only|%s|%s|%s' "$active_svc" "$ntp" "$virt"
+        fi
+        return 0
+    fi
+    if [[ "$ntp" == "yes" ]]; then
+        case "$virt" in
+            openvz|lxc|lxc-libvirt|docker|podman|container-other|container)
+                printf 'host|%s|%s|%s' "${enabled_svc:-host}" "$ntp" "$virt"
+                return 0
+                ;;
+        esac
+        printf 'enabled|%s|%s|%s' "${enabled_svc:-ntp}" "$ntp" "$virt"
+        return 0
+    fi
+    if [[ -n "$enabled_svc" ]]; then
+        printf 'enabled|%s|%s|%s' "$enabled_svc" "$ntp" "$virt"
+        return 0
+    fi
+    case "$virt" in
+        openvz|lxc|lxc-libvirt|docker|podman|container-other|container)
+            printf 'container|%s|%s|%s' "-" "$ntp" "$virt"
+            return 0
+            ;;
+    esac
+    printf 'off|-|%s|%s' "$ntp" "$virt"
+}
+
+status_timesync_brief() {
+    local state svc _ntp virt
+    IFS='|' read -r state svc _ntp virt <<<"$(timesync_probe_status 2>/dev/null || echo 'off|-|-|unknown')"
+    case "$state" in
+        synced) printf '已同步(%s)' "$svc" ;;
+        running) printf '运行中/待同步(%s)' "$svc" ;;
+        service_only) printf '服务运行中(%s)' "$svc" ;;
+        enabled) printf '已启用/待同步(%s)' "$svc" ;;
+        host) printf '宿主管理/已启用(%s)' "$virt" ;;
+        container) printf '容器受限/宿主管理(%s)' "$virt" ;;
+        *) printf %s '未启用' ;;
+    esac
+}
+
+status_timesync_line() {
+    local text
+    text="$(status_timesync_brief)"
+    case "$text" in
+        已同步*) echo -e "  时间同步服务: $(status_colorize ok \"$text\")" ;;
+        运行中/*|服务运行中*|已启用/*|宿主管理/*|容器受限/*) echo -e "  时间同步服务: $(status_colorize info \"$text\")" ;;
+        *) echo -e "  时间同步服务: $(status_colorize warn \"$text\")" ;;
+    esac
+}
+
+sync_server_time() {
+    local svc state svc_name _ntp virt
+    echo -e "${CYAN}>>> 正在启用时间同步服务...${RESET}"
+    if have_cmd timedatectl; then
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+    fi
+    svc="$(timesync_preferred_service 2>/dev/null || true)"
+    if [[ -z "$svc" ]]; then
+        if have_cmd apt-get; then
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -yqq systemd-timesyncd >/dev/null 2>&1 || apt-get install -yqq chrony >/dev/null 2>&1 || true
+        elif have_cmd dnf; then
+            dnf install -y chrony >/dev/null 2>&1 || true
+        elif have_cmd yum; then
+            yum install -yq chrony >/dev/null 2>&1 || true
+        elif have_cmd apk; then
+            apk add --no-cache chrony >/dev/null 2>&1 || true
+        fi
+        svc="$(timesync_preferred_service 2>/dev/null || true)"
+    fi
+    if [[ -n "$svc" ]]; then
+        timesync_enable_service "$svc" >/dev/null 2>&1 || true
+    fi
+    if have_cmd timedatectl; then
+        timedatectl set-ntp true >/dev/null 2>&1 || true
+    fi
+    sleep 2
+    IFS='|' read -r state svc_name _ntp virt <<<"$(timesync_probe_status 2>/dev/null || echo 'off|-|-|unknown')"
+    case "$state" in
+        synced)
+            echo -e "${GREEN}✅ 时间同步已生效：${svc_name}（已同步）。${RESET}"
+            ;;
+        running|service_only|enabled)
+            echo -e "${GREEN}✅ 时间同步服务已启动：${svc_name}。${RESET}"
+            echo -e "${YELLOW}提示：服务已启用，但可能需要等待几十秒到几分钟完成首次同步。${RESET}"
+            ;;
+        host|container)
+            echo -e "${YELLOW}⚠ 当前环境为 ${virt}，时间可能由宿主机统一管理。${RESET}"
+            echo -e "${YELLOW}状态检测：$(status_timesync_brief)${RESET}"
+            ;;
+        *)
+            echo -e "${RED}❌ 未检测到可用的时间同步服务生效。${RESET}"
+            if [[ -n "$svc" ]]; then
+                echo -e "${YELLOW}已尝试启用：${svc}${RESET}"
+            fi
+            ;;
+    esac
     sleep 2
 }
 
@@ -6967,22 +7146,6 @@ nginx_status_eval() {
     ( source "${NGX_MODULE_FILE}" >/dev/null 2>&1 || exit 1; "$@" )
 }
 
-status_timesync_brief() {
-    if have_cmd systemctl; then
-        if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
-            printf %s "systemd-timesyncd"
-            return 0
-        elif systemctl is-active --quiet chronyd 2>/dev/null; then
-            printf %s "chronyd"
-            return 0
-        elif systemctl is-active --quiet ntpd 2>/dev/null; then
-            printf %s "ntpd"
-            return 0
-        fi
-    fi
-    printf %s "未启用"
-}
-
 status_cc_brief() {
     local cc qdisc
     cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo unknown)
@@ -7107,7 +7270,7 @@ status_page_loop() {
         echo -e "${CYAN}============================================================${RESET}"
         echo -e "${GREEN}网络调优${RESET}"
         echo -e "  拥塞控制 / 队列: $(status_cc_colored)"
-        echo -e "  时间同步服务: ${YELLOW}${timesync}${RESET}"
+        status_timesync_line
         echo -e ""
         echo -e "${GREEN}代理节点${RESET}"
         status_service_brief_line "ss-rust" "SS-Rust"
