@@ -3206,8 +3206,8 @@ install_vless_native() {
     echo -e "${CYAN}========= 原生交互安装 VLESS Reality =========${RESET}"
     rm -f /etc/systemd/system/xray.service
 
-    read -rp "伪装域名 [默认 publicassets.cdn-apple.com]: " sni_domain
-    [[ -z "$sni_domain" ]] && sni_domain="publicassets.cdn-apple.com"
+    read -rp "伪装域名 [默认 updates.cdn-apple.com]: " sni_domain
+    [[ -z "$sni_domain" ]] && sni_domain="updates.cdn-apple.com"
 
     read -rp "监听端口 [留空随机]: " port
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
@@ -3345,8 +3345,8 @@ install_ss_v2ray_plugin_native() {
     fi
     ss_pick_method_password || return
     ensure_ss_rust_binary || return
-    read -rp "伪装域名 Host [默认 www.microsoft.com]: " host
-    [[ -z "$host" ]] && host="www.microsoft.com"
+    read -rp "伪装域名 Host [默认 updates.cdn-apple.com]: " host
+    [[ -z "$host" ]] && host="updates.cdn-apple.com"
     read -rp "WebSocket Path [默认随机]: " path
     [[ -z "$path" ]] && path="/$(random_token 8)"
     [[ "$path" == /* ]] || path="/${path}"
@@ -3426,9 +3426,12 @@ unified_node_manager() {
                     local port
                     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
                     echo -e "---------------------------------"
-                    echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 修改密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
+                    echo -e "${YELLOW}1) 查看节点链接信息${RESET} | ${YELLOW}2) 修改端口${RESET} | ${YELLOW}3) 修改密码${RESET} | ${RED}4) 删除节点${RESET} | 0) 返回"
                     read -rp "输入操作: " op
                     if [[ "$op" == "1" ]]; then
+                        show_ss_rust_summary
+                        read -n1 -rsp "按任意键返回..." _
+                    elif [[ "$op" == "2" ]]; then
                         read -rp "新端口 (1-65535): " np
                         if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
                             if apply_json_named_service_port_change /etc/ss-rust/config.json server_port "$np" "$port" "ss-rust"; then
@@ -3440,7 +3443,7 @@ unified_node_manager() {
                             echo -e "${RED}❌ 端口无效${RESET}"
                         fi
                         sleep 1
-                    elif [[ "$op" == "2" ]]; then
+                    elif [[ "$op" == "3" ]]; then
                         read -rp "新密码: " npwd
                         [[ -z "$npwd" ]] && { echo -e "${RED}❌ 密码不能为空${RESET}"; sleep 1; continue; }
                         if apply_json_named_service_change /etc/ss-rust/config.json password "$npwd" string "ss-rust"; then
@@ -3449,7 +3452,7 @@ unified_node_manager() {
                             echo -e "${RED}❌ 修改失败，已自动回滚${RESET}"
                         fi
                         sleep 1
-                    elif [[ "$op" == "3" ]]; then
+                    elif [[ "$op" == "4" ]]; then
                         managed_service_destroy "ss-rust"
                         sleep 1
                     fi
@@ -3461,9 +3464,12 @@ unified_node_manager() {
                     local port
                     port=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
                     echo -e "---------------------------------"
-                    echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 修改密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
+                    echo -e "${YELLOW}1) 查看节点链接信息${RESET} | ${YELLOW}2) 修改端口${RESET} | ${YELLOW}3) 修改密码${RESET} | ${RED}4) 删除节点${RESET} | 0) 返回"
                     read -rp "输入操作: " op
                     if [[ "$op" == "1" ]]; then
+                        show_ss_v2ray_summary
+                        read -n1 -rsp "按任意键返回..." _
+                    elif [[ "$op" == "2" ]]; then
                         read -rp "新端口 (1-65535): " np
                         if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
                             if apply_json_named_service_port_change "$SS_V2RAY_CONF" server_port "$np" "$port" "ss-v2ray"; then
@@ -3475,7 +3481,7 @@ unified_node_manager() {
                             echo -e "${RED}❌ 端口无效${RESET}"
                         fi
                         sleep 1
-                    elif [[ "$op" == "2" ]]; then
+                    elif [[ "$op" == "3" ]]; then
                         read -rp "新密码: " npwd
                         [[ -z "$npwd" ]] && { echo -e "${RED}❌ 密码不能为空${RESET}"; sleep 1; continue; }
                         if apply_json_named_service_change "$SS_V2RAY_CONF" password "$npwd" string "ss-v2ray"; then
@@ -3484,7 +3490,7 @@ unified_node_manager() {
                             echo -e "${RED}❌ 修改失败，已自动回滚${RESET}"
                         fi
                         sleep 1
-                    elif [[ "$op" == "3" ]]; then
+                    elif [[ "$op" == "4" ]]; then
                         managed_service_destroy "ss-v2ray"
                         sleep 1
                     fi
@@ -3496,9 +3502,12 @@ unified_node_manager() {
                     local port
                     port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
                     echo -e "---------------------------------"
-                    echo -e "${YELLOW}1) 修改端口${RESET} | ${YELLOW}2) 重启节点${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
+                    echo -e "${YELLOW}1) 查看节点链接信息${RESET} | ${YELLOW}2) 修改端口${RESET} | ${YELLOW}3) 重启节点${RESET} | ${RED}4) 删除节点${RESET} | 0) 返回"
                     read -rp "输入操作: " op
                     if [[ "$op" == "1" ]]; then
+                        show_vless_summary
+                        read -n1 -rsp "按任意键返回..." _
+                    elif [[ "$op" == "2" ]]; then
                         read -rp "新端口 (1-65535): " np
                         if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
                             if apply_json_named_service_port_change /usr/local/etc/xray/config.json inbounds.0.port "$np" "$port" "xray"; then
@@ -3510,14 +3519,14 @@ unified_node_manager() {
                             echo -e "${RED}❌ 端口无效${RESET}"
                         fi
                         sleep 1
-                    elif [[ "$op" == "2" ]]; then
+                    elif [[ "$op" == "3" ]]; then
                         if restart_named_service "xray" >/dev/null 2>&1; then
                             echo -e "${GREEN}✅ 已重启${RESET}"
                         else
                             echo -e "${RED}❌ 重启失败，请检查配置或日志${RESET}"
                         fi
                         sleep 1
-                    elif [[ "$op" == "3" ]]; then
+                    elif [[ "$op" == "4" ]]; then
                         managed_service_destroy "xray"
                         sleep 1
                     fi
