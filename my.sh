@@ -4178,7 +4178,7 @@ ${YELLOW}========================${RESET}"
 
 # ===== 基于用户上传 TXT 替换的 Xray Reality / Shadowsocks-2022 逻辑 =====
 
-
+# Xray protocol helpers
 ensure_jq_available() {
     if have_cmd jq; then
         return 0
@@ -4202,7 +4202,7 @@ ensure_jq_available() {
     return 1
 }
 
- {
+xray_protocol_config_path() {
     printf %s "/usr/local/etc/xray/config.json"
 }
 
