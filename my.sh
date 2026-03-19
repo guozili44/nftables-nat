@@ -1722,7 +1722,8 @@ text = open(path, 'r', encoding='utf-8', errors='ignore').read()
 out = []
 changed = False
 for line in text.splitlines(True):
-    if re.match(r'^\s*listen\s+.*(?:\b443\b|:443\b)', line) and ';' in line and not line.lstrip().startswith('#'):
+    stripped = line.lstrip()
+    if re.match(r'^\s*listen\s+.*(?:\b443\b|:443\b)', line) and ';' in line and not stripped.startswith('#'):
         indent = re.match(r'^(\s*)', line).group(1)
         body = line.strip()
         body = re.sub(r'^listen\s+', '', body)
@@ -1732,11 +1733,17 @@ for line in text.splitlines(True):
             out.append(line)
             continue
         addr = tokens[0]
-        rest = ' '.join(tokens[1:])
-        new_addr = '[::1]:8443' if '[::]' in addr else '127.0.0.1:8443'
+        opts = []
+        for token in tokens[1:]:
+            low = token.lower()
+            if low in ('default_server', 'reuseport', 'quic', 'http3'):
+                changed = True
+                continue
+            opts.append(token)
+        new_addr = '[::1]:8443' if ('[::]' in addr or '[::1]' in addr) else '127.0.0.1:8443'
         newline = f"{indent}listen {new_addr}"
-        if rest:
-            newline += f" {rest}"
+        if opts:
+            newline += ' ' + ' '.join(opts)
         newline += ';\n'
         if newline != line:
             changed = True
@@ -1867,19 +1874,17 @@ EOF
 }
 
 reality_nginx_prepare_front() {
-    local sni="$1" xray_port="$2" fallback_backend="$3" conflicts ngx_module_file
+    local sni="$1" xray_port="$2" fallback_backend="$3" conflicts ngx_module_file nginx_test_log
     ngx_module_file="${NGX_MODULE_FILE:-/usr/local/lib/my/nginx_module.sh}"
-    if ! declare -F ngx_install_dependencies >/dev/null 2>&1; then
-        if [[ -f "$ngx_module_file" ]]; then
-            # shellcheck disable=SC1090
-            source "$ngx_module_file" || true
+    if declare -F ngx_install_dependencies >/dev/null 2>&1; then
+        ngx_install_dependencies || return 1
+    else
+        if [[ ! -f "$ngx_module_file" ]]; then
+            echo -e "${RED}❌ 未找到 Nginx 模块文件：${ngx_module_file}${RESET}"
+            return 1
         fi
+        bash -lc 'source "$1" && ngx_install_dependencies' _ "$ngx_module_file" || return 1
     fi
-    if ! declare -F ngx_install_dependencies >/dev/null 2>&1; then
-        echo -e "${RED}❌ 未找到 Nginx 模块函数 ngx_install_dependencies：${ngx_module_file}${RESET}"
-        return 1
-    fi
-    ngx_install_dependencies || return 1
     reality_nginx_ensure_stream_module || return 1
     if ! reality_nginx_ensure_stream_include; then
         echo -e "${RED}❌ 写入 Nginx stream include 失败。${RESET}"
@@ -1910,10 +1915,13 @@ reality_nginx_prepare_front() {
         rm -f "$REALITY_NGX_FALLBACK_CONF" 2>/dev/null || true
     fi
     reality_nginx_write_stream_conf "$sni" "$xray_port" "$fallback_backend" || return 1
-    if ! nginx -t >/dev/null 2>&1; then
+    nginx_test_log="${TMPDIR:-/tmp}/my-reality-nginx-test.log"
+    if ! nginx -t >"$nginx_test_log" 2>&1; then
         echo -e "${RED}❌ Nginx 配置测试失败，正在回滚自动迁移的 443 站点配置。${RESET}"
         reality_nginx_restore_migrated_confs >/dev/null 2>&1 || true
         nginx -t >/dev/null 2>&1 || true
+        echo -e "${YELLOW}>>> Nginx 测试日志：${nginx_test_log}${RESET}"
+        tail -n 20 "$nginx_test_log" 2>/dev/null || true
         return 1
     fi
     systemctl enable nginx >/dev/null 2>&1 || true
@@ -6698,11 +6706,11 @@ mv -f "${NFT_MODULE_FILE}.tmp" "${NFT_MODULE_FILE}"
 #!/bin/bash
 set -o pipefail
 
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly CYAN='\033[0;36m'
-readonly RESET='\033[0m'
+: "${RED:=\033[0;31m}"
+: "${GREEN:=\033[0;32m}"
+: "${YELLOW:=\033[1;33m}"
+: "${CYAN:=\033[0;36m}"
+: "${RESET:=\033[0m}"
 
 readonly MY_NGX_ID="my-nginx-proxy"
 readonly NGX_STATE_DIR="${MY_STATE_DIR:-/usr/local/lib/my/state}/nginx"
