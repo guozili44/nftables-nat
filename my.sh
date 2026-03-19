@@ -3254,28 +3254,36 @@ install_vless_native() {
         echo -e "${CYAN}>>> 本地无可用 Xray 核心，开始联网下载...${RESET}"
         xray_latest=$(cached_latest_tag "XTLS/Xray-core" "xray")
         xray_latest=$(printf '%s' "$xray_latest" | tr -d '[:space:]')
-        [[ -z "$xray_latest" ]] && xray_latest="v26.2.6"
 
         tmpdir=$(mktemp -d /tmp/ssr-xray.XXXXXX)
         zipf="${tmpdir}/xray.zip"
-        local asset_name official_url api_url proxy_url latest_url latest_proxy try_tag ok_url=""
+        local asset_name official_url api_url proxy_url latest_url latest_proxy try_tag ok_url="" display_tag=""
         asset_name="Xray-linux-${xray_arch}.zip"
         latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
         latest_proxy="https://ghproxy.net/${latest_url#https://}"
+        display_tag="${xray_latest:-latest}"
+        [[ -z "$display_tag" ]] && display_tag="latest"
 
-        echo -e "${CYAN}>>> 下载核心: ${xray_latest:-latest} (linux-${xray_arch}) ...${RESET}"
-        for try_tag in "$xray_latest" "v26.2.6"; do
-            [[ -n "$try_tag" ]] || continue
-            official_url="https://github.com/XTLS/Xray-core/releases/download/${try_tag}/${asset_name}"
-            api_url=$(github_release_asset_url "XTLS/Xray-core" "$try_tag" "$asset_name" 2>/dev/null || true)
-            proxy_url="https://ghproxy.net/${official_url#https://}"
+        echo -e "${CYAN}>>> 下载核心: ${display_tag} (linux-${xray_arch}) ...${RESET}"
+
+        # 先尝试 latest 直链，避免版本号获取失败时整个安装链路被卡死
+        if download_file_any "$zipf" "$latest_url" "$latest_proxy" && [[ -s "$zipf" ]] && unzip -t "$zipf" >/dev/null 2>&1; then
+            ok_url=1
+        else
             rm -f "$zipf" >/dev/null 2>&1 || true
-            if download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" "$latest_url" "$latest_proxy" && [[ -s "$zipf" ]] && unzip -t "$zipf" >/dev/null 2>&1; then
-                xray_latest="$try_tag"
-                ok_url=1
-                break
-            fi
-        done
+            for try_tag in "$xray_latest" "v26.2.6"; do
+                [[ -n "$try_tag" ]] || continue
+                official_url="https://github.com/XTLS/Xray-core/releases/download/${try_tag}/${asset_name}"
+                api_url=$(github_release_asset_url "XTLS/Xray-core" "$try_tag" "$asset_name" 2>/dev/null || true)
+                proxy_url="https://ghproxy.net/${official_url#https://}"
+                rm -f "$zipf" >/dev/null 2>&1 || true
+                if download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" && [[ -s "$zipf" ]] && unzip -t "$zipf" >/dev/null 2>&1; then
+                    xray_latest="$try_tag"
+                    ok_url=1
+                    break
+                fi
+            done
+        fi
         if [[ -z "$ok_url" ]]; then
             echo -e "${RED}❌ 核心下载或校验失败。${RESET}"
             rm -rf "$tmpdir"
