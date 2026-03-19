@@ -108,26 +108,49 @@ state_kv_get() {
     grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^"//; s/"$//'
 }
 
+state_escape_value() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//$'\n'/ }"
+    printf '%s' "$v"
+}
+
 state_kv_set() {
-    local file="$1" key="$2" value="$3"
+    local file="$1" key="$2" value="$3" escaped tmp line found=0
     state_dir_ensure "$(dirname "$file")" || return 1
     touch "$file" 2>/dev/null || return 1
     chmod 600 "$file" 2>/dev/null || true
-    if grep -qE "^${key}=" "$file" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}="${value}"|g" "$file"
-    else
+    escaped=$(state_escape_value "$value")
+    tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s="%s"
+' "$key" "$escaped" >> "$tmp"
+            found=1
+        else
+            printf '%s
+' "$line" >> "$tmp"
+        fi
+    done < "$file"
+    if [[ "$found" -eq 0 ]]; then
         printf '%s="%s"
-' "$key" "$value" >> "$file"
+' "$key" "$escaped" >> "$tmp"
     fi
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$file" 2>/dev/null || true
 }
 
 state_write_pairs() {
     local file="$1"; shift
+    local key value escaped
     state_dir_ensure "$(dirname "$file")" || return 1
     : > "$file"
     while [[ $# -ge 2 ]]; do
-        printf '%s="%s"
-' "$1" "$2" >> "$file"
+        key="$1"
+        value="$2"
+        escaped=$(state_escape_value "$value")
+        printf '%s="%s"\n' "$key" "$escaped" >> "$file"
         shift 2
     done
     chmod 600 "$file" 2>/dev/null || true
@@ -1567,13 +1590,19 @@ ${link}"
 }
 
 show_vless_summary() {
-    local ip port uuid sni priv pub sid link
+    local ip port uuid sni priv pub sid link front_mode public_port fallback_backend
     ip=$(ssr_fetch_node_address)
     port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
     uuid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.settings.clients.0.id 2>/dev/null)
     sni=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.serverNames.0 2>/dev/null)
     priv=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.privateKey 2>/dev/null)
     sid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.shortIds.0 2>/dev/null)
+    front_mode=$(meta_get "VLESS_FRONT_MODE" 2>/dev/null || true)
+    public_port=$(meta_get "VLESS_PUBLIC_PORT" 2>/dev/null || true)
+    fallback_backend=$(meta_get "VLESS_FALLBACK_BACKEND" 2>/dev/null || true)
+    if [[ "$front_mode" == "nginx-stream" && "$public_port" =~ ^[0-9]+$ ]]; then
+        port="$public_port"
+    fi
     if [[ -n "$priv" && -x /usr/local/bin/xray ]]; then
         pub=$(xray_extract_reality_public_key "$(/usr/local/bin/xray x25519 -i "$priv" 2>/dev/null || true)")
     fi
@@ -1585,12 +1614,209 @@ show_vless_summary() {
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "UUID: ${GREEN}${uuid:-未读取}${RESET}"
     echo -e "SNI: ${GREEN}${sni:-未读取}${RESET}"
+    if [[ "$front_mode" == "nginx-stream" ]]; then
+        echo -e "前置过滤: ${GREEN}Nginx stream / ssl_preread${RESET}"
+        echo -e "回落后端: ${GREEN}${fallback_backend:-127.0.0.1:8443}${RESET}"
+    fi
     if [[ -n "$ip" && -n "$port" && -n "$uuid" && -n "$sni" && -n "$pub" && -n "$sid" ]]; then
         link="vless://${uuid}@${ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp&headerType=none#VLESS-Reality"
         echo -e "${YELLOW}链接:${RESET}
 ${link}"
     fi
 }
+
+readonly REALITY_NGX_STREAM_DIR="/etc/nginx/stream-conf.d"
+readonly REALITY_NGX_STREAM_CONF="${REALITY_NGX_STREAM_DIR}/10-my-reality-front.conf"
+readonly REALITY_NGX_FALLBACK_CONF="/etc/nginx/conf.d/zz-my-reality-fallback.conf"
+readonly REALITY_NGX_FALLBACK_CERT_DIR="/etc/nginx/ssl/my-reality-fallback"
+readonly REALITY_NGX_FALLBACK_CERT="${REALITY_NGX_FALLBACK_CERT_DIR}/fullchain.pem"
+readonly REALITY_NGX_FALLBACK_KEY="${REALITY_NGX_FALLBACK_CERT_DIR}/privkey.pem"
+readonly REALITY_NGX_FALLBACK_WEBROOT="/var/www/my-reality-fallback"
+
+reality_nginx_ensure_stream_module() {
+    have_cmd nginx || return 1
+    if nginx -V 2>&1 | grep -Eq -- '--with-stream|--with-stream=dynamic'; then
+        return 0
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq libnginx-mod-stream >/dev/null 2>&1 || apt-get install -y -qq nginx-mod-stream >/dev/null 2>&1 || true
+    if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
+        mkdir -p /etc/nginx/modules-enabled 2>/dev/null || true
+        if [[ ! -f /etc/nginx/modules-enabled/50-mod-stream.conf ]]; then
+            printf '%s\n' 'load_module modules/ngx_stream_module.so;' > /etc/nginx/modules-enabled/50-mod-stream.conf
+        fi
+    fi
+    if [[ -f /usr/lib/nginx/modules/ngx_stream_ssl_preread_module.so ]]; then
+        mkdir -p /etc/nginx/modules-enabled 2>/dev/null || true
+        if [[ ! -f /etc/nginx/modules-enabled/70-mod-stream-ssl-preread.conf ]]; then
+            printf '%s\n' 'load_module modules/ngx_stream_ssl_preread_module.so;' > /etc/nginx/modules-enabled/70-mod-stream-ssl-preread.conf
+        fi
+    fi
+    return 0
+}
+
+reality_nginx_ensure_stream_include() {
+    local conf="/etc/nginx/nginx.conf" tmp
+    [[ -f "$conf" ]] || return 1
+    grep -q '/etc/nginx/stream-conf.d/\*\.conf' "$conf" && return 0
+    tmp="$(mktemp "${TMPDIR:-/tmp}/nginx.conf.XXXXXX")" || return 1
+    awk '
+        BEGIN { done=0 }
+        { print }
+        !done && $0 ~ /include[[:space:]]+\/etc\/nginx\/modules-enabled\/\*\.conf;/ {
+            print "# managed-by=my-reality-front"
+            print "include /etc/nginx/stream-conf.d/*.conf;"
+            done=1
+        }
+        END {
+            if (!done) {
+                print "# managed-by=my-reality-front"
+                print "include /etc/nginx/stream-conf.d/*.conf;"
+            }
+        }
+    ' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    install -m 644 "$tmp" "$conf" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+}
+
+reality_nginx_detect_public_443_conflicts() {
+    local hits
+    hits=$(grep -RIlE 'listen[^;]*[[:space:]]443([[:space:];]|$)|listen[^;]*:443([[:space:];]|$)' /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | grep -v -F "$REALITY_NGX_FALLBACK_CONF" || true)
+    [[ -z "$hits" ]] && return 0
+    echo "$hits"
+    return 1
+}
+
+reality_nginx_write_local_fallback_site() {
+    mkdir -p "$REALITY_NGX_FALLBACK_CERT_DIR" "$REALITY_NGX_FALLBACK_WEBROOT" /etc/nginx/conf.d 2>/dev/null || true
+    if ! have_cmd openssl; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y -qq openssl >/dev/null 2>&1 || return 1
+    fi
+    if [[ ! -s "$REALITY_NGX_FALLBACK_CERT" || ! -s "$REALITY_NGX_FALLBACK_KEY" ]]; then
+        openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -subj "/CN=localhost" -keyout "$REALITY_NGX_FALLBACK_KEY" -out "$REALITY_NGX_FALLBACK_CERT" >/dev/null 2>&1 || return 1
+    fi
+    cat > "${REALITY_NGX_FALLBACK_WEBROOT}/index.html" <<'EOF'
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Welcome</title>
+  <style>
+    body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#0b1020; color:#e8eefc; margin:0; }
+    .box { max-width:760px; margin:10vh auto; padding:32px; line-height:1.7; }
+    h1 { font-size:28px; margin:0 0 12px; }
+    p { opacity:.92; }
+    code { background:#17203a; padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>It works</h1>
+    <p>这是前置 Nginx 过滤模式生成的本机回落页。</p>
+    <p>当前 443 由 <code>stream + ssl_preread</code> 分流，只有命中指定 REALITY SNI 的连接才会进入 Xray；其余连接都会回落到这个固定后端。</p>
+  </div>
+</body>
+</html>
+EOF
+    cat > "$REALITY_NGX_FALLBACK_CONF" <<EOF
+# managed-by=my-reality-front
+server {
+    listen 127.0.0.1:8443 ssl default_server;
+    listen [::1]:8443 ssl default_server;
+    server_name _;
+
+    access_log off;
+    error_log /var/log/nginx/my-reality-fallback-error.log warn;
+
+    ssl_certificate ${REALITY_NGX_FALLBACK_CERT};
+    ssl_certificate_key ${REALITY_NGX_FALLBACK_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:REALITYFALLBACK:10m;
+    ssl_session_tickets off;
+    server_tokens off;
+
+    root ${REALITY_NGX_FALLBACK_WEBROOT};
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+}
+
+reality_nginx_write_stream_conf() {
+    local sni="$1" xray_port="$2" fallback_backend="$3"
+    mkdir -p "$REALITY_NGX_STREAM_DIR" 2>/dev/null || true
+    cat > "$REALITY_NGX_STREAM_CONF" <<EOF
+# managed-by=my-reality-front
+stream {
+    map \$ssl_preread_server_name \$my_reality_backend {
+        ${sni} xray_reality_backend;
+        default fallback_backend;
+    }
+
+    upstream xray_reality_backend {
+        server 127.0.0.1:${xray_port};
+    }
+
+    upstream fallback_backend {
+        server ${fallback_backend};
+    }
+
+    log_format my_reality_stream '\$remote_addr [\$time_local] \$protocol \$ssl_preread_server_name \$bytes_sent \$bytes_received \$session_time';
+    access_log /var/log/nginx/my-reality-stream-access.log my_reality_stream;
+    error_log  /var/log/nginx/my-reality-stream-error.log warn;
+
+    server {
+        listen 443 reuseport;
+        listen [::]:443 reuseport;
+        proxy_connect_timeout 5s;
+        proxy_timeout 300s;
+        ssl_preread on;
+        proxy_pass \$my_reality_backend;
+    }
+}
+EOF
+}
+
+reality_nginx_prepare_front() {
+    local sni="$1" xray_port="$2" fallback_backend="$3" conflicts
+    ngx_install_dependencies || return 1
+    reality_nginx_ensure_stream_module || return 1
+    if ! reality_nginx_ensure_stream_include; then
+        echo -e "${RED}❌ 写入 Nginx stream include 失败。${RESET}"
+        return 1
+    fi
+    if ! conflicts=$(reality_nginx_detect_public_443_conflicts); then
+        echo -e "${RED}❌ 检测到现有 Nginx 公网 443 站点，无法同时启用前置 stream 过滤。${RESET}"
+        echo -e "${YELLOW}冲突配置:${RESET}"
+        printf '%s\n' "$conflicts"
+        echo -e "${YELLOW}请先迁移/删除这些 443 站点，或改用非前置模式。${RESET}"
+        return 1
+    fi
+    if [[ -z "$fallback_backend" || "$fallback_backend" == "127.0.0.1:8443" ]]; then
+        fallback_backend="127.0.0.1:8443"
+        reality_nginx_write_local_fallback_site || return 1
+    else
+        rm -f "$REALITY_NGX_FALLBACK_CONF" 2>/dev/null || true
+    fi
+    reality_nginx_write_stream_conf "$sni" "$xray_port" "$fallback_backend" || return 1
+    nginx -t >/dev/null 2>&1 || return 1
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl restart nginx >/dev/null 2>&1 || systemctl reload nginx >/dev/null 2>&1 || return 1
+    add_firewall_rule 443 tcp >/dev/null 2>&1 || true
+    meta_set "VLESS_FRONT_MODE" "nginx-stream"
+    meta_set "VLESS_PUBLIC_PORT" "443"
+    meta_set "VLESS_FALLBACK_BACKEND" "$fallback_backend"
+    return 0
+}
+
 
 service_unit_exists() {
     local name="$1"
@@ -3278,25 +3504,21 @@ run_cf_ddns() {
 
     [[ "$mode" == "manual" ]] && echo -e "${YELLOW}获取到当前 ${record_type} IP: $current_ip ，正在通信...${RESET}"
 
-    local record_response record_id api_result success
+    local record_response record_id api_result success payload
     record_response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${CF_RECORD}&type=${record_type}"         -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json")
     record_id=$(echo "$record_response" | jq -r '.result[0].id' 2>/dev/null)
+    payload=$(printf '{"type":"%s","name":"%s","content":"%s","ttl":60,"proxied":false}' "$record_type" "$CF_RECORD" "$current_ip")
 
     if [[ -z "$record_id" || "$record_id" == "null" ]]; then
-        api_result=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"             -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json"             --data "{"type":"${record_type}","name":"${CF_RECORD}","content":"${current_ip}","ttl":60,"proxied":false}")
+        api_result=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"             -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json"             --data "$payload")
     else
-        api_result=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}"             -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json"             --data "{"type":"${record_type}","name":"${CF_RECORD}","content":"${current_ip}","ttl":60,"proxied":false}")
+        api_result=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}"             -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json"             --data "$payload")
     fi
 
     success=$(echo "$api_result" | jq -r '.success' 2>/dev/null)
     if [[ "$success" == "true" ]]; then
-        sed -i "s/^LAST_IP=.*/LAST_IP="${current_ip}"/g" "$DDNS_CONF"
-        if grep -q '^LAST_TYPE=' "$DDNS_CONF" 2>/dev/null; then
-            sed -i "s/^LAST_TYPE=.*/LAST_TYPE="${record_type}"/g" "$DDNS_CONF"
-        else
-            printf 'LAST_TYPE="%s"
-' "$record_type" >> "$DDNS_CONF"
-        fi
+        state_kv_set "$DDNS_CONF" LAST_IP "$current_ip"
+        state_kv_set "$DDNS_CONF" LAST_TYPE "$record_type"
         chmod 600 "$DDNS_CONF" 2>/dev/null || true
         echo "$(date '+%Y-%m-%d %H:%M:%S') - [成功] ${record_type} 更新为: $current_ip" >> "$DDNS_LOG"
         [[ "$mode" == "manual" ]] && echo -e "${GREEN}✅ ${record_type} 解析已更新为: $current_ip${RESET}"
@@ -3767,12 +3989,26 @@ install_vless_native() {
     echo -e "${CYAN}========= 原生交互安装 VLESS Reality =========${RESET}"
     rm -f /etc/systemd/system/xray.service
 
-    read -rp "伪装域名 [默认 updates.cdn-apple.com]: " sni_domain
+    local use_nginx_front="y" fallback_backend="127.0.0.1:8443"
+    echo -e "${YELLOW}提示：更安全的 REALITY 建议配合前置 Nginx SNI 过滤，仅让指定 SNI 进入 Xray。${RESET}"
+    read -rp "启用前置 Nginx 过滤 [Y/n]: " use_nginx_front
+    read -rp "REALITY SNI / target 域名 [建议非 CDN 直连站，默认 updates.cdn-apple.com]: " sni_domain
     [[ -z "$sni_domain" ]] && sni_domain="updates.cdn-apple.com"
 
-    read -rp "监听端口 [留空随机]: " port
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        port=$((RANDOM % 55535 + 10000))
+    if [[ ! "$use_nginx_front" =~ ^[nN]$ ]]; then
+        read -rp "Xray 内部监听端口 [默认 1443]: " port
+        [[ -z "$port" ]] && port=1443
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ] || [ "$port" -eq 443 ]; then
+            port=1443
+        fi
+        read -rp "非命中流量固定回落后端 [默认 127.0.0.1:8443，本机自签名页]: " fallback_backend
+        [[ -z "$fallback_backend" ]] && fallback_backend="127.0.0.1:8443"
+    else
+        read -rp "监听端口 [留空随机]: " port
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            port=$((RANDOM % 55535 + 10000))
+        fi
+        fallback_backend=""
     fi
 
     local arch; arch=$(uname -m)
@@ -3888,8 +4124,11 @@ PYUUID
         return
     fi
 
+    local xray_listen="::"
+    [[ ! "$use_nginx_front" =~ ^[nN]$ ]] && xray_listen="127.0.0.1"
+
     cat > /usr/local/etc/xray/config.json << EOF
-{ "inbounds": [{ "listen": "::", "port": $port, "protocol": "vless", "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" }, "streamSettings": { "network": "tcp", "security": "reality", "realitySettings": { "dest": "${sni_domain}:443", "serverNames": ["${sni_domain}"], "privateKey": "$priv", "shortIds": ["$short_id"] } } }], "outbounds": [{"protocol": "freedom"}] }
+{ "inbounds": [{ "listen": "${xray_listen}", "port": $port, "protocol": "vless", "settings": { "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none" }, "streamSettings": { "network": "raw", "security": "reality", "realitySettings": { "target": "${sni_domain}:443", "serverNames": ["${sni_domain}"], "privateKey": "$priv", "shortIds": ["$short_id"], "maxTimeDiff": 60000 } } }], "outbounds": [{"protocol": "freedom"}] }
 EOF
 
     if ! /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1; then
@@ -3906,11 +4145,27 @@ EOF
         return
     fi
 
-    named_service_add_firewall "xray" "$port" >/dev/null 2>&1 || true
+    if [[ ! "$use_nginx_front" =~ ^[nN]$ ]]; then
+        if ! reality_nginx_prepare_front "$sni_domain" "$port" "$fallback_backend"; then
+            echo -e "${RED}❌ Nginx 前置过滤部署失败，Xray 已以内网端口方式启动：127.0.0.1:${port}${RESET}"
+            rm -rf "$tmpdir"
+            sleep 4
+            return
+        fi
+        remove_firewall_rule "$port" tcp >/dev/null 2>&1 || true
+    else
+        named_service_add_firewall "xray" "$port" >/dev/null 2>&1 || true
+        meta_set "VLESS_FRONT_MODE" "direct"
+        meta_set "VLESS_PUBLIC_PORT" "$port"
+        meta_set "VLESS_FALLBACK_BACKEND" ""
+    fi
 
     [[ -n "$xray_latest" ]] && meta_set "XRAY_TAG" "$xray_latest"
 
     echo -e "${GREEN}✅ VLESS Reality (${xray_latest:-local}) 安装成功！${RESET}"
+    if [[ ! "$use_nginx_front" =~ ^[nN]$ ]]; then
+        echo -e "${GREEN}✅ 已启用前置 Nginx SNI 过滤：公网入口固定为 443，只有 ${sni_domain} 会进入 Xray。${RESET}"
+    fi
     show_vless_summary
     rm -rf "$tmpdir"
     read -n 1 -s -r -p "按任意键返回上一层..."
