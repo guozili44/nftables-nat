@@ -96,7 +96,72 @@ install_modules() {
 #!/bin/bash
 set -o pipefail
 
+: "${RED:=\033[0;31m}"
+: "${GREEN:=\033[0;32m}"
+: "${YELLOW:=\033[1;33m}"
+: "${CYAN:=\033[0;36m}"
+: "${PLAIN:=\033[0m}"
+: "${RESET:=${PLAIN}}"
+
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+msg_ok()   { echo -e "${GREEN}$*${PLAIN}"; }
+msg_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
+msg_err()  { echo -e "${RED}$*${PLAIN}"; }
+msg_info() { echo -e "${CYAN}$*${PLAIN}"; }
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        msg_err "错误: 必须使用 root 权限运行！"
+        exit 1
+    fi
+}
+
+script_realpath() {
+    local target="$0"
+    if have_cmd readlink; then
+        readlink -f "$target" 2>/dev/null && return 0
+    fi
+    if have_cmd realpath; then
+        realpath "$target" 2>/dev/null && return 0
+    fi
+    printf '%s\n' "$target"
+}
+
+base64_nw() {
+    if base64 --help 2>&1 | grep -q -- '-w'; then
+        base64 -w 0
+    else
+        base64 | tr -d '\n'
+    fi
+}
+
+port_in_use() {
+    local port="$1" proto="${2:-both}" used=1
+    proto="$(normalize_proto "$proto")"
+    if have_cmd ss; then
+        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+            ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
+        fi
+        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+            ss -lnuH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
+        fi
+    fi
+    return $used
+}
+
+port_listening_tcp() {
+    local port="$1"
+    if have_cmd ss; then
+        ss -lnt "( sport = :${port} )" 2>/dev/null | tail -n +2 | grep -q . && return 0
+    fi
+    if have_cmd netstat; then
+        netstat -lnt 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END{exit !found}' && return 0
+    fi
+    if have_cmd lsof; then
+        lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | tail -n +2 | grep -q . && return 0
+    fi
+    return 1
+}
 
 state_dir_ensure() {
     mkdir -p "$1" >/dev/null 2>&1 || return 1
@@ -224,11 +289,47 @@ txn_reverse_read() {
     fi
 }
 
+_txn_exec_allowed() {
+    case "$1" in
+        _txn_restore_file|_txn_remove_path|remove_firewall_rule|restart_managed_service|_ngx_reload_quiet) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_txn_parse_line_to_argv() {
+    local line="$1"
+    python3 - "$line" <<'PYTXN'
+import shlex, sys
+try:
+    for item in shlex.split(sys.argv[1], posix=True):
+        print(item)
+except Exception:
+    sys.exit(1)
+PYTXN
+}
+
+_txn_abort_safe_exec() {
+    local line="$1" first="${line%% *}"
+    local -a argv=()
+    [[ -n "$line" ]] || return 0
+
+    if have_cmd python3; then
+        mapfile -t argv < <(_txn_parse_line_to_argv "$line") || return 1
+        [[ ${#argv[@]} -gt 0 ]] || return 0
+        _txn_exec_allowed "${argv[0]}" || return 1
+        "${argv[@]}" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    _txn_exec_allowed "$first" || return 1
+    eval "$line" >/dev/null 2>&1 || true
+}
+
 txn_abort() {
     local txn="$1" line
     [[ -n "$txn" && -f "$txn/stack" ]] || { rm -rf "$txn" >/dev/null 2>&1 || true; return 0; }
     while IFS= read -r line; do
-        eval "$line" >/dev/null 2>&1 || true
+        _txn_abort_safe_exec "$line" || msg_warn "⚠️ 已跳过未知回滚动作：${line%% *}"
     done < <(txn_reverse_read "$txn/stack")
     rm -rf "$txn" >/dev/null 2>&1 || true
 }
@@ -291,20 +392,6 @@ proto_to_list() {
     esac
 }
 
-port_in_use() {
-    local port="$1" proto="${2:-both}"
-    local used=1
-    proto="$(normalize_proto "$proto")"
-    if have_cmd ss; then
-        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
-            ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
-        fi
-        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
-            ss -lnuH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
-        fi
-    fi
-    return $used
-}
 
 resolve_ipv4_first() {
     local addr="$1" out=""
@@ -379,7 +466,13 @@ readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
 readonly LEGACY_META_DIR="/usr/local/etc/ssr_meta"
 COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
 NGX_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/nginx_module.sh"
-[[ -f "$COMMON_MODULE_FILE" ]] && source "$COMMON_MODULE_FILE"
+if [[ -f "$COMMON_MODULE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$COMMON_MODULE_FILE"
+else
+    echo "缺少公共模块: $COMMON_MODULE_FILE" >&2
+    exit 1
+fi
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/00-my-auth.conf"
 readonly SSH_PORT_DROPIN="/etc/ssh/sshd_config.d/00-my-port.conf"
 readonly ROOT_SSH_DIR="/root/.ssh"
@@ -397,17 +490,7 @@ readonly RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/99-ssr-dns.conf"
 
 trap 'echo -e "\n${GREEN}已安全退出脚本。${RESET}"; exit 0' SIGINT
 
-# 通用工具
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-base64_nw() {
-    # 输出不换行的 base64
-    if base64 --help 2>&1 | grep -q -- '-w'; then
-        base64 -w 0
-    else
-        base64 | tr -d '\n'
-    fi
-}
+# 通用工具（have_cmd/base64_nw 等由 common_module.sh 提供）
 
 run_with_timeout() {
     local seconds="$1"; shift
@@ -994,286 +1077,6 @@ normalize_ssh_root_login_mode() {
     esac
 }
 
-port_listening_tcp() {
-    local port="$1"
-    if have_cmd ss; then
-        ss -lnt "( sport = :${port} )" 2>/dev/null | tail -n +2 | grep -q . && return 0
-    fi
-    if have_cmd netstat; then
-        netstat -lnt 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END{exit !found}' && return 0
-    fi
-    if have_cmd lsof; then
-        lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | tail -n +2 | grep -q . && return 0
-    fi
-    return 1
-}
-
-ensure_root_authorized_keys() {
-    mkdir -p "$ROOT_SSH_DIR" 2>/dev/null || return 1
-    chmod 700 "$ROOT_SSH_DIR" 2>/dev/null || true
-    touch "$ROOT_AUTH_KEYS_FILE" 2>/dev/null || return 1
-    chmod 600 "$ROOT_AUTH_KEYS_FILE" 2>/dev/null || true
-    return 0
-}
-
-verify_ssh_runtime() {
-    local expected_port="$1" expected_pass="$2" expected_root="$3"
-    local got_port got_pass got_root got_pub ok="0" i
-    have_cmd sshd || return 1
-    sshd -t >/dev/null 2>&1 || return 1
-    expected_root=$(normalize_ssh_root_login_mode "$expected_root")
-    for i in 1 2 3 4 5; do
-        got_port=$(sshd_effective_port)
-        got_pass=$(sshd_effective_value_runtime passwordauthentication | tr '[:upper:]' '[:lower:]')
-        got_pub=$(sshd_effective_value_runtime pubkeyauthentication | tr '[:upper:]' '[:lower:]')
-        got_root=$(normalize_ssh_root_login_mode "$(sshd_effective_value_runtime permitrootlogin)")
-        [[ -z "$got_pass" ]] && got_pass="yes"
-        [[ -z "$got_pub" ]] && got_pub="yes"
-        if [[ "$got_port" == "$expected_port" ]]            && [[ -z "$expected_pass" || "$got_pass" == "$expected_pass" ]]            && [[ "$got_pub" == "yes" ]]            && [[ -z "$expected_root" || "$got_root" == "$expected_root" ]]            && port_listening_tcp "$expected_port"; then
-            ok="1"
-            break
-        fi
-        sleep 1
-    done
-    [[ "$ok" == "1" ]]
-}
-
-service_use_systemd() {
-    have_cmd systemctl && [[ -d /run/systemd/system ]]
-}
-
-ssh_service_name() {
-    if service_use_systemd; then
-        if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^sshd\.service'; then
-            echo sshd
-            return 0
-        fi
-        if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ssh\.service'; then
-            echo ssh
-            return 0
-        fi
-    fi
-    echo sshd
-}
-
-restart_ssh_safe() {
-    local cfg="/etc/ssh/sshd_config" svc
-    if have_cmd sshd && ! sshd -t -f "$cfg" >/dev/null 2>&1; then
-        echo -e "${YELLOW}⚠️ sshd_config 校验失败，未重启 SSH。${RESET}"
-        return 1
-    fi
-    if service_use_systemd; then
-        svc="$(ssh_service_name)"
-        systemctl restart "$svc" >/dev/null 2>&1 || return 1
-        systemctl is-active --quiet "$svc" >/dev/null 2>&1 || return 1
-        return 0
-    fi
-    if have_cmd service; then
-        service ssh restart >/dev/null 2>&1 || service sshd restart >/dev/null 2>&1 || return 1
-        return 0
-    fi
-    return 1
-}
-
-ssh_takeover_socket_activation() {
-    local svc=""
-    have_cmd systemctl || return 0
-
-    if systemctl list-unit-files --type=socket 2>/dev/null | grep -q '^ssh\.socket'; then
-        if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
-            systemctl disable --now ssh.socket >/dev/null 2>&1 || true
-        fi
-    fi
-
-    if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ssh\.service'; then
-        svc="ssh"
-    elif systemctl list-unit-files --type=service 2>/dev/null | grep -q '^sshd\.service'; then
-        svc="sshd"
-    fi
-
-    if [[ -n "$svc" ]]; then
-        systemctl enable "$svc" >/dev/null 2>&1 || true
-        systemctl start "$svc" >/dev/null 2>&1 || true
-    fi
-    return 0
-}
-
-json_get_path() {
-    local file="$1" path="$2"
-    [[ -f "$file" ]] || return 1
-    if have_cmd python3; then
-        python3 - "$file" "$path" <<'PYPARSE'
-import json, sys
-file, path = sys.argv[1], sys.argv[2]
-with open(file, 'r', encoding='utf-8') as f:
-    obj = json.load(f)
-cur = obj
-for part in path.split('.'):
-    if part.isdigit():
-        cur = cur[int(part)]
-    else:
-        cur = cur[part]
-if cur is None:
-    print("")
-elif isinstance(cur, bool):
-    print("true" if cur else "false")
-else:
-    print(cur)
-PYPARSE
-        return 0
-    fi
-    if have_cmd jq; then
-        local expr="."
-        IFS='.' read -r -a _parts <<< "$path"
-        local part
-        for part in "${_parts[@]}"; do
-            if [[ "$part" =~ ^[0-9]+$ ]]; then
-                expr+="[$part]"
-            else
-                expr+=".$part"
-            fi
-        done
-        jq -r "$expr" "$file" 2>/dev/null
-        return 0
-    fi
-    case "$path" in
-        server_port) sed -n 's/.*"server_port": \([0-9][0-9]*\).*/\1/p' "$file" | head -n1 ;;
-        method) sed -n 's/.*"method": "\([^"]*\)".*/\1/p' "$file" | head -n1 ;;
-        password) sed -n 's/.*"password": "\([^"]*\)".*/\1/p' "$file" | head -n1 ;;
-        inbounds.0.port) sed -n 's/.*"port": \([0-9][0-9]*\).*/\1/p' "$file" | head -n1 ;;
-        inbounds.0.settings.clients.0.id) sed -n 's/.*"id": "\([^"]*\)".*/\1/p' "$file" | head -n1 ;;
-        inbounds.0.streamSettings.realitySettings.serverNames.0) sed -n 's/.*"serverNames": \["\([^"]*\)"\].*/\1/p' "$file" | head -n1 ;;
-        inbounds.0.streamSettings.realitySettings.privateKey) sed -n 's/.*"privateKey": "\([^"]*\)".*/\1/p' "$file" | head -n1 ;;
-        inbounds.0.streamSettings.realitySettings.shortIds.0) sed -n 's/.*"shortIds": \["\([^"]*\)"\].*/\1/p' "$file" | head -n1 ;;
-        *) return 1 ;;
-    esac
-}
-
-normalize_xray_x25519_output() {
-    printf '%s' "$1" | tr '\r' '\n' | awk '
-        {
-            gsub(/Private[[:space:]]*[Kk]ey[[:space:]]*:/, "\nPrivateKey:")
-            gsub(/Public[[:space:]]*[Kk]ey[[:space:]]*:/, "\nPublicKey:")
-            gsub(/Password[[:space:]]*:/, "\nPassword:")
-            gsub(/Hash32[[:space:]]*:/, "\nHash32:")
-            print
-        }
-    ' | tr -s '\n' | sed '/^[[:space:]]*$/d'
-}
-
-xray_extract_reality_private_key() {
-    local raw norm
-    raw="$1"
-    norm=$(normalize_xray_x25519_output "$raw")
-    printf '%s\n' "$norm" | sed -nE 's/^[[:space:]]*Private([[:space:]]*[Kk]ey|Key):[[:space:]]*//p' | head -n1 | tr -d '[:space:]'
-}
-
-xray_extract_reality_public_key() {
-    local raw norm
-    raw="$1"
-    norm=$(normalize_xray_x25519_output "$raw")
-    {
-        printf '%s\n' "$norm" | sed -nE 's/^[[:space:]]*Public([[:space:]]*[Kk]ey|Key):[[:space:]]*//p'
-        printf '%s\n' "$norm" | sed -nE 's/^[[:space:]]*Password:[[:space:]]*//p'
-    } | head -n1 | tr -d '[:space:]'
-}
-
-json_set_path() {
-    local file="$1" path="$2" value="$3" kind="$4"
-    [[ -f "$file" ]] || return 1
-    if have_cmd python3; then
-        python3 - "$file" "$path" "$value" "$kind" <<'PYPARSE'
-import json, os, sys
-file, path, value, kind = sys.argv[1:5]
-
-def convert(v, k):
-    if k == 'number':
-        return int(v)
-    if k == 'bool':
-        return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
-    if k == 'null':
-        return None
-    return v
-
-with open(file, 'r', encoding='utf-8') as f:
-    obj = json.load(f)
-cur = obj
-parts = path.split('.')
-for part in parts[:-1]:
-    cur = cur[int(part)] if part.isdigit() else cur[part]
-last = parts[-1]
-cur[int(last) if last.isdigit() else last] = convert(value, kind)
-tmp = file + '.tmp'
-with open(tmp, 'w', encoding='utf-8') as f:
-    json.dump(obj, f, ensure_ascii=False)
-os.replace(tmp, file)
-PYPARSE
-        return $?
-    fi
-    if have_cmd jq; then
-        local tmp
-        tmp=$(mktemp /tmp/json-set.XXXXXX) || return 1
-        if jq --arg path "$path" --arg val "$value" --arg kind "$kind" '
-            def conv($v; $k):
-                if $k == "number" then ($v | tonumber)
-                elif $k == "bool" then (($v | ascii_downcase) | test("^(true|1|yes|on)$"))
-                elif $k == "null" then null
-                else $v end;
-            ($path | split(".") | map(if test("^[0-9]+$") then tonumber else . end)) as $p
-            | setpath($p; conv($val; $kind))
-        ' "$file" > "$tmp" 2>/dev/null; then
-            mv -f "$tmp" "$file" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
-            return 0
-        fi
-        rm -f "$tmp"
-    fi
-    return 1
-}
-
-json_set_top_value() {
-    json_set_path "$1" "$2" "$3" "$4"
-}
-
-uri_encode() {
-    local raw="$1"
-    if have_cmd python3; then
-        python3 - "$raw" <<'PYURL'
-import sys, urllib.parse
-print(urllib.parse.quote(sys.argv[1], safe=''))
-PYURL
-        return 0
-    fi
-    local out="" i ch hex
-    for ((i=0; i<${#raw}; i++)); do
-        ch="${raw:i:1}"
-        case "$ch" in
-            [a-zA-Z0-9.~_-]) out+="$ch" ;;
-            *) printf -v hex '%%%02X' "'${ch}"; out+="$hex" ;;
-        esac
-    done
-    printf '%s' "$out"
-}
-
-ss_make_userinfo() {
-    local method="$1" password="$2"
-    if [[ "$method" == 2022-* ]]; then
-        printf '%s:%s' "$(uri_encode "$method")" "$(uri_encode "$password")"
-    else
-        printf '%s' "${method}:${password}" | base64_nw
-    fi
-}
-
-port_listening_tcp() {
-    local port="$1"
-    if have_cmd ss; then
-        ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\])${port}$"
-    elif have_cmd netstat; then
-        netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\])${port}$"
-    else
-        return 1
-    fi
-}
-
 ssr_extract_first_ip() {
     local raw="$1" token=""
     token=$(printf '%s\n' "$raw" | tr -d '\r' | awk '{for(i=1;i<=NF;i++) print $i}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | head -n1)
@@ -1586,7 +1389,7 @@ show_ss_v2ray_summary() {
     port=$(printf '%s' "$ss_inbound" | jq -r '.port')
     method=$(printf '%s' "$ss_inbound" | jq -r '.settings.method')
     password=$(printf '%s' "$ss_inbound" | jq -r '.settings.password')
-    userinfo=$(printf '%s' "${method}:${password}" | base64 -w 0)
+    userinfo=$(ss_make_userinfo "$method" "$password")
     link="ss://${userinfo}@${ip}:${port}#SS2022-Xray"
     if is_ipv4 "$ip" || is_ipv6 "$ip"; then
         echo -e "IP: ${GREEN}${ip}${RESET}"
@@ -2619,81 +2422,199 @@ measure_host_latency_ms() {
     ping -4 -n -c 1 -W 1 "$host" 2>/dev/null | awk -F'time=' '/time=/{print $2}' | awk '{print int($1+0.5)}' | head -n 1
 }
 
-# 真正的 DNS 解析测速（测试查询真实域名的耗时）
+# 智能 DNS 选优：按“多域名真实解析 + 成功率 + 抖动 + 直连时延”综合打分
 measure_dns_latency_ms() {
-    local dns_ip="$1"
-    # 使用一个在全球都有丰富 CDN 节点的域名，更能测出 DNS 分配是否合理
-    local test_domain="www.apple.com" 
-    
+    local dns_ip="$1" test_domain="${2:-www.apple.com}" rrtype="${3:-A}" qtime
+
     if have_cmd dig; then
-        local qtime
-        # 发送真实的 A 记录查询，超时设为 1 秒，仅试 1 次，提取 Query time
-        qtime=$(dig @"${dns_ip}" "${test_domain}" A +time=1 +tries=1 2>/dev/null | awk '/Query time:/ {print $4}')
+        qtime=$(dig @"${dns_ip}" "${test_domain}" "${rrtype}" +time=1 +tries=1 +noall +stats 2>/dev/null | awk '/Query time:/ {print $4}')
         if [[ -n "$qtime" && "$qtime" =~ ^[0-9]+$ ]]; then
             echo "$qtime"
             return 0
         fi
     fi
-    # 解析失败、超时或未安装 dig，返回 9999 惩罚值
+
+    if have_cmd nslookup; then
+        qtime=$(
+            (TIMEFORMAT=%R; time nslookup -timeout=1 -retry=1 -type="${rrtype}" "${test_domain}" "${dns_ip}" >/dev/null 2>&1) 2>&1 \
+            | sed 's/[[:space:]]//g' \
+            | awk -F. '{printf "%d", ($1*1000) + substr($2 "000",1,3)}' \
+            | head -n1
+        )
+        if [[ -n "$qtime" && "$qtime" =~ ^[0-9]+$ ]]; then
+            echo "$qtime"
+            return 0
+        fi
+    fi
+
     echo 9999
 }
 
-# 替换原有的 DNS 选优逻辑
-select_best_dns_pair() {
-    local mode="$(profile_alias "${1:-stable}")"
-    local candidates=() pair primary secondary lat1 lat2 score
-    local best_pair="" best_score=999999
+dns_probe_matrix() {
+    cat <<'EOF'
+www.apple.com A
+www.cloudflare.com A
+www.microsoft.com A
+www.qq.com A
+EOF
+}
 
-    # 备选池不变，国内节点和国际节点分离
-    if [[ "$mode" == "perf" ]]; then
-        candidates=(
-            "1.1.1.1 1.0.0.1"
-            "223.5.5.5 223.6.6.6"
-            "119.29.29.29 182.254.116.116"
-            "9.9.9.9 149.112.112.112"
-            "8.8.8.8 8.8.4.4"
-        )
+dns_provider_region_bias() {
+    local provider="$1" mode="$2"
+    case "$mode:$provider" in
+        stable:aliyun|stable:tencent) echo -15 ;;
+        perf:cloudflare|perf:google) echo -10 ;;
+        *) echo 0 ;;
+    esac
+}
+
+dns_ping_latency_ms() {
+    local host="$1" ms
+    ms="$(measure_host_latency_ms "$host" 2>/dev/null || true)"
+    [[ -n "$ms" && "$ms" =~ ^[0-9]+$ ]] && echo "$ms" || echo 120
+}
+
+dns_probe_tcp_bonus() {
+    local dns_ip="$1" qtime
+    have_cmd dig || { echo 80; return 0; }
+    qtime=$(dig @"${dns_ip}" www.apple.com A +tcp +time=1 +tries=1 +noall +stats 2>/dev/null | awk '/Query time:/ {print $4}')
+    if [[ -n "$qtime" && "$qtime" =~ ^[0-9]+$ ]]; then
+        echo 0
     else
-        candidates=(
-            "223.5.5.5 223.6.6.6"
-            "119.29.29.29 182.254.116.116"
-            "1.1.1.1 1.0.0.1"
-            "9.9.9.9 149.112.112.112"
-            "8.8.8.8 8.8.4.4"
-        )
+        echo 80
+    fi
+}
+
+dns_candidate_servers() {
+    cat <<'EOF'
+aliyun 223.5.5.5
+aliyun 223.6.6.6
+tencent 119.29.29.29
+tencent 182.254.116.116
+cloudflare 1.1.1.1
+cloudflare 1.0.0.1
+quad9 9.9.9.9
+quad9 149.112.112.112
+google 8.8.8.8
+google 8.8.4.4
+EOF
+}
+
+dns_server_score_line() {
+    local provider="$1" dns_ip="$2" mode="$3"
+    local total=0 success=0 samples=0 best=9999 worst=0 qtime ping_ms tcp_penalty bias fail_penalty avg jitter score
+    local domain rrtype
+
+    while read -r domain rrtype; do
+        [[ -n "$domain" && -n "$rrtype" ]] || continue
+        samples=$((samples + 1))
+        qtime="$(measure_dns_latency_ms "$dns_ip" "$domain" "$rrtype")"
+        if [[ "$qtime" =~ ^[0-9]+$ ]] && (( qtime < 9999 )); then
+            success=$((success + 1))
+            total=$((total + qtime))
+            (( qtime < best )) && best=$qtime
+            (( qtime > worst )) && worst=$qtime
+        fi
+    done < <(dns_probe_matrix)
+
+    if (( success == 0 )); then
+        echo "999999|${provider}|${dns_ip}|0/${samples}|9999|9999|9999"
+        return 0
     fi
 
-    for pair in "${candidates[@]}"; do
-        primary="${pair%% *}"
-        secondary="${pair##* }"
-        
-        # 测速主 DNS
-        lat1="$(measure_dns_latency_ms "$primary")"
-        # 如果主 DNS 解析就失败了，直接放弃这组，避免将坏节点写入系统
-        [[ "$lat1" == "9999" ]] && continue 
-        
-        # 测速备用 DNS
-        lat2="$(measure_dns_latency_ms "$secondary")"
-        [[ "$lat2" == "9999" ]] && lat2=$lat1 # 备用失败则用主节点延迟替代，增加一点惩罚但组保留
-        
-        score=$((lat1 + lat2))
-        if (( score < best_score )); then
-            best_score=$score
-            best_pair="$pair"
+    avg=$(( total / success ))
+    jitter=$(( worst > best ? worst - best : 0 ))
+    ping_ms="$(dns_ping_latency_ms "$dns_ip")"
+    tcp_penalty="$(dns_probe_tcp_bonus "$dns_ip")"
+    fail_penalty=$(( (samples - success) * 220 ))
+    bias="$(dns_provider_region_bias "$provider" "$mode")"
+    score=$(( avg * 5 + jitter * 2 + ping_ms + fail_penalty + tcp_penalty + bias ))
+
+    echo "${score}|${provider}|${dns_ip}|${success}/${samples}|${avg}|${ping_ms}|${jitter}"
+}
+
+select_best_dns_pair() {
+    local mode="$(profile_alias "${1:-stable}")"
+    local lines=() sorted=() line provider ip score health avg ping_ms jitter
+    local primary_ips=() primary_providers=() fallback_ips=() summary_parts=()
+    local fallback_same_provider=""
+
+    while read -r provider ip; do
+        [[ -n "$provider" && -n "$ip" ]] || continue
+        lines+=("$(dns_server_score_line "$provider" "$ip" "$mode")")
+    done < <(dns_candidate_servers)
+
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        echo "223.5.5.5 119.29.29.29|223.6.6.6 1.0.0.1|fallback"
+        return 0
+    fi
+
+    mapfile -t sorted < <(printf '%s\n' "${lines[@]}" | sort -t'|' -n -k1,1)
+
+    for line in "${sorted[@]}"; do
+        IFS='|' read -r score provider ip health avg ping_ms jitter <<< "$line"
+        [[ -n "$score" && "$score" =~ ^[0-9]+$ ]] || continue
+        (( score >= 999999 )) && continue
+        summary_parts+=("${provider}:${ip}:score=${score}:ok=${health}:avg=${avg}ms:ping=${ping_ms}ms:jitter=${jitter}ms")
+
+        if [[ ${#primary_ips[@]} -eq 0 ]]; then
+            primary_ips+=("$ip")
+            primary_providers+=("$provider")
+            continue
+        fi
+
+        if [[ ${#primary_ips[@]} -eq 1 ]]; then
+            if [[ "$provider" != "${primary_providers[0]}" ]]; then
+                primary_ips+=("$ip")
+                primary_providers+=("$provider")
+            elif [[ -z "$fallback_same_provider" ]]; then
+                fallback_same_provider="$ip"
+            fi
+            continue
+        fi
+
+        if [[ ${#fallback_ips[@]} -lt 2 ]] && [[ " ${primary_ips[*]} ${fallback_ips[*]} " != *" ${ip} "* ]]; then
+            fallback_ips+=("$ip")
         fi
     done
 
-    [[ -n "$best_pair" ]] && echo "$best_pair" || echo "223.5.5.5 223.6.6.6"
+    if [[ ${#primary_ips[@]} -lt 2 && -n "$fallback_same_provider" && " ${primary_ips[*]} " != *" ${fallback_same_provider} "* ]]; then
+        primary_ips+=("$fallback_same_provider")
+    fi
+
+    while [[ ${#primary_ips[@]} -lt 2 ]]; do
+        case ${#primary_ips[@]} in
+            0) primary_ips+=("223.5.5.5") ;;
+            1) primary_ips+=("119.29.29.29") ;;
+        esac
+    done
+
+    while [[ ${#fallback_ips[@]} -lt 2 ]]; do
+        case ${#fallback_ips[@]} in
+            0)
+                [[ " ${primary_ips[*]} ${fallback_ips[*]} " != *" 223.6.6.6 "* ]] && fallback_ips+=("223.6.6.6") || fallback_ips+=("1.0.0.1")
+                ;;
+            1)
+                [[ " ${primary_ips[*]} ${fallback_ips[*]} " != *" 1.0.0.1 "* ]] && fallback_ips+=("1.0.0.1") || fallback_ips+=("8.8.4.4")
+                ;;
+        esac
+    done
+
+    echo "${primary_ips[0]} ${primary_ips[1]}|${fallback_ips[0]} ${fallback_ips[1]}|$(printf '%s' "${summary_parts[*]}")"
 }
 
 smart_dns_apply() {
     local mode="$(profile_alias "${1:-stable}")"
     local dns_action="${2:-auto}"
-    local pair d1 d2 actual_action
+    local plan primary_list fallback_list score_board actual_action
+    local d1 d2 f1 f2 apply_list
 
-    pair="$(select_best_dns_pair "$mode")"
-    d1="${pair%% *}"
-    d2="${pair##* }"
+    plan="$(select_best_dns_pair "$mode")"
+    IFS='|' read -r primary_list fallback_list score_board <<< "$plan"
+    d1="${primary_list%% *}"
+    d2="${primary_list##* }"
+    f1="${fallback_list%% *}"
+    f2="${fallback_list##* }"
 
     if [[ "$dns_action" == "auto" ]]; then
         [[ "$mode" == "perf" ]] && actual_action=lock || actual_action=set
@@ -2703,17 +2624,24 @@ smart_dns_apply() {
 
     dns_backup
     if [[ -L /etc/resolv.conf ]] && readlink -f /etc/resolv.conf 2>/dev/null | grep -q '/run/systemd/resolve/'; then
-        dns_apply_systemd_resolved_custom "$d1" "$d2"
+        dns_apply_systemd_resolved_smart "$primary_list" "$fallback_list"
         [[ "$actual_action" == "lock" ]] && chattr +i /etc/resolv.conf 2>/dev/null || true
     else
-        dns_apply_resolvconf_custom "$actual_action" "$d1" "$d2"
+        apply_list="$d1 $d2"
+        [[ -n "$f1" ]] && apply_list+=" $f1"
+        dns_apply_resolvconf_custom "$actual_action" $apply_list
     fi
 
     meta_set "DNS_SELECTED" "${d1},${d2}"
-    echo -e "${GREEN}✅ 已自动选择 DNS: ${d1} ${d2} (${actual_action})${RESET}"
+    meta_set "DNS_FALLBACK" "${f1},${f2}"
+    meta_set "DNS_MODE" "$mode"
+    meta_set "DNS_SCOREBOARD" "$score_board"
+    meta_set "DNS_PROBED_AT" "$(date '+%F %T')"
+    echo -e "${GREEN}✅ 已自动选择 DNS: ${d1} ${d2}${RESET}"
+    echo -e "${CYAN}   备用 DNS: ${f1} ${f2}   模式: ${mode}   应用方式: ${actual_action}${RESET}"
 }
 
-render_sysctl_profile() {
+render_sysctl_profile() { {
     local target="$1" env="$2" mode="$(profile_alias "$3")" tier="${4:-medium}" cc qdisc
     local rmax wmax rmem wmem somax backlog filemax fin_timeout keepalive_time keepalive_intvl keepalive_probes
     cc="$(best_congestion_control)"
@@ -3518,10 +3446,37 @@ dns_apply_systemd_resolved_custom() {
 [Resolve]
 DNS=${dns_list}
 FallbackDNS=9.9.9.9 149.112.112.112
-DNSSEC=no
+Domains=~.
+Cache=yes
+DNSSEC=allow-downgrade
+DNSOverTLS=no
+LLMNR=no
+MulticastDNS=no
 EOF
     chmod 644 "$RESOLVED_DROPIN" 2>/dev/null || true
     systemctl restart systemd-resolved 2>/dev/null || true
+    have_cmd resolvectl && resolvectl flush-caches >/dev/null 2>&1 || true
+}
+
+dns_apply_systemd_resolved_smart() {
+    local primary_list="$1" fallback_list="$2" dns_list
+    dns_list="$primary_list"
+    [[ -n "$fallback_list" ]] && dns_list+=" $fallback_list"
+    mkdir -p /etc/systemd/resolved.conf.d
+    cat > "$RESOLVED_DROPIN" << EOF
+[Resolve]
+DNS=${dns_list}
+FallbackDNS=9.9.9.9 149.112.112.112
+Domains=~.
+Cache=yes
+DNSSEC=allow-downgrade
+DNSOverTLS=no
+LLMNR=no
+MulticastDNS=no
+EOF
+    chmod 644 "$RESOLVED_DROPIN" 2>/dev/null || true
+    systemctl restart systemd-resolved 2>/dev/null || true
+    have_cmd resolvectl && resolvectl flush-caches >/dev/null 2>&1 || true
 }
 
 dns_manual_set() {
@@ -3641,6 +3596,18 @@ dns_status() {
     else
         echo -e "systemd-resolved drop-in: ${GREEN}disabled${RESET}"
     fi
+
+    local selected fallback mode probed_at scoreboard
+    selected="$(meta_get DNS_SELECTED 2>/dev/null || true)"
+    fallback="$(meta_get DNS_FALLBACK 2>/dev/null || true)"
+    mode="$(meta_get DNS_MODE 2>/dev/null || true)"
+    probed_at="$(meta_get DNS_PROBED_AT 2>/dev/null || true)"
+    scoreboard="$(meta_get DNS_SCOREBOARD 2>/dev/null || true)"
+    [[ -n "$selected" ]] && echo -e "已选 DNS: ${GREEN}${selected}${RESET}"
+    [[ -n "$fallback" ]] && echo -e "备用 DNS: ${GREEN}${fallback}${RESET}"
+    [[ -n "$mode" ]] && echo -e "调优模式: ${GREEN}${mode}${RESET}"
+    [[ -n "$probed_at" ]] && echo -e "最近探测: ${GREEN}${probed_at}${RESET}"
+    [[ -n "$scoreboard" ]] && echo -e "评分摘要: ${YELLOW}${scoreboard}${RESET}"
 
     echo -e "${CYAN}---------- /etc/resolv.conf ----------${RESET}"
     sed -n '1,30p' /etc/resolv.conf 2>/dev/null || true
@@ -4605,7 +4572,7 @@ view_all_info() {
         port=$(printf '%s' "$ss_inbound" | jq -r '.port')
         method=$(printf '%s' "$ss_inbound" | jq -r '.settings.method')
         password=$(printf '%s' "$ss_inbound" | jq -r '.settings.password')
-        userinfo=$(printf '%s' "${method}:${password}" | base64 -w 0)
+        userinfo=$(ss_make_userinfo "$method" "$password")
         link="ss://${userinfo}@${ip}:${port}#${host// /%20}-SS2022"
         echo -e "${GREEN}[ Shadowsocks-2022 ]${RESET}"
         echo -e "地址: ${GREEN}${ip}${RESET}"
@@ -5315,21 +5282,18 @@ update_xray_if_needed() {
 }
 
 update_components_with_rollback() {
-    local is_silent=$1
-    local updated_any=0
+    local is_silent="$1"
+    local r3=0
 
-    update_xray_if_needed; local r3=$?
-
-    [[ $r3 -eq 0 ]] && updated_any=1
+    update_xray_if_needed
+    r3=$?
 
     if [[ "$is_silent" != "silent" ]]; then
-        if [[ $updated_any -eq 1 ]]; then
-            echo -e "${GREEN}✅ Xray 核心已完成更新（受控重启，失败自动回滚）。${RESET}"
-        else
-            echo -e "${GREEN}✅ Xray 核心已是最新版本或无需更新。${RESET}"
-        fi
+        report_update_result "Xray" "$r3"
+        [[ $r3 -eq 0 ]] && echo -e "${GREEN}ℹ️ 已执行受控热切换；若重启失败会自动回滚。${RESET}"
         sleep 2
     fi
+    return $r3
 }
 
 hot_update_components() {
@@ -5902,7 +5866,13 @@ NFTABLES_CREATED_MARK="/etc/nftables.conf.nftmgr_created"
 PERSIST_MODE_DEFAULT="service"
 NFT_MGR_CONF="${NFT_MGR_DIR}/nft_mgr.conf"
 COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
-[[ -f "$COMMON_MODULE_FILE" ]] && source "$COMMON_MODULE_FILE"
+if [[ -f "$COMMON_MODULE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$COMMON_MODULE_FILE"
+else
+    echo "缺少公共模块: $COMMON_MODULE_FILE" >&2
+    exit 1
+fi
 NFT_MGR_SERVICE="/etc/systemd/system/nft-mgr.service"
 
 SYSCTL_FILE="/etc/sysctl.d/99-nft-mgr.conf"
@@ -5929,7 +5899,8 @@ settings_get() {
     grep -E "^${key}=" "$SETTINGS_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//; s/"$//'
 }
 settings_set() {
-    local key="$1"; local value="$2"
+    local key="$1"
+    local value="$2"
     touch "$SETTINGS_FILE" 2>/dev/null || true
     chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
     if grep -qE "^${key}=" "$SETTINGS_FILE" 2>/dev/null; then
@@ -5942,39 +5913,8 @@ PERSIST_MODE="$(settings_get "PERSIST_MODE" || true)"
 [[ -z "$PERSIST_MODE" ]] && PERSIST_MODE="$PERSIST_MODE_DEFAULT"
 
 # --------------------------
-# 颜色
-# --------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-PLAIN='\033[0m'
-
-msg_ok()   { echo -e "${GREEN}$*${PLAIN}"; }
-msg_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
-msg_err()  { echo -e "${RED}$*${PLAIN}"; }
-
-# 基础工具
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-# --------------------------
 # 环境与依赖
 # --------------------------
-require_root() {
-    [[ $EUID -ne 0 ]] && msg_err "错误: 必须使用 root 权限运行!" && exit 1
-}
-
-# 获取脚本真实路径（兼容不支持 readlink -f 的环境）
-script_realpath() {
-    local p="$0"
-    if command -v readlink >/dev/null 2>&1; then
-        readlink -f "$p" 2>/dev/null && return 0
-    fi
-    if command -v realpath >/dev/null 2>&1; then
-        realpath "$p" 2>/dev/null && return 0
-    fi
-    echo "$p"
-}
 detect_pkg_mgr() {
     if have_cmd apt-get; then
         echo "apt"
@@ -5994,11 +5934,10 @@ install_deps() {
 
     # 依赖：nft/curl/flock/ss（域名解析允许 dig/getent/host/nslookup 任一）
     if [[ "$mgr" == "apt" ]]; then
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -yqq nftables dnsutils curl util-linux iproute2 >/dev/null 2>&1 || true
+        apt-get update -qq >/dev/null 2>&1 || return 1
+        apt-get install -yqq nftables dnsutils curl util-linux iproute2 >/dev/null 2>&1 || return 1
     else
-        # dnf/yum
-        "$mgr" install -y nftables bind-utils curl util-linux iproute >/dev/null 2>&1 || true
+        "$mgr" install -y nftables bind-utils curl util-linux iproute >/dev/null 2>&1 || return 1
     fi
 }
 
@@ -6006,18 +5945,21 @@ have_dns_resolver() {
     have_cmd dig || have_cmd getent || have_cmd host || have_cmd nslookup
 }
 
-check_env() {
+nft_check_env() {
     # 自动装依赖（尽量温和），dig 不再作为必需项，避免仅因缺少 dnsutils 就卡在进入菜单时
-    local need=0
+    local need=0 c
+    local missing=()
     for c in nft curl flock ss sysctl; do
         have_cmd "$c" || need=1
     done
-    [[ $need -eq 1 ]] && install_deps
+    if [[ $need -eq 1 ]]; then
+        install_deps || msg_warn "⚠️ 依赖自动安装未完全成功，请按提示手动补装。"
+    fi
 
-    # 再次检查关键依赖
     for c in nft curl flock ss sysctl; do
-        have_cmd "$c" || msg_warn "⚠️ 未找到依赖命令: $c（部分功能可能不可用）"
+        have_cmd "$c" || missing+=("$c")
     done
+    ((${#missing[@]} == 0)) || msg_warn "⚠️ 仍缺少关键依赖：${missing[*]}"
     have_dns_resolver || msg_warn "⚠️ 未找到 dig/getent/host/nslookup，域名转发将不可用。"
 
     mkdir -p "$(dirname "$CONFIG_FILE")" "$LOG_DIR" "$NFT_MGR_DIR" 2>/dev/null || true
@@ -6027,10 +5969,6 @@ check_env() {
     chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
 }
 
-install_global_command() {
-    # 已由综合脚本 my 统一安装命令入口，不再创建 /usr/local/bin/nftmgr
-    return 0
-}
 # --------------------------
 # 锁（防并发踩踏）
 # --------------------------
@@ -6159,8 +6097,9 @@ nftables_conf_includes_mgr() {
 
 enable_persist_system() {
     # 兼容模式：把 nft_mgr.conf 纳入 nftables.service 的持久化体系
+    local bak="" created_file=0
     mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
-    [[ -f "$NFT_MGR_CONF" ]] || generate_empty_conf "$NFT_MGR_CONF"
+    [[ -f "$NFT_MGR_CONF" ]] || generate_empty_conf "$NFT_MGR_CONF" || return 1
 
     if [[ -e "$NFTABLES_CONF" && ! -f "$NFTABLES_CONF" ]]; then
         msg_err "❌ ${NFTABLES_CONF} 存在但不是普通文件，无法注入 include。"
@@ -6176,36 +6115,66 @@ include "${NFT_MGR_CONF}"
 EOF
         chmod 644 "$NFTABLES_CONF" 2>/dev/null || true
         echo "1" > "$NFTABLES_CREATED_MARK" 2>/dev/null || true
+        created_file=1
     else
-        # 备份并注入 include
-        local bak="${NFTABLES_CONF}.nftmgr.bak.$(date +%s)"
-        cp -a "$NFTABLES_CONF" "$bak" 2>/dev/null || true
+        bak="${NFTABLES_CONF}.nftmgr.bak.$(date +%s)"
+        cp -a "$NFTABLES_CONF" "$bak" >/dev/null 2>&1 || {
+            msg_err "❌ 备份 ${NFTABLES_CONF} 失败，已终止注入 include。"
+            return 1
+        }
 
         if ! nftables_conf_includes_mgr; then
             printf "
 # nftmgr include (added %s)
 include "%s"
-" "$(date '+%F %T')" "$NFT_MGR_CONF" >> "$NFTABLES_CONF"
+" "$(date '+%F %T')" "$NFT_MGR_CONF" >> "$NFTABLES_CONF" || {
+                cp -a "$bak" "$NFTABLES_CONF" >/dev/null 2>&1 || true
+                msg_err "❌ 写入 ${NFTABLES_CONF} 失败，已恢复原配置。"
+                return 1
+            }
         fi
     fi
 
-    # 校验 & 启用 nftables 持久化
-    if have_cmd nft; then
-        if ! nft -c -f "$NFTABLES_CONF" >/dev/null 2>&1; then
-            msg_err "❌ 注入后 ${NFTABLES_CONF} 语法校验失败，已保留备份文件，请手动检查。"
+    if have_cmd nft && ! nft -c -f "$NFTABLES_CONF" >/dev/null 2>&1; then
+        if [[ -n "$bak" && -f "$bak" ]]; then
+            cp -a "$bak" "$NFTABLES_CONF" >/dev/null 2>&1 || true
+        elif (( created_file == 1 )); then
+            rm -f "$NFTABLES_CONF" "$NFTABLES_CREATED_MARK" >/dev/null 2>&1 || true
+        fi
+        msg_err "❌ 注入后 ${NFTABLES_CONF} 语法校验失败，已自动恢复原配置。"
+        return 1
+    fi
+
+    if have_cmd systemctl; then
+        if ! systemctl enable nftables >/dev/null 2>&1; then
+            [[ -n "$bak" && -f "$bak" ]] && cp -a "$bak" "$NFTABLES_CONF" >/dev/null 2>&1 || true
+            (( created_file == 1 )) && [[ -z "$bak" ]] && rm -f "$NFTABLES_CONF" "$NFTABLES_CREATED_MARK" >/dev/null 2>&1 || true
+            msg_err "❌ 启用 nftables 服务失败，已恢复原配置。"
+            return 1
+        fi
+        if ! systemctl restart nftables >/dev/null 2>&1; then
+            if [[ -n "$bak" && -f "$bak" ]]; then
+                cp -a "$bak" "$NFTABLES_CONF" >/dev/null 2>&1 || true
+                systemctl restart nftables >/dev/null 2>&1 || true
+            elif (( created_file == 1 )); then
+                rm -f "$NFTABLES_CONF" "$NFTABLES_CREATED_MARK" >/dev/null 2>&1 || true
+            fi
+            msg_err "❌ 重启 nftables 服务失败，已恢复原配置。"
+            return 1
+        fi
+        systemctl disable --now nft-mgr >/dev/null 2>&1 || true
+    else
+        if ! have_cmd nft || ! nft -f "$NFTABLES_CONF" >/dev/null 2>&1; then
+            if [[ -n "$bak" && -f "$bak" ]]; then
+                cp -a "$bak" "$NFTABLES_CONF" >/dev/null 2>&1 || true
+            elif (( created_file == 1 )); then
+                rm -f "$NFTABLES_CONF" "$NFTABLES_CREATED_MARK" >/dev/null 2>&1 || true
+            fi
+            msg_err "❌ 应用 ${NFTABLES_CONF} 失败，已恢复原配置。"
             return 1
         fi
     fi
 
-    if have_cmd systemctl; then
-        systemctl enable --now nftables >/dev/null 2>&1 || true
-        systemctl restart nftables >/dev/null 2>&1 || true
-        # 为避免双重加载导致困惑，兼容模式下默认停用 nft-mgr oneshot
-        systemctl disable --now nft-mgr >/dev/null 2>&1 || true
-    else
-        # 无 systemd：至少立即加载一次
-        nft -f "$NFTABLES_CONF" >/dev/null 2>&1 || true
-    fi
     PERSIST_MODE="system"
     msg_ok "✅ 已启用【系统持久化兼容模式】：/etc/nftables.conf 已包含 nft_mgr.conf。"
     return 0
@@ -6763,23 +6732,6 @@ format_bytes() {
 # --------------------------
 # 新增转发
 # --------------------------
-port_in_use() {
-    local port="$1"
-    local proto="$2"
-    proto="$(normalize_proto "$proto")"
-    local used=1
-
-    if have_cmd ss; then
-        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
-            ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
-        fi
-        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
-            ss -lnuH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
-        fi
-    fi
-    return $used
-}
-
 add_forward_impl() {
     local lport taddr tport proto tip
 
@@ -7057,18 +7009,6 @@ manage_cron() {
     esac
 }
 
-# --------------------------
-download_to() {
-    local url="$1"
-    local out="$2"
-    if have_cmd curl; then
-        curl -fsSL --retry 2 --connect-timeout 8 --max-time 120 "$url" -o "$out" >/dev/null 2>&1
-    elif have_cmd wget; then
-        wget -qO "$out" "$url" >/dev/null 2>&1
-    else
-        return 1
-    fi
-}
 
 # --------------------------
 # 清空规则
@@ -7234,7 +7174,7 @@ nft_tools_menu() {
 # --------------------------
 # 主菜单
 # --------------------------
-main_menu() {
+nft_main_menu() {
     clear 2>/dev/null || true
     echo -e "${GREEN}==========================================${PLAIN}"
     echo -e "${GREEN}     nftables 端口转发管理面板 (Pro)      ${PLAIN}"
@@ -8084,37 +8024,57 @@ daily_clean() {
 # GitHub 一键更新（选项 4）
 # --------------------------
 download_to() {
-    local url="$1"
-    local out="$2"
+    local url="$1" out="$2" tmp="" rc=1
+    [[ -n "$url" && -n "$out" ]] || return 1
+    tmp="$(mktemp "${TMPDIR:-/tmp}/my.update.dl.XXXXXX")" || return 1
+
     if have_cmd curl; then
-        curl -fsSL --retry 2 --connect-timeout 8 --max-time 120 "$url" -o "$out" >/dev/null 2>&1
+        curl -fsSL --retry 2 --connect-timeout 8 --max-time 120 "$url" -o "$tmp" >/dev/null 2>&1
+        rc=$?
     elif have_cmd wget; then
-        wget -qO "$out" "$url" >/dev/null 2>&1
+        wget -qO "$tmp" "$url" >/dev/null 2>&1
+        rc=$?
     else
+        rm -f "$tmp"
         return 1
     fi
+
+    [[ $rc -eq 0 && -s "$tmp" ]] || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$out" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+    return 0
 }
 
 verify_update_file() {
-    local f="$1"
+    local f="$1" size="" checksum=""
 
-    # 1) 基础校验
+    [[ -s "$f" ]] || return 10
+    size=$(wc -c < "$f" 2>/dev/null | tr -d '[:space:]')
+    [[ "$size" =~ ^[0-9]+$ ]] || return 15
+    (( size >= 50000 )) || return 16
+
     grep -q '^#!/bin/bash' "$f" || return 11
     grep -q 'CMD_NAME="my"' "$f" || return 12
     grep -q 'MY_SCRIPT_ID="my-manager"' "$f" || return 13
+    grep -q '^github_update()' "$f" || return 17
+    grep -q '^main_menu()' "$f" || return 18
+    grep -q '^init()' "$f" || return 19
 
-    # 2) 语法校验
     bash -n "$f" >/dev/null 2>&1 || return 14
 
+    checksum=$(file_sha256_hex "$f" 2>/dev/null || true)
+    [[ "$checksum" =~ ^[0-9a-fA-F]{64}$ ]] || return 20
     return 0
 }
 
 github_update() {
     require_root
 
-    local tmp
-    tmp="$(mktemp /tmp/my.update.XXXXXX)"
-    local used=""
+    local tmp used rc dst bak="" new_sha="" old_sha=""
+    tmp="$(mktemp /tmp/my.update.XXXXXX)" || {
+        msg_err "更新失败：无法创建临时文件。"
+        return 1
+    }
+    used=""
 
     msg_info "开始更新：自动检测国内/国外网络..."
 
@@ -8128,25 +8088,49 @@ github_update() {
         return 1
     fi
 
-    if ! verify_update_file "$tmp"; then
-        local rc=$?
+    verify_update_file "$tmp"
+    rc=$?
+    if (( rc != 0 )); then
         rm -f "$tmp"
         msg_err "更新失败：下载文件校验不通过（错误码 $rc），已终止替换。"
         return 1
     fi
 
-    local dst="/usr/local/bin/${CMD_NAME}"
+    dst="/usr/local/bin/${CMD_NAME}"
     mkdir -p "$(dirname "$dst")" 2>/dev/null || true
 
+    new_sha=$(file_sha256_hex "$tmp" 2>/dev/null || true)
+    old_sha=$(file_sha256_hex "$dst" 2>/dev/null || true)
+    if [[ -n "$new_sha" && -n "$old_sha" && "$new_sha" == "$old_sha" ]]; then
+        rm -f "$tmp"
+        msg_ok "✅ 当前已是最新脚本（内容一致，无需替换）。"
+        return 0
+    fi
+
     if [[ -f "$dst" ]]; then
-        local bak="${dst}.bak.$(date +%s)"
-        cp -f "$dst" "$bak" 2>/dev/null || true
+        bak="${dst}.bak.$(date +%s)"
+        cp -f "$dst" "$bak" 2>/dev/null || {
+            rm -f "$tmp"
+            msg_err "更新失败：备份旧版本失败。"
+            return 1
+        }
         msg_info "已备份旧版本：$bak"
     fi
 
-    install -m 755 "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; msg_err "安装新版本失败。"; return 1; }
-    rm -f "$tmp"
+    if ! install -m 755 "$tmp" "$dst" 2>/dev/null; then
+        rm -f "$tmp"
+        msg_err "安装新版本失败。"
+        return 1
+    fi
 
+    if ! bash -n "$dst" >/dev/null 2>&1; then
+        [[ -n "$bak" && -f "$bak" ]] && cp -f "$bak" "$dst" 2>/dev/null || true
+        rm -f "$tmp"
+        msg_err "更新失败：安装后的脚本语法校验未通过，已恢复旧版本。"
+        return 1
+    fi
+
+    rm -f "$tmp"
     msg_ok "✅ 更新成功（来源：${used}）。正在重启脚本..."
     exec "$dst"
 }
@@ -8319,7 +8303,7 @@ run_nft_module_menu() {
       # 自动检测并完成持久化设置（无单独菜单项）
       auto_persist_setup
       while true; do
-          main_menu
+          nft_main_menu
       done
     )
 }
@@ -8785,7 +8769,7 @@ nft_cli() {
             ( source "${NFT_MODULE_FILE}" || exit 1; ddns_update )
             ;;
         optimize|auto)
-            ( source "${NFT_MODULE_FILE}" || exit 1; check_env; nft_apply_profile "${2:-stable}" )
+            ( source "${NFT_MODULE_FILE}" || exit 1; nft_check_env; nft_apply_profile "${2:-stable}" )
             ;;
         *)
             msg_err "用法: my nft <--cron|optimize [stable|extreme]>"
