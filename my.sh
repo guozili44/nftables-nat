@@ -182,6 +182,58 @@ txn_backup_file() {
     local txn="$1" target="$2" bak=""
     mkdir -p "$txn/files" >/dev/null 2>&1 || return 1
     if [[ -e "$target" ]]; then
+        bak=$(mktemp "$txn/files/$(basename "$target").XXXXXX") || ret    chmod 600 "$file" 2>/dev/null || true
+}
+
+state_migrate_file() {
+    local old="$1" new="$2"
+    [[ -e "$old" ]] || return 0
+    state_dir_ensure "$(dirname "$new")" || return 1
+    if [[ ! -e "$new" || ! -s "$new" ]]; then
+        cp -a "$old" "$new" >/dev/null 2>&1 || return 1
+    fi
+}
+
+state_migrate_dir() {
+    local old="$1" new="$2"
+    [[ -d "$old" ]] || return 0
+    state_dir_ensure "$new" || return 1
+    cp -a "$old"/. "$new"/ >/dev/null 2>&1 || true
+}
+
+txn_begin() {
+    local dir
+    dir=$(mktemp -d /tmp/my-txn.XXXXXX) || return 1
+    : > "$dir/stack"
+    echo "$dir"
+}
+
+txn_register() {
+    local txn="$1"; shift
+    local out="" q
+    [[ -n "$txn" ]] || return 1
+    for q in "$@"; do
+        printf -v q '%q' "$q"
+        out+="$q "
+    done
+    printf '%s
+' "${out% }" >> "$txn/stack"
+}
+
+_txn_restore_file() {
+    local dst="$1" bak="$2"
+    [[ -f "$bak" ]] || return 1
+    cp -a "$bak" "$dst" >/dev/null 2>&1 || return 1
+}
+
+_txn_remove_path() {
+    rm -rf "$1" >/dev/null 2>&1 || true
+}
+
+txn_backup_file() {
+    local txn="$1" target="$2" bak=""
+    mkdir -p "$txn/files" >/dev/null 2>&1 || return 1
+    if [[ -e "$target" ]]; then
         bak=$(mktemp "$txn/files/$(basename "$target").XXXXXX") || return 1
         cp -a "$target" "$bak" >/dev/null 2>&1 || { rm -f "$bak"; return 1; }
         txn_register "$txn" _txn_restore_file "$target" "$bak"
