@@ -2619,11 +2619,32 @@ measure_host_latency_ms() {
     ping -4 -n -c 1 -W 1 "$host" 2>/dev/null | awk -F'time=' '/time=/{print $2}' | awk '{print int($1+0.5)}' | head -n 1
 }
 
+# 真正的 DNS 解析测速（测试查询真实域名的耗时）
+measure_dns_latency_ms() {
+    local dns_ip="$1"
+    # 使用一个在全球都有丰富 CDN 节点的域名，更能测出 DNS 分配是否合理
+    local test_domain="www.apple.com" 
+    
+    if have_cmd dig; then
+        local qtime
+        # 发送真实的 A 记录查询，超时设为 1 秒，仅试 1 次，提取 Query time
+        qtime=$(dig @"${dns_ip}" "${test_domain}" A +time=1 +tries=1 2>/dev/null | awk '/Query time:/ {print $4}')
+        if [[ -n "$qtime" && "$qtime" =~ ^[0-9]+$ ]]; then
+            echo "$qtime"
+            return 0
+        fi
+    fi
+    # 解析失败、超时或未安装 dig，返回 9999 惩罚值
+    echo 9999
+}
+
+# 替换原有的 DNS 选优逻辑
 select_best_dns_pair() {
     local mode="$(profile_alias "${1:-stable}")"
     local candidates=() pair primary secondary lat1 lat2 score
     local best_pair="" best_score=999999
 
+    # 备选池不变，国内节点和国际节点分离
     if [[ "$mode" == "perf" ]]; then
         candidates=(
             "1.1.1.1 1.0.0.1"
@@ -2645,10 +2666,16 @@ select_best_dns_pair() {
     for pair in "${candidates[@]}"; do
         primary="${pair%% *}"
         secondary="${pair##* }"
-        lat1="$(measure_host_latency_ms "$primary")"
-        [[ -z "$lat1" ]] && continue
-        lat2="$(measure_host_latency_ms "$secondary")"
-        [[ -z "$lat2" ]] && lat2=$lat1
+        
+        # 测速主 DNS
+        lat1="$(measure_dns_latency_ms "$primary")"
+        # 如果主 DNS 解析就失败了，直接放弃这组，避免将坏节点写入系统
+        [[ "$lat1" == "9999" ]] && continue 
+        
+        # 测速备用 DNS
+        lat2="$(measure_dns_latency_ms "$secondary")"
+        [[ "$lat2" == "9999" ]] && lat2=$lat1 # 备用失败则用主节点延迟替代，增加一点惩罚但组保留
+        
         score=$((lat1 + lat2))
         if (( score < best_score )); then
             best_score=$score
@@ -3029,7 +3056,7 @@ check_env() {
 
     ssr_state_init_if_needed
 
-    local deps=(curl bc wget tar openssl unzip ip ping jq python3)
+    local deps=(curl bc wget tar openssl unzip ip ping jq python3 dig)
     local missing=()
     local dep
     for dep in "${deps[@]}"; do
@@ -3039,13 +3066,16 @@ check_env() {
     if ((${#missing[@]} > 0)); then
         if have_cmd apt-get; then
             apt-get update -qq >/dev/null 2>&1 || true
-            apt-get install -yqq curl jq bc wget tar xz-utils openssl unzip util-linux e2fsprogs iproute2 iputils-ping python3 coreutils >/dev/null 2>&1 || true
+            # Debian/Ubuntu 系列包名叫 dnsutils
+            apt-get install -yqq curl jq bc wget tar xz-utils openssl unzip util-linux e2fsprogs iproute2 iputils-ping python3 coreutils dnsutils >/dev/null 2>&1 || true
         elif have_cmd dnf; then
-            dnf install -y curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute iputils python3 coreutils >/dev/null 2>&1 || true
+            # RedHat/CentOS 系列包名叫 bind-utils
+            dnf install -y curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute iputils python3 coreutils bind-utils >/dev/null 2>&1 || true
         elif have_cmd yum; then
-            yum install -yq curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute iputils python3 coreutils >/dev/null 2>&1 || true
+            yum install -yq curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute iputils python3 coreutils bind-utils >/dev/null 2>&1 || true
         elif have_cmd apk; then
-            apk add --no-cache curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute2 iputils python3 coreutils >/dev/null 2>&1 || true
+            # Alpine 系列包名叫 bind-tools
+            apk add --no-cache curl jq bc wget tar xz openssl unzip util-linux e2fsprogs iproute2 iputils python3 coreutils bind-tools >/dev/null 2>&1 || true
         fi
     fi
 
@@ -5531,7 +5561,31 @@ quic_rule_blocked_iptables() {
 quic_rule_blocked_nft() {
     have_cmd nft || return 1
     nft list table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 || return 1
-    nft list table inet "$QUIC_NFT_TABLE" 2>/dev/null | grep -q "$QUIC_RULE_COMMENT"
+    nft list chain inet "$QUIC_NFT_TABLE" input 2>/dev/null | grep -Eq 'udp dport 443.*drop' || return 1
+    nft list chain inet "$QUIC_NFT_TABLE" output 2>/dev/null | grep -Eq 'udp dport 443.*drop' || return 1
+    return 0
+}
+
+quic_candidate_backends() {
+    local list=() seen=" "
+    if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
+        list+=(ufw); seen+=" ufw "
+    fi
+    if have_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
+        list+=(firewalld); seen+=" firewalld "
+    fi
+    if have_cmd nft && [[ "$seen" != *" nftables "* ]]; then
+        list+=(nftables); seen+=" nftables "
+    fi
+    if (have_cmd iptables || have_cmd ip6tables) && [[ "$seen" != *" iptables "* ]]; then
+        list+=(iptables); seen+=" iptables "
+    fi
+    if [[ ${#list[@]} -eq 0 ]]; then
+        printf %s "none"
+    else
+        printf '%s
+' "${list[@]}"
+    fi
 }
 
 quic_detect_block_backend() {
@@ -5626,17 +5680,9 @@ get_nginx_status_brief() {
 }
 
 select_quic_backend() {
-    if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
-        printf %s "ufw"
-    elif have_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
-        printf %s "firewalld"
-    elif have_cmd iptables || have_cmd ip6tables; then
-        printf %s "iptables"
-    elif have_cmd nft; then
-        printf %s "nftables"
-    else
-        printf %s "none"
-    fi
+    local first
+    first=$(quic_candidate_backends | head -n 1)
+    [[ -n "$first" ]] && printf %s "$first" || printf %s "none"
 }
 
 quic_apply_backend() {
@@ -5683,12 +5729,29 @@ quic_apply_backend() {
             ;;
         nftables)
             if [[ "$action" == "block" ]]; then
-                nft list table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 && nft delete table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 || true
-                nft add table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 || return 1
-                nft 'add chain inet '"$QUIC_NFT_TABLE"' input { type filter hook input priority 0; policy accept; }' >/dev/null 2>&1 || return 1
-                nft 'add chain inet '"$QUIC_NFT_TABLE"' output { type filter hook output priority 0; policy accept; }' >/dev/null 2>&1 || return 1
-                nft add rule inet "$QUIC_NFT_TABLE" input udp dport 443 drop comment "$QUIC_RULE_COMMENT" >/dev/null 2>&1 || return 1
-                nft add rule inet "$QUIC_NFT_TABLE" output udp dport 443 drop comment "$QUIC_RULE_COMMENT" >/dev/null 2>&1 || return 1
+                local nft_tmp nft_log
+                nft_tmp="$(mktemp /tmp/my-quic-nft.XXXXXX.conf)"
+                nft_log="/tmp/my-quic-nft.log"
+                cat >"$nft_tmp" <<EOF
+flush table inet ${QUIC_NFT_TABLE}
+table inet ${QUIC_NFT_TABLE} {
+    chain input {
+        type filter hook input priority filter; policy accept;
+        udp dport 443 counter drop comment "${QUIC_RULE_COMMENT}"
+    }
+    chain output {
+        type filter hook output priority filter; policy accept;
+        udp dport 443 counter drop comment "${QUIC_RULE_COMMENT}"
+    }
+}
+EOF
+                nft delete table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 || true
+                if ! nft -f "$nft_tmp" >"$nft_log" 2>&1; then
+                    rm -f "$nft_tmp"
+                    return 1
+                fi
+                rm -f "$nft_tmp"
+                quic_rule_blocked_nft || return 1
             else
                 nft list table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 && nft delete table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 || true
             fi
@@ -5708,24 +5771,32 @@ quic_unblock_all_backends() {
 }
 
 manage_quic_udp443() {
-    local action="$1" backend actual
+    local action="$1" backend actual tried=() preferred_backend="none"
     if [[ "$action" == "block" ]]; then
         backend=$(select_quic_backend)
+        preferred_backend="$backend"
         if [[ "$backend" == "none" ]]; then
             echo -e "${RED}❌ 未找到可用防火墙后端（ufw / firewalld / iptables / nftables）。${RESET}"
             sleep 2
             return 1
         fi
-        quic_apply_backend "$backend" "block" || true
-        actual=$(quic_detect_block_backend)
+        while IFS= read -r backend; do
+            [[ -z "$backend" || "$backend" == "none" ]] && continue
+            tried+=("$backend")
+            quic_apply_backend "$backend" "block" || true
+            actual=$(quic_detect_block_backend)
+            [[ "$actual" != "none" ]] && break
+        done < <(quic_candidate_backends)
         if [[ "$actual" == "none" ]]; then
-            echo -e "${RED}❌ UDP 443 阻断未生效：后端 ${backend} 未成功写入规则。${RESET}"
+            echo -e "${RED}❌ UDP 443 阻断未生效：已尝试 ${tried[*]:-无可用后端}。${RESET}"
+            [[ -f /tmp/my-quic-nft.log ]] && echo -e "${YELLOW}>>> nftables 调试日志：/tmp/my-quic-nft.log${RESET}"
             sleep 2
             return 1
         fi
         quic_meta_set MANAGED 1
         quic_meta_set BACKEND "$actual"
         quic_meta_set LAST_ACTION block
+        [[ "$actual" != "$preferred_backend" ]] && echo -e "${YELLOW}>>> 首选后端 ${preferred_backend} 未生效，已自动回退到 ${actual}${RESET}"
         echo -e "${GREEN}✅ 已成功阻断 UDP 443 端口 (QUIC 已关闭) / 后端: ${actual}${RESET}"
     else
         backend=$(get_quic_backend)
