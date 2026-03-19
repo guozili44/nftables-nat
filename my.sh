@@ -378,6 +378,7 @@ readonly SWAP_MARK_FILE="${META_DIR}/swap_created_by_ssr"
 readonly SSHD_BACKUP_FILE="${META_DIR}/sshd_config.bak"
 readonly LEGACY_META_DIR="/usr/local/etc/ssr_meta"
 COMMON_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/common_module.sh"
+NGX_MODULE_FILE="${MY_INSTALL_DIR:-/usr/local/lib/my}/nginx_module.sh"
 [[ -f "$COMMON_MODULE_FILE" ]] && source "$COMMON_MODULE_FILE"
 readonly SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/00-my-auth.conf"
 readonly SSH_PORT_DROPIN="/etc/ssh/sshd_config.d/00-my-port.conf"
@@ -1786,7 +1787,18 @@ EOF
 }
 
 reality_nginx_prepare_front() {
-    local sni="$1" xray_port="$2" fallback_backend="$3" conflicts
+    local sni="$1" xray_port="$2" fallback_backend="$3" conflicts ngx_module_file
+    ngx_module_file="${NGX_MODULE_FILE:-/usr/local/lib/my/nginx_module.sh}"
+    if ! declare -F ngx_install_dependencies >/dev/null 2>&1; then
+        if [[ -f "$ngx_module_file" ]]; then
+            # shellcheck disable=SC1090
+            source "$ngx_module_file" || true
+        fi
+    fi
+    if ! declare -F ngx_install_dependencies >/dev/null 2>&1; then
+        echo -e "${RED}❌ 未找到 Nginx 模块函数 ngx_install_dependencies：${ngx_module_file}${RESET}"
+        return 1
+    fi
     ngx_install_dependencies || return 1
     reality_nginx_ensure_stream_module || return 1
     if ! reality_nginx_ensure_stream_include; then
