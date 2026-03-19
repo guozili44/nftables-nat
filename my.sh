@@ -2,7 +2,7 @@
 # 综合管理脚本：SSR + nftables
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v1.3.4  (build 2026-03-15+txn-state-tree)
+# 版本：v1.3.5  (build 2026-03-19+ip-detect-fix)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 
 set -o pipefail
@@ -15,7 +15,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # --------------------------
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="1.3.4"
+MY_VERSION="1.3.5"
 
 MY_INSTALL_DIR="/usr/local/lib/my"
 MY_STATE_DIR="${MY_INSTALL_DIR}/state"
@@ -228,6 +228,25 @@ is_ipv4() {
         [[ "$octet" =~ ^[0-9]+$ ]] || return 1
         ((octet >= 0 && octet <= 255)) || return 1
     done
+}
+
+is_ipv6() {
+    local ip="$1"
+    [[ "$ip" == *:* ]]
+}
+
+is_public_ipv4() {
+    local ip="$1" o1 o2 o3 o4
+    is_ipv4 "$ip" || return 1
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    (( o1 == 0 || o1 == 10 || o1 == 127 )) && return 1
+    (( o1 == 169 && o2 == 254 )) && return 1
+    (( o1 == 172 && o2 >= 16 && o2 <= 31 )) && return 1
+    (( o1 == 192 && o2 == 168 )) && return 1
+    (( o1 == 100 && o2 >= 64 && o2 <= 127 )) && return 1
+    (( o1 == 198 && (o2 == 18 || o2 == 19) )) && return 1
+    (( o1 >= 224 )) && return 1
+    return 0
 }
 
 normalize_proto() {
@@ -1231,13 +1250,111 @@ port_listening_tcp() {
     fi
 }
 
+ssr_extract_first_ip() {
+    local raw="$1" token=""
+    token=$(printf '%s\n' "$raw" | tr -d '\r' | awk '{for(i=1;i<=NF;i++) print $i}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | head -n1)
+    if is_public_ipv4 "$token" || is_ipv6 "$token"; then
+        echo "$token"
+        return 0
+    fi
+    return 1
+}
+
+ssr_fetch_iface_public_ip() {
+    local cand=""
+    if have_cmd ip; then
+        while IFS= read -r cand; do
+            cand="${cand%%/*}"
+            if is_public_ipv4 "$cand"; then
+                echo "$cand"
+                return 0
+            fi
+        done < <(ip -4 -o addr show scope global up 2>/dev/null | awk '{print $4}')
+    fi
+    return 1
+}
+
+ssr_fetch_ddns_record() {
+    local record=""
+    [[ -f "$DDNS_CONF" ]] || return 1
+    record=$(grep -E '^CF_RECORD=' "$DDNS_CONF" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^"//; s/"$//')
+    [[ -n "$record" ]] || return 1
+    printf '%s\n' "$record"
+}
+
 ssr_fetch_public_ip() {
-    curl -s4m8 ip.sb 2>/dev/null || curl -s4m8 ifconfig.me 2>/dev/null || curl -s6m8 ip.sb 2>/dev/null || echo "0.0.0.0"
+    local ip="" url="" out="" cached=""
+
+    ip=$(ssr_fetch_iface_public_ip 2>/dev/null || true)
+    if is_public_ipv4 "$ip" || is_ipv6 "$ip"; then
+        meta_set "LAST_PUBLIC_IP" "$ip"
+        printf '%s\n' "$ip"
+        return 0
+    fi
+
+    for url in \
+        "https://api.ipify.org" \
+        "https://ipv4.icanhazip.com" \
+        "https://ifconfig.me/ip" \
+        "https://4.ident.me" \
+        "https://ipinfo.io/ip" \
+        "https://ip.sb"
+    do
+        out=""
+        if have_cmd curl; then
+            out=$(curl -4 -fsS --connect-timeout 3 --max-time 6 "$url" 2>/dev/null || true)
+        elif have_cmd wget; then
+            out=$(wget -4 -qO- --timeout=6 "$url" 2>/dev/null || true)
+        fi
+        ip=$(ssr_extract_first_ip "$out" 2>/dev/null || true)
+        if is_public_ipv4 "$ip" || is_ipv6 "$ip"; then
+            meta_set "LAST_PUBLIC_IP" "$ip"
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    done
+
+    if have_cmd dig; then
+        out=$(dig +short -4 myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -n1)
+        ip=$(ssr_extract_first_ip "$out" 2>/dev/null || true)
+        if is_public_ipv4 "$ip" || is_ipv6 "$ip"; then
+            meta_set "LAST_PUBLIC_IP" "$ip"
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    elif have_cmd nslookup; then
+        out=$(nslookup myip.opendns.com resolver1.opendns.com 2>/dev/null | awk '/^Address: /{print $2}' | tail -n1)
+        ip=$(ssr_extract_first_ip "$out" 2>/dev/null || true)
+        if is_public_ipv4 "$ip" || is_ipv6 "$ip"; then
+            meta_set "LAST_PUBLIC_IP" "$ip"
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    fi
+
+    cached=$(meta_get "LAST_PUBLIC_IP" 2>/dev/null || true)
+    if is_public_ipv4 "$cached" || is_ipv6 "$cached"; then
+        printf '%s\n' "$cached"
+        return 0
+    fi
+
+    echo "0.0.0.0"
+}
+
+ssr_fetch_node_address() {
+    local addr=""
+    addr=$(ssr_fetch_public_ip 2>/dev/null || true)
+    if is_public_ipv4 "$addr" || is_ipv6 "$addr"; then
+        printf '%s\n' "$addr"
+        return 0
+    fi
+    addr=$(ssr_fetch_ddns_record 2>/dev/null || true)
+    [[ -n "$addr" ]] && printf '%s\n' "$addr" || echo "0.0.0.0"
 }
 
 ssr_make_ss_link() {
     local ip port method password userinfo
-    ip="${1:-$(ssr_fetch_public_ip)}"
+    ip="${1:-$(ssr_fetch_node_address)}"
     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
     method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
     password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
@@ -1248,12 +1365,16 @@ ssr_make_ss_link() {
 
 show_ss_rust_summary() {
     local ip port method password link
-    ip=$(ssr_fetch_public_ip)
+    ip=$(ssr_fetch_node_address)
     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
     method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
     password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
     link=$(ssr_make_ss_link "$ip" 2>/dev/null || true)
-    echo -e "IP: ${GREEN}${ip}${RESET}"
+    if is_ipv4 "$ip" || is_ipv6 "$ip"; then
+        echo -e "IP: ${GREEN}${ip}${RESET}"
+    else
+        echo -e "地址: ${GREEN}${ip}${RESET}"
+    fi
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
     echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
@@ -1409,7 +1530,7 @@ ensure_ss_rust_binary() {
 
 ss_v2ray_make_link() {
     local ip port method password host path plugin_raw plugin_enc userinfo
-    ip="${1:-$(ssr_fetch_public_ip)}"
+    ip="${1:-$(ssr_fetch_node_address)}"
     port=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
     method=$(json_get_path "$SS_V2RAY_CONF" method 2>/dev/null)
     password=$(json_get_path "$SS_V2RAY_CONF" password 2>/dev/null)
@@ -1424,14 +1545,18 @@ ss_v2ray_make_link() {
 
 show_ss_v2ray_summary() {
     local ip port method password host path link
-    ip=$(ssr_fetch_public_ip)
+    ip=$(ssr_fetch_node_address)
     port=$(json_get_path "$SS_V2RAY_CONF" server_port 2>/dev/null)
     method=$(json_get_path "$SS_V2RAY_CONF" method 2>/dev/null)
     password=$(json_get_path "$SS_V2RAY_CONF" password 2>/dev/null)
     host=$(plugin_state_get "$SS_V2RAY_STATE" HOST 2>/dev/null || true)
     path=$(plugin_state_get "$SS_V2RAY_STATE" PATH 2>/dev/null || true)
     link=$(ss_v2ray_make_link "$ip" 2>/dev/null || true)
-    echo -e "IP: ${GREEN}${ip}${RESET}"
+    if is_ipv4 "$ip" || is_ipv6 "$ip"; then
+        echo -e "IP: ${GREEN}${ip}${RESET}"
+    else
+        echo -e "地址: ${GREEN}${ip}${RESET}"
+    fi
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
     echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
@@ -1443,7 +1568,7 @@ ${link}"
 
 show_vless_summary() {
     local ip port uuid sni priv pub sid link
-    ip=$(ssr_fetch_public_ip)
+    ip=$(ssr_fetch_node_address)
     port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
     uuid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.settings.clients.0.id 2>/dev/null)
     sni=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.serverNames.0 2>/dev/null)
@@ -1452,7 +1577,11 @@ show_vless_summary() {
     if [[ -n "$priv" && -x /usr/local/bin/xray ]]; then
         pub=$(xray_extract_reality_public_key "$(/usr/local/bin/xray x25519 -i "$priv" 2>/dev/null || true)")
     fi
-    echo -e "IP: ${GREEN}${ip}${RESET}"
+    if is_ipv4 "$ip" || is_ipv6 "$ip"; then
+        echo -e "IP: ${GREEN}${ip}${RESET}"
+    else
+        echo -e "地址: ${GREEN}${ip}${RESET}"
+    fi
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "UUID: ${GREEN}${uuid:-未读取}${RESET}"
     echo -e "SNI: ${GREEN}${sni:-未读取}${RESET}"
