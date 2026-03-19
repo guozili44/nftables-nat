@@ -1635,27 +1635,66 @@ readonly REALITY_NGX_FALLBACK_KEY="${REALITY_NGX_FALLBACK_CERT_DIR}/privkey.pem"
 readonly REALITY_NGX_FALLBACK_WEBROOT="/var/www/my-reality-fallback"
 readonly REALITY_NGX_MIGRATE_BACKUP_DIR="/etc/nginx/my-reality-front-backup"
 
+reality_nginx_stream_runtime_ok() {
+    local tmp_dir conf err
+    have_cmd nginx || return 1
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/nginx-stream-check.XXXXXX")" || return 1
+    conf="${tmp_dir}/nginx.conf"
+    err="${tmp_dir}/err.log"
+    cat > "$conf" <<'EOF'
+events {}
+stream {
+    server {
+        listen 127.0.0.1:9;
+    }
+}
+http {
+    server {
+        listen 127.0.0.1:9080;
+        return 204;
+    }
+}
+EOF
+    if nginx -t -c "$conf" >"$err" 2>&1; then
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+    if grep -qiE 'unknown directive "stream"|dlopen\(\).*ngx_stream.*failed|module ".*ngx_stream.*" is not binary compatible' "$err" 2>/dev/null; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    rm -rf "$tmp_dir"
+    return 0
+}
+
+reality_nginx_enable_dynamic_stream_modules() {
+    mkdir -p /etc/nginx/modules-enabled 2>/dev/null || true
+    if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]] && [[ ! -f /etc/nginx/modules-enabled/50-mod-stream.conf ]]; then
+        printf '%s\n' 'load_module modules/ngx_stream_module.so;' > /etc/nginx/modules-enabled/50-mod-stream.conf
+    fi
+    if [[ -f /usr/lib/nginx/modules/ngx_stream_ssl_preread_module.so ]] && [[ ! -f /etc/nginx/modules-enabled/70-mod-stream-ssl-preread.conf ]]; then
+        printf '%s\n' 'load_module modules/ngx_stream_ssl_preread_module.so;' > /etc/nginx/modules-enabled/70-mod-stream-ssl-preread.conf
+    fi
+}
+
 reality_nginx_ensure_stream_module() {
     have_cmd nginx || return 1
-    if nginx -V 2>&1 | grep -Eq -- '--with-stream|--with-stream=dynamic'; then
+    if reality_nginx_stream_runtime_ok; then
         return 0
     fi
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null 2>&1 || true
-    apt-get install -y -qq libnginx-mod-stream >/dev/null 2>&1 || apt-get install -y -qq nginx-mod-stream >/dev/null 2>&1 || true
-    if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
-        mkdir -p /etc/nginx/modules-enabled 2>/dev/null || true
-        if [[ ! -f /etc/nginx/modules-enabled/50-mod-stream.conf ]]; then
-            printf '%s\n' 'load_module modules/ngx_stream_module.so;' > /etc/nginx/modules-enabled/50-mod-stream.conf
-        fi
+    apt-get install -y -qq libnginx-mod-stream >/dev/null 2>&1 \
+        || apt-get install -y -qq nginx-mod-stream >/dev/null 2>&1 \
+        || apt-get install -y -qq nginx-full >/dev/null 2>&1 \
+        || apt-get install -y -qq nginx-extras >/dev/null 2>&1 \
+        || true
+    reality_nginx_enable_dynamic_stream_modules
+    if reality_nginx_stream_runtime_ok; then
+        return 0
     fi
-    if [[ -f /usr/lib/nginx/modules/ngx_stream_ssl_preread_module.so ]]; then
-        mkdir -p /etc/nginx/modules-enabled 2>/dev/null || true
-        if [[ ! -f /etc/nginx/modules-enabled/70-mod-stream-ssl-preread.conf ]]; then
-            printf '%s\n' 'load_module modules/ngx_stream_ssl_preread_module.so;' > /etc/nginx/modules-enabled/70-mod-stream-ssl-preread.conf
-        fi
-    fi
-    return 0
+    echo -e "${RED}❌ 当前 Nginx 不支持 stream/ssl_preread，无法启用前置过滤模式。${RESET}"
+    return 1
 }
 
 reality_nginx_ensure_stream_include() {
