@@ -1,5 +1,5 @@
 #!/bin/bash
-# 综合管理脚本：SSR + nftables
+# 综合管理脚本：my
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
 # 版本：v1.3.5  (build 2026-03-19+ip-detect-fix)
@@ -15,7 +15,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # --------------------------
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="1.3.5"
+MY_VERSION="1.3.6"
 
 MY_INSTALL_DIR="/usr/local/lib/my"
 MY_STATE_DIR="${MY_INSTALL_DIR}/state"
@@ -336,7 +336,7 @@ mv -f "${COMMON_MODULE_FILE}.tmp" "${COMMON_MODULE_FILE}"
     # SSR 模块（已移除脚本自更新/卸载菜单，并适配 my 统一管理）
     cat > "${SSR_MODULE_FILE}.tmp" <<'SSR_MODULE_EOF'
 #!/bin/bash
-# 脚本名称: SSR 综合管理脚本 (稳定优先 + 极致性能 Profiles)
+# 脚本名称: my 综合管理脚本
 # 核心特性:
 #   - 节点部署: Shadowsocks-2022 (Xray) / VLESS Reality (Xray)
 #   - 双档位网络调优: 手动选择 常规机器 / NAT 小鸡 => 稳定优先 / 极致优化
@@ -1424,6 +1424,15 @@ random_token() {
         openssl rand -hex "$(( (len+1)/2 ))" 2>/dev/null | cut -c1-"$len"
     else
         tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c "$len"
+    fi
+}
+
+generate_ss_key() {
+    local raw_len="${1:-16}"
+    if have_cmd openssl; then
+        openssl rand "$raw_len" 2>/dev/null | base64_nw
+    else
+        head -c "$raw_len" /dev/urandom 2>/dev/null | base64_nw
     fi
 }
 
@@ -3611,37 +3620,34 @@ dns_menu() {
     while true; do
         clear 2>/dev/null || true
         echo -e "${CYAN}========= DNS 管理中心 =========${RESET}"
-        echo -e "${GREEN} 1.${RESET} 智能选优：稳定优先"
-        echo -e "${GREEN} 2.${RESET} 智能选优：极致优化"
-        echo -e "${YELLOW} 3.${RESET} 一键设置标准 DNS（不锁）"
-        echo -e "${YELLOW} 4.${RESET} 手动设置 DNS（自定义）"
-        echo -e "${YELLOW} 5.${RESET} 锁定 DNS（尽可能稳健）"
-        echo -e "${YELLOW} 6.${RESET} 一键解锁并恢复（回滚至备份）"
+        echo -e "${GREEN} 1.${RESET} 智能选优：极致优化"
+        echo -e "${YELLOW} 2.${RESET} 一键设置标准 DNS（不锁）"
+        echo -e "${YELLOW} 3.${RESET} 手动设置 DNS（自定义）"
+        echo -e "${YELLOW} 4.${RESET} 锁定 DNS（尽可能稳健）"
+        echo -e "${YELLOW} 5.${RESET} 一键解锁并恢复（回滚至备份）"
         echo -e " 0. 返回"
-        read -rp "输入 [0-6]: " dn
+        read -rp "输入 [0-5]: " dn
         case "$dn" in
-            1|2)
-                local profile="stable" dns_mode
-                [[ "$dn" == "2" ]] && profile="extreme"
+            1)
+                local dns_mode
                 read -rp "DNS 模式 [auto/set/lock, 回车 auto]: " dns_mode
-                smart_dns_apply "$profile" "${dns_mode:-auto}"
+                smart_dns_apply "extreme" "${dns_mode:-auto}"
                 sleep 2
                 ;;
-            3)
+            2)
                 dns_set_or_lock "set" && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
                 sleep 2
                 ;;
-            4)
+            3)
                 dns_manual_set && echo -e "${GREEN}✅ DNS 已设置。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
                 sleep 2
                 ;;
-            5)
-                dns_set_or_lock "lock" && echo -e "${GREEN}✅ DNS 已锁定/固定。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
+            4)
+                dns_set_or_lock "lock" && echo -e "${GREEN}✅ DNS 已锁定。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
                 sleep 2
                 ;;
-            6)
-                dns_unlock_restore
-                echo -e "${GREEN}✅ 已解锁并恢复。${RESET}"
+            5)
+                dns_set_or_lock "unlock" && echo -e "${GREEN}✅ DNS 已恢复。${RESET}" || echo -e "${YELLOW}⚠️ 未修改 DNS。${RESET}"
                 sleep 2
                 ;;
             0) return ;;
@@ -4923,13 +4929,12 @@ unified_node_manager() {
         local has_ss=0 has_vless=0
         xray_protocol_exists "shadowsocks" && has_ss=1
         xray_protocol_exists "vless" && has_vless=1
-        echo -e "${CYAN}========= 统一节点生命周期管控中心 =========${RESET}"
-        echo -e "${YELLOW} 1)${RESET} Shadowsocks-2022 (Xray) 管理"
-        echo -e "${YELLOW} 2)${RESET} VLESS Reality (Xray) 管理"
-        echo -e "${YELLOW} 3)${RESET} 清理旧版 Shadowsocks 后端残留"
-        echo -e "${RED} 4) ☢️ 全局强制核爆 (当前仅 Xray)${RESET}"
+        echo -e "${CYAN}========= Xray 节点运维中心 =========${RESET}"
+        echo -e "${YELLOW} 1)${RESET} Shadowsocks-2022 管理"
+        echo -e "${YELLOW} 2)${RESET} VLESS Reality 管理"
+        echo -e "${RED} 3) ☢️ 全局强制核爆 (当前仅 Xray)${RESET}"
         echo -e " 0) 返回主菜单"
-        read -rp "请选择 [0-4]: " node_choice
+        read -rp "请选择 [0-3]: " node_choice
         case "$node_choice" in
             1)
                 if [[ $has_ss -eq 1 ]]; then
@@ -4989,10 +4994,6 @@ unified_node_manager() {
                 fi
                 ;;
             3)
-                cleanup_legacy_ss_backends
-                read -n1 -rsp "按任意键返回..." _
-                ;;
-            4)
                 while true; do
                     clear 2>/dev/null || true
                     echo -e "${CYAN}========= ☢️ 全局强制核爆中心 =========${RESET}"
@@ -5140,19 +5141,15 @@ opt_menu() {
     while true; do
         clear 2>/dev/null || true
         echo -e "${CYAN}========= 网络优化与系统清理中心 =========${RESET}"
-        echo -e "${GREEN} 1.${RESET} 常规机器调优：稳定优先"
-        echo -e "${GREEN} 2.${RESET} 常规机器调优：极致优化"
-        echo -e "${YELLOW} 3.${RESET} NAT 小鸡调优：稳定优先"
-        echo -e "${YELLOW} 4.${RESET} NAT 小鸡调优：极致优化"
-        echo -e "${CYAN} 5.${RESET} 手动清理系统垃圾与冗余日志"
+        echo -e "${GREEN} 1.${RESET} 常规机器调优：极致优化"
+        echo -e "${YELLOW} 2.${RESET} NAT 小鸡调优：极致优化"
+        echo -e "${CYAN} 3.${RESET} 手动清理系统垃圾与冗余日志"
         echo -e " 0. 返回主菜单"
-        read -rp "输入数字 [0-5]: " opt_num
+        read -rp "输入数字 [0-3]: " opt_num
         case "$opt_num" in
-            1) apply_regular_profile "stable" ;;
-            2) apply_regular_profile "extreme" ;;
-            3) apply_nat_profile "stable" ;;
-            4) apply_nat_profile "extreme" ;;
-            5) auto_clean ;;
+            1) apply_regular_profile "extreme" ;;
+            2) apply_nat_profile "extreme" ;;
+            3) auto_clean ;;
             0) return ;;
         esac
     done
@@ -5291,16 +5288,15 @@ update_components_with_rollback() {
     local is_silent=$1
     local updated_any=0
 
-    update_ss_rust_if_needed; local r1=$?
     update_xray_if_needed; local r3=$?
 
-    [[ $r1 -eq 0 || $r3 -eq 0 ]] && updated_any=1
+    [[ $r3 -eq 0 ]] && updated_any=1
 
     if [[ "$is_silent" != "silent" ]]; then
         if [[ $updated_any -eq 1 ]]; then
-            echo -e "${GREEN}✅ 核心组件已完成稳定更新（受控重启，失败自动回滚）。${RESET}"
+            echo -e "${GREEN}✅ Xray 核心已完成更新（受控重启，失败自动回滚）。${RESET}"
         else
-            echo -e "${GREEN}✅ 核心组件已是最新或无需更新。${RESET}"
+            echo -e "${GREEN}✅ Xray 核心已是最新版本或无需更新。${RESET}"
         fi
         sleep 2
     fi
@@ -5324,22 +5320,17 @@ report_update_result() {
 core_cache_menu() {
     while true; do
         clear 2>/dev/null || true
-        echo -e "${CYAN}========= 核心缓存与更新中心 =========${RESET}"
+        echo -e "${CYAN}========= Xray 核心与缓存中心 =========${RESET}"
         echo
         echo -e "${GREEN} 1.${RESET} 更新 Xray 核心"
         echo -e "${YELLOW} 2.${RESET} 清理全部核心缓存"
-        echo -e "${YELLOW} 3.${RESET} 清理旧版 Shadowsocks 后端残留"
         echo -e " 0. 返回主菜单"
-        read -rp "输入数字 [0-3]: " cache_num
+        read -rp "输入数字 [0-2]: " cache_num
         case "$cache_num" in
             1) update_xray_if_needed; report_update_result "Xray" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
             2)
                 core_cache_clear_all
                 echo -e "${GREEN}✅ 本地核心缓存已清理。${RESET}"
-                read -n 1 -s -r -p "按任意键继续..."
-                ;;
-            3)
-                cleanup_legacy_ss_backends
                 read -n 1 -s -r -p "按任意键继续..."
                 ;;
             0) return ;;
@@ -6451,15 +6442,13 @@ nft_apply_profile() {
 optimize_system() {
     clear 2>/dev/null || true
     echo -e "${GREEN}--- NFT 智能调优中心 ---${PLAIN}"
-    echo "1) 稳定优先：保守提升转发与并发"
-    echo "2) 极致优化：激进提升队列/并发/连接追踪"
+    echo "1) 极致优化：激进提升队列/并发/连接追踪"
     echo "0) 返回"
     echo "--------------------------------"
-    read -rp "请选择 [0-2]: " pick
+    read -rp "请选择 [0-1]: " pick
     case "$pick" in
         0) return ;;
-        1) nft_apply_profile "stable" ;;
-        2) nft_apply_profile "extreme" ;;
+        1) nft_apply_profile "extreme" ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
 }
@@ -8192,20 +8181,18 @@ ssr_deploy_menu() {
     while true; do
         clear 2>/dev/null || true
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}         Xray 协议部署中心 (VLESS / SS2022)${RESET}"
+        echo -e "${CYAN}              Xray 节点部署中心            ${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 安装 VLESS Reality (Xray)"
-        echo -e "${YELLOW} 2.${RESET} 安装 Shadowsocks-2022 (Xray)"
-        echo -e "${YELLOW} 3.${RESET} 安装双协议 (VLESS + Shadowsocks-2022)"
-        echo -e "${YELLOW} 4.${RESET} 清理旧版 Shadowsocks 后端残留"
+        echo -e "${YELLOW} 1.${RESET} 安装 VLESS Reality"
+        echo -e "${YELLOW} 2.${RESET} 安装 Shadowsocks-2022"
+        echo -e "${YELLOW} 3.${RESET} 安装双协议 (VLESS + SS2022)"
         echo -e " 0. 返回上一级"
         echo -e "${CYAN}--------------------------------------------${RESET}"
-        read -rp "请输入数字 [0-4]: " choice
+        read -rp "请输入数字 [0-3]: " choice
         case "$choice" in
             1) install_vless_native ;;
             2) install_ss_v2ray_plugin_native ;;
             3) install_dual_xray_native ;;
-            4) cleanup_legacy_ss_backends; read -n1 -rsp "按任意键返回..." _ ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
         esac
@@ -8216,13 +8203,13 @@ ssr_hub_menu() {
     while true; do
         clear 2>/dev/null || true
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}           代理节点与热更中心 (Xray)       ${RESET}"
+        echo -e "${CYAN}                Xray 节点中心             ${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 节点部署中心"
-        echo -e "${YELLOW} 2.${RESET} 节点运维中心"
-        echo -e "${YELLOW} 3.${RESET} 网络优化与系统清理中心"
-        echo -e "${YELLOW} 4.${RESET} 核心缓存与更新中心"
-        echo -e "${YELLOW} 5.${RESET} 系统基础与极客管理"
+        echo -e "${YELLOW} 1.${RESET} 节点部署"
+        echo -e "${YELLOW} 2.${RESET} 节点运维"
+        echo -e "${YELLOW} 3.${RESET} 网络优化与清理"
+        echo -e "${YELLOW} 4.${RESET} 核心与缓存"
+        echo -e "${YELLOW} 5.${RESET} 系统工具与极客管理"
         echo -e " 0. 返回主菜单"
         echo -e "${CYAN}--------------------------------------------${RESET}"
         read -rp "请输入数字 [0-5]: " choice
@@ -8242,6 +8229,7 @@ run_ssr_module_menu() {
     my_enable_ssr_cron_tasks
     (
       source "${SSR_MODULE_FILE}" || exit 1
+      cleanup_legacy_ss_backends silent >/dev/null 2>&1 || true
       ssr_hub_menu
     )
 }
@@ -8918,17 +8906,17 @@ run_status_page() {
 }
 
 # --------------------------
-# 综合管理目录
+# 系统与建站菜单
 # --------------------------
 comprehensive_menu() {
     while true; do
         clear 2>/dev/null || true
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}         系统 / 建站 / 重装中心            ${RESET}"
+        echo -e "${CYAN}              系统与建站中心              ${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 系统基础与极客管理"
-        echo -e "${YELLOW} 2.${RESET} Nginx 反向代理"
-        echo -e "${GREEN} 3.${RESET} DD / 重装系统中心"
+        echo -e "${YELLOW} 1.${RESET} 系统工具与极客管理"
+        echo -e "${YELLOW} 2.${RESET} Nginx 建站与反代"
+        echo -e "${GREEN} 3.${RESET} DD / 重装系统"
         echo -e " 0. 返回主菜单"
         echo -e "${CYAN}--------------------------------------------${RESET}"
         read -rp "请输入数字 [0-3]: " choice
@@ -8948,14 +8936,14 @@ comprehensive_menu() {
 main_menu() {
     clear 2>/dev/null || true
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${CYAN}      综合管理脚本 my  v${MY_VERSION}${RESET}"
+    echo -e "${CYAN}              my 综合管理 v${MY_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${YELLOW} 1.${RESET} 统一状态页 / 管理导航"
-    echo -e "${YELLOW} 2.${RESET} 代理节点与热更中心 (Xray)"
-    echo -e "${YELLOW} 3.${RESET} 端口转发 / NFT 中心"
-    echo -e "${YELLOW} 4.${RESET} 系统 / 建站 / 重装中心"
-    echo -e "${YELLOW} 5.${RESET} GitHub 一键更新"
-    echo -e "${YELLOW} 6.${RESET} 一键卸载"
+    echo -e "${YELLOW} 1.${RESET} 状态页 / 快捷导航"
+    echo -e "${YELLOW} 2.${RESET} Xray 节点中心"
+    echo -e "${YELLOW} 3.${RESET} NFT 转发中心"
+    echo -e "${YELLOW} 4.${RESET} 系统与建站中心"
+    echo -e "${YELLOW} 5.${RESET} 脚本更新"
+    echo -e "${YELLOW} 6.${RESET} 卸载脚本"
     echo -e " 0. 退出"
     echo -e "${CYAN}--------------------------------------------${RESET}"
     read -rp "请输入数字 [0-6]: " choice
