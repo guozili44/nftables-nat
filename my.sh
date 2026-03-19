@@ -338,7 +338,7 @@ mv -f "${COMMON_MODULE_FILE}.tmp" "${COMMON_MODULE_FILE}"
 #!/bin/bash
 # 脚本名称: SSR 综合管理脚本 (稳定优先 + 极致性能 Profiles)
 # 核心特性:
-#   - 节点部署: SS-Rust / Shadowsocks-2022 (Xray) / VLESS Reality (Xray)
+#   - 节点部署: Shadowsocks-2022 (Xray) / VLESS Reality (Xray)
 #   - 双档位网络调优: 手动选择 常规机器 / NAT 小鸡 => 稳定优先 / 极致优化
 #   - Cloudflare DDNS: 原生 API + 定时守护
 #   - 自动任务互斥: cron 使用 flock 防并发踩踏
@@ -1569,6 +1569,7 @@ ss_v2ray_make_link() {
 
 
 show_ss_v2ray_summary() {
+    ensure_jq_available || return 1
     local ip ss_inbound port method password userinfo link
     ss_inbound=$(xray_protocol_get_inbound "shadowsocks" || true)
     [[ -n "$ss_inbound" ]] || { echo -e "${RED}❌ 未检测到 Shadowsocks-2022 (Xray) 配置。${RESET}"; return 1; }
@@ -3387,7 +3388,7 @@ managed_nuke_build_index() {
     NUCLEAR_LABELS=()
     NUCLEAR_PORTS=()
     local idx=1 svc port
-    for svc in ss-rust ss-v2ray xray; do
+    for svc in xray; do
         managed_service_exists "$svc" || continue
         port=$(managed_service_current_port "$svc" 2>/dev/null || true)
         NUCLEAR_TARGETS[$idx]="$svc"
@@ -4177,15 +4178,31 @@ ${YELLOW}========================${RESET}"
 
 # ===== 基于用户上传 TXT 替换的 Xray Reality / Shadowsocks-2022 逻辑 =====
 
-generate_ss_key() {
-    if have_cmd openssl; then
-        openssl rand -base64 16 2>/dev/null
-    else
-        head -c 16 /dev/urandom | base64 | tr -d '\n'
+
+ensure_jq_available() {
+    if have_cmd jq; then
+        return 0
     fi
+    echo -e "${CYAN}>>> 未检测到 jq，正在自动安装...${RESET}"
+    if have_cmd apt-get; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -yqq jq >/dev/null 2>&1 || true
+    elif have_cmd dnf; then
+        dnf install -y jq >/dev/null 2>&1 || true
+    elif have_cmd yum; then
+        yum install -y jq >/dev/null 2>&1 || true
+    elif have_cmd apk; then
+        apk add --no-cache jq >/dev/null 2>&1 || true
+    fi
+    if have_cmd jq; then
+        return 0
+    fi
+    echo -e "${RED}❌ 缺少 jq，且自动安装失败。请手动安装 jq 后重试。${RESET}"
+    return 1
 }
 
-xray_protocol_config_path() {
+ {
     printf %s "/usr/local/etc/xray/config.json"
 }
 
@@ -4193,6 +4210,7 @@ xray_protocol_exists() {
     local proto="$1" cfg
     cfg=$(xray_protocol_config_path)
     [[ -f "$cfg" ]] || return 1
+    have_cmd jq || return 1
     jq -e --arg p "$proto" '.inbounds[]? | select(.protocol == $p)' "$cfg" >/dev/null 2>&1
 }
 
@@ -4200,6 +4218,7 @@ xray_protocol_get_inbound() {
     local proto="$1" cfg
     cfg=$(xray_protocol_config_path)
     [[ -f "$cfg" ]] || return 1
+    have_cmd jq || return 1
     jq -c --arg p "$proto" '.inbounds[]? | select(.protocol == $p)' "$cfg" 2>/dev/null | head -n1
 }
 
@@ -4220,11 +4239,36 @@ is_valid_port() {
 is_port_available() {
     local port="$1"
     is_valid_port "$port" || return 1
-    if xray_protocol_port_in_use "$port"; then
-        echo -e "${YELLOW}⚠ 端口 ${port} 已被占用，请更换。${RESET}"
+    if ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port"; then
+        echo -e "${YELLOW}⚠ TCP 端口 ${port} 已被占用，请更换。${RESET}"
+        return 1
+    fi
+    if ss -lnuH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port"; then
+        echo -e "${YELLOW}⚠ UDP 端口 ${port} 已被占用，请更换。${RESET}"
         return 1
     fi
     return 0
+}
+
+suggest_available_port() {
+    local preferred="$1"; shift || true
+    local port
+    for port in "$preferred" "$@"; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        if is_port_available "$port" >/dev/null 2>&1; then
+            printf %s "$port"
+            return 0
+        fi
+    done
+    port=$((preferred + 1))
+    while [ "$port" -le 65535 ]; do
+        if is_port_available "$port" >/dev/null 2>&1; then
+            printf %s "$port"
+            return 0
+        fi
+        port=$((port + 1))
+    done
+    return 1
 }
 
 is_valid_domain() {
@@ -4234,11 +4278,17 @@ is_valid_domain() {
 
 prompt_for_vless_config() {
     local -n p_port="$1" p_uuid="$2" p_sni="$3"
-    local default_port="${4:-443}"
+    local default_port="${4:-443}" suggested_port=""
 
+    suggested_port=$(suggest_available_port "$default_port" 443 8443 2053 2083 2087 2096 9443 30443 2>/dev/null || true)
     while true; do
-        read -rp "VLESS 端口 [默认 ${default_port}]: " p_port
-        [[ -z "$p_port" ]] && p_port="$default_port"
+        if [[ -n "$suggested_port" && "$suggested_port" != "$default_port" ]]; then
+            read -rp "VLESS 端口 [默认 ${default_port}，回车改用 ${suggested_port}]: " p_port
+            [[ -z "$p_port" ]] && p_port="$suggested_port"
+        else
+            read -rp "VLESS 端口 [默认 ${default_port}]: " p_port
+            [[ -z "$p_port" ]] && p_port="$default_port"
+        fi
         if is_port_available "$p_port"; then
             break
         fi
@@ -4247,17 +4297,20 @@ prompt_for_vless_config() {
     read -rp "UUID [留空自动生成]: " p_uuid
     if [[ -z "$p_uuid" ]]; then
         if [[ -r /proc/sys/kernel/random/uuid ]]; then
-            p_uuid=$(tr -d '\r\n' < /proc/sys/kernel/random/uuid)
+            p_uuid=$(tr -d '
+' < /proc/sys/kernel/random/uuid)
         elif have_cmd uuidgen; then
-            p_uuid=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' | tr -d '\r\n')
+            p_uuid=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' | tr -d '
+')
         else
-            p_uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '\r')
+            p_uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '
+')
         fi
     fi
 
     while true; do
-        read -rp "SNI 域名 [默认 learn.microsoft.com]: " p_sni
-        [[ -z "$p_sni" ]] && p_sni="learn.microsoft.com"
+        read -rp "SNI 域名 [默认 updates.cdn-apple.com]: " p_sni
+        [[ -z "$p_sni" ]] && p_sni="updates.cdn-apple.com"
         if is_valid_domain "$p_sni"; then
             break
         fi
@@ -4267,11 +4320,17 @@ prompt_for_vless_config() {
 
 prompt_for_ss_config() {
     local -n p_port="$1" p_pass="$2"
-    local default_port="${3:-8388}"
+    local default_port="${3:-8388}" suggested_port=""
 
+    suggested_port=$(suggest_available_port "$default_port" 8388 8389 8390 18388 28443 2>/dev/null || true)
     while true; do
-        read -rp "Shadowsocks-2022 端口 [默认 ${default_port}]: " p_port
-        [[ -z "$p_port" ]] && p_port="$default_port"
+        if [[ -n "$suggested_port" && "$suggested_port" != "$default_port" ]]; then
+            read -rp "Shadowsocks-2022 端口 [默认 ${default_port}，回车改用 ${suggested_port}]: " p_port
+            [[ -z "$p_port" ]] && p_port="$suggested_port"
+        else
+            read -rp "Shadowsocks-2022 端口 [默认 ${default_port}]: " p_port
+            [[ -z "$p_port" ]] && p_port="$default_port"
+        fi
         if is_port_available "$p_port"; then
             break
         fi
@@ -4450,6 +4509,7 @@ restart_xray_protocol_service() {
 }
 
 view_all_info() {
+    ensure_jq_available || return 1
     local cfg ip host links=()
     cfg=$(xray_protocol_config_path)
     [[ -f "$cfg" ]] || { echo -e "${RED}❌ 未找到 Xray 配置。${RESET}"; return 1; }
@@ -4512,9 +4572,11 @@ view_all_info() {
 }
 
 run_install_vless() {
+    ensure_jq_available || return 1
     local port="$1" uuid="$2" domain="$3"
     local ss_inbound key_pair private_key short_id vless_inbound
     ensure_xray_core_ready || return 1
+    cleanup_legacy_ss_backends silent >/dev/null 2>&1 || true
 
     mkdir -p /usr/local/etc/xray
     key_pair=$(/usr/local/bin/xray x25519 2>&1 | tr -d '\r')
@@ -4549,9 +4611,11 @@ run_install_vless() {
 }
 
 run_install_ss() {
+    ensure_jq_available || return 1
     local port="$1" password="$2"
     local vless_inbound ss_inbound
     ensure_xray_core_ready || return 1
+    cleanup_legacy_ss_backends silent >/dev/null 2>&1 || true
 
     mkdir -p /usr/local/etc/xray
     vless_inbound=$(xray_protocol_get_inbound "vless" || true)
@@ -4570,7 +4634,92 @@ run_install_ss() {
     return 0
 }
 
+run_install_dual() {
+    ensure_jq_available || return 1
+    local vless_port="$1" uuid="$2" domain="$3" ss_port="$4" password="$5"
+    local key_pair private_key short_id vless_inbound ss_inbound
+    ensure_xray_core_ready || return 1
+    cleanup_legacy_ss_backends silent >/dev/null 2>&1 || true
+
+    mkdir -p /usr/local/etc/xray
+    key_pair=$(/usr/local/bin/xray x25519 2>&1 | tr -d '
+')
+    private_key=$(xray_extract_reality_private_key "$key_pair")
+    if have_cmd openssl; then
+        short_id=$(openssl rand -hex 8 2>/dev/null)
+    else
+        short_id=$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' 
+')
+    fi
+    if [[ -z "$private_key" || -z "$short_id" ]]; then
+        echo -e "${RED}❌ 生成 REALITY 密钥材料失败。${RESET}"
+        return 1
+    fi
+
+    vless_inbound=$(build_vless_inbound "$vless_port" "$uuid" "$domain" "$private_key" "$short_id") || return 1
+    ss_inbound=$(build_ss_inbound "$ss_port" "$password") || return 1
+    write_xray_protocol_config "$vless_inbound" "$ss_inbound" || return 1
+
+    if ! /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1; then
+        echo -e "${RED}❌ Xray 配置自检失败。${RESET}"
+        return 1
+    fi
+
+    restart_xray_protocol_service || { echo -e "${RED}❌ Xray 启动失败。${RESET}"; return 1; }
+    named_service_add_firewall "xray" "$vless_port" >/dev/null 2>&1 || true
+    named_service_add_firewall "xray" "$ss_port" >/dev/null 2>&1 || true
+    meta_set "VLESS_FRONT_MODE" "direct"
+    meta_set "VLESS_PUBLIC_PORT" "$vless_port"
+    meta_set "VLESS_FALLBACK_BACKEND" ""
+    echo -e "${GREEN}✅ VLESS-Reality + Shadowsocks-2022 双协议安装完成！${RESET}"
+    view_all_info
+    return 0
+}
+
+cleanup_legacy_ss_backends() {
+    local mode="${1:-normal}" cleaned=0
+    if managed_service_exists "ss-v2ray" || [[ -f "$SS_V2RAY_CONF" ]] || [[ -f /etc/systemd/system/ss-v2ray.service ]]; then
+        managed_service_destroy "ss-v2ray" force 1 >/dev/null 2>&1 || true
+        cleaned=1
+    fi
+    if managed_service_exists "ss-rust" || [[ -f /etc/ss-rust/config.json ]] || [[ -f /etc/systemd/system/ss-rust.service ]]; then
+        managed_service_destroy "ss-rust" force 1 >/dev/null 2>&1 || true
+        cleaned=1
+    fi
+    rm -f /usr/local/bin/v2ray-plugin "$SS_V2RAY_STATE" >/dev/null 2>&1 || true
+    if [[ "$mode" != "silent" ]]; then
+        if [[ "$cleaned" -eq 1 ]]; then
+            echo -e "${GREEN}✅ 旧版 SS-Rust / v2ray-plugin 残留已清理。${RESET}"
+        else
+            echo -e "${YELLOW}未检测到旧版 SS-Rust / v2ray-plugin 残留。${RESET}"
+        fi
+    fi
+    return 0
+}
+
+install_dual_xray_native() {
+    clear 2>/dev/null || true
+    echo -e "${CYAN}========= 按 TXT 方案安装双协议 (VLESS + SS2022) =========${RESET}"
+    local vless_port uuid sni_domain ss_port ss_password default_ss_port
+    prompt_for_vless_config vless_port uuid sni_domain 443 || return
+    default_ss_port=$([[ "$vless_port" == "443" ]] && echo "8388" || echo "$((vless_port + 1))")
+    prompt_for_ss_config ss_port ss_password "$default_ss_port" || return
+    if [[ "$ss_port" == "$vless_port" ]]; then
+        echo -e "${RED}❌ Shadowsocks-2022 端口不能与 VLESS 端口相同。${RESET}"
+        sleep 3
+        return
+    fi
+    run_install_dual "$vless_port" "$uuid" "$sni_domain" "$ss_port" "$ss_password" || {
+        echo -e "${RED}❌ 双协议安装失败。${RESET}"
+        sleep 3
+        return
+    }
+    read -n 1 -s -r -p "按任意键返回上一层..."
+}
+
+
 modify_vless_config() {
+    ensure_jq_available || return 1
     local vless_inbound ss_inbound current_port current_uuid current_domain current_priv current_sid port uuid domain new_vless_inbound
     vless_inbound=$(xray_protocol_get_inbound "vless" || true)
     [[ -n "$vless_inbound" ]] || { echo -e "${RED}❌ 未检测到 VLESS-Reality 配置。${RESET}"; return 1; }
@@ -4615,6 +4764,7 @@ modify_vless_config() {
 }
 
 modify_ss_config() {
+    ensure_jq_available || return 1
     local ss_inbound vless_inbound current_port current_password port password new_ss_inbound
     ss_inbound=$(xray_protocol_get_inbound "shadowsocks" || true)
     [[ -n "$ss_inbound" ]] || { echo -e "${RED}❌ 未检测到 Shadowsocks-2022 配置。${RESET}"; return 1; }
@@ -4646,6 +4796,7 @@ modify_ss_config() {
 }
 
 remove_xray_protocol() {
+    ensure_jq_available || return 1
     local proto="$1" cfg tmp remaining
     cfg=$(xray_protocol_config_path)
     [[ -f "$cfg" ]] || return 0
@@ -4678,33 +4829,8 @@ remove_xray_protocol() {
 
 install_ss_rust_native() {
     clear 2>/dev/null || true
-    echo -e "${CYAN}========= 原生交互安装 SS-Rust =========${RESET}"
-    read -rp "端口 [留空随机]: " port
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        port=$((RANDOM % 55535 + 10000))
-    fi
-    ss_pick_method_password || return
-    ensure_ss_rust_binary || return
-    mkdir -p /etc/ss-rust
-    cat > /etc/ss-rust/config.json << EOF
-{ "server": "::", "server_port": $port, "password": "${SS_PICK_PASSWORD}", "method": "${SS_PICK_METHOD}", "mode": "tcp_and_udp", "fast_open": true }
-EOF
-    run_with_timeout 2 /usr/local/bin/ss-rust -c /etc/ss-rust/config.json >/dev/null 2>&1
-    local rc=$?
-    if [[ "$rc" -ne 0 && "$rc" -ne 124 && "$rc" -ne 137 ]]; then
-        echo -e "${RED}❌ 配置自检失败，已中止启动。${RESET}"
-        sleep 3
-        return
-    fi
-    if ! start_named_service "ss-rust"; then
-        echo -e "${RED}❌ SS-Rust 启动失败。请检查 /var/log/ss-rust.log${RESET}"
-        sleep 3
-        return
-    fi
-    named_service_add_firewall "ss-rust" "$port" >/dev/null 2>&1 || true
-    [[ -n "$ENSURED_SS_RUST_TAG" ]] && meta_set "SS_RUST_TAG" "$ENSURED_SS_RUST_TAG"
-    echo -e "${GREEN}✅ SS-Rust (${ENSURED_SS_RUST_TAG:-local}) 安装完成！${RESET}"
-    show_ss_rust_summary
+    echo -e "${YELLOW}⚠ 已移除旧版 SS-Rust 安装入口。请改用 Shadowsocks-2022 (Xray)。${RESET}"
+    cleanup_legacy_ss_backends
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
 
@@ -4726,7 +4852,7 @@ install_vless_native() {
 
 install_ss_v2ray_plugin_native() {
     clear 2>/dev/null || true
-    echo -e "${CYAN}========= 按 TXT 方案安装 Shadowsocks-2022 =========${RESET}"
+    echo -e "${CYAN}========= 安装 Shadowsocks-2022 (Xray) =========${RESET}"
     local port password
     prompt_for_ss_config port password 8388 || return
     run_install_ss "$port" "$password" || {
@@ -4744,58 +4870,19 @@ install_ss_v2ray_plugin_native() {
 unified_node_manager() {
     while true; do
         clear 2>/dev/null || true
-        local has_ss=0 has_v2=0 has_vless=0
-        managed_service_exists "ss-rust" && has_ss=1
-        xray_protocol_exists "shadowsocks" && has_v2=1
+        local has_ss=0 has_vless=0
+        xray_protocol_exists "shadowsocks" && has_ss=1
         xray_protocol_exists "vless" && has_vless=1
         echo -e "${CYAN}========= 统一节点生命周期管控中心 =========${RESET}"
-        echo -e "${YELLOW} 1)${RESET} SS-Rust 节点管理"
-        echo -e "${YELLOW} 2)${RESET} Shadowsocks-2022 (Xray) 管理"
-        echo -e "${YELLOW} 3)${RESET} VLESS Reality (Xray) 管理"
-        echo -e "${RED} 4) ☢️ 全局强制核爆${RESET}"
+        echo -e "${YELLOW} 1)${RESET} Shadowsocks-2022 (Xray) 管理"
+        echo -e "${YELLOW} 2)${RESET} VLESS Reality (Xray) 管理"
+        echo -e "${YELLOW} 3)${RESET} 清理旧版 SS-Rust / v2ray-plugin 残留"
+        echo -e "${RED} 4) ☢️ 全局强制核爆 (当前仅 Xray)${RESET}"
         echo -e " 0) 返回主菜单"
         read -rp "请选择 [0-4]: " node_choice
         case "$node_choice" in
             1)
                 if [[ $has_ss -eq 1 ]]; then
-                    clear 2>/dev/null || true
-                    local port
-                    port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
-                    echo -e "---------------------------------"
-                    echo -e "${YELLOW}1) 查看节点链接信息${RESET} | ${YELLOW}2) 修改端口${RESET} | ${YELLOW}3) 修改密码${RESET} | ${RED}4) 删除节点${RESET} | 0) 返回"
-                    read -rp "输入操作: " op
-                    if [[ "$op" == "1" ]]; then
-                        show_ss_rust_summary
-                        read -n1 -rsp "按任意键返回..." _
-                    elif [[ "$op" == "2" ]]; then
-                        read -rp "新端口 (1-65535): " np
-                        if [[ "$np" =~ ^[0-9]+$ ]] && [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; then
-                            if apply_json_named_service_port_change /etc/ss-rust/config.json server_port "$np" "$port" "ss-rust"; then
-                                echo -e "${GREEN}✅ 修改成功${RESET}"
-                            else
-                                echo -e "${RED}❌ 修改失败，已自动回滚${RESET}"
-                            fi
-                        else
-                            echo -e "${RED}❌ 端口无效${RESET}"
-                        fi
-                        sleep 1
-                    elif [[ "$op" == "3" ]]; then
-                        read -rp "新密码: " npwd
-                        [[ -z "$npwd" ]] && { echo -e "${RED}❌ 密码不能为空${RESET}"; sleep 1; continue; }
-                        if apply_json_named_service_change /etc/ss-rust/config.json password "$npwd" string "ss-rust"; then
-                            echo -e "${GREEN}✅ 修改成功${RESET}"
-                        else
-                            echo -e "${RED}❌ 修改失败，已自动回滚${RESET}"
-                        fi
-                        sleep 1
-                    elif [[ "$op" == "4" ]]; then
-                        managed_service_destroy "ss-rust"
-                        sleep 1
-                    fi
-                fi
-                ;;
-            2)
-                if [[ $has_v2 -eq 1 ]]; then
                     clear 2>/dev/null || true
                     echo -e "---------------------------------"
                     echo -e "${YELLOW}1) 查看节点链接信息${RESET} | ${YELLOW}2) 修改端口/密码${RESET} | ${RED}3) 删除节点${RESET} | 0) 返回"
@@ -4814,9 +4901,12 @@ unified_node_manager() {
                         fi
                         sleep 1
                     fi
+                else
+                    echo -e "${YELLOW}未检测到 Shadowsocks-2022 (Xray) 节点。${RESET}"
+                    sleep 1
                 fi
                 ;;
-            3)
+            2)
                 if [[ $has_vless -eq 1 ]]; then
                     clear 2>/dev/null || true
                     echo -e "---------------------------------"
@@ -4829,7 +4919,7 @@ unified_node_manager() {
                         modify_vless_config
                         read -n1 -rsp "按任意键返回..." _
                     elif [[ "$op" == "3" ]]; then
-                        if restart_xray_protocol_service >/dev/null 2>&1; then
+                        if restart_named_service "xray"; then
                             echo -e "${GREEN}✅ 已重启${RESET}"
                         else
                             echo -e "${RED}❌ 重启失败，请检查配置或日志${RESET}"
@@ -4843,13 +4933,20 @@ unified_node_manager() {
                         fi
                         sleep 1
                     fi
+                else
+                    echo -e "${YELLOW}未检测到 VLESS Reality (Xray) 节点。${RESET}"
+                    sleep 1
                 fi
+                ;;
+            3)
+                cleanup_legacy_ss_backends
+                read -n1 -rsp "按任意键返回..." _
                 ;;
             4)
                 while true; do
                     clear 2>/dev/null || true
                     echo -e "${CYAN}========= ☢️ 全局强制核爆中心 =========${RESET}"
-                    echo -e "${YELLOW}已改为序号选择，直接核爆已识别到的节点残留。${RESET}"
+                    echo -e "${YELLOW}当前仅展示 Xray 协议栈残留。${RESET}"
                     echo -e "---------------------------------"
                     managed_nuke_build_index
                     local nuke_count=0 i target label port
@@ -4867,7 +4964,7 @@ unified_node_manager() {
                     done
                     if [[ "$nuke_count" -eq 0 ]]; then
                         echo -e "${RED}未识别到可核爆的节点残留。${RESET}"
-                        read -n1 -rsp "按任意键返回..." _
+                        read -n1 -rsp "按任意键返回." _
                         break
                     fi
                     echo -e "---------------------------------"
@@ -5012,12 +5109,6 @@ opt_menu() {
 }
 
 run_daemon_check() {
-    if managed_service_present "ss-rust" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/run/ss-rust.pid" && ! service_is_running "ss-rust" '/usr/local/bin/ss-rust -c /etc/ss-rust/config.json' "/var/run/ss-rust.pid"; then
-        restart_named_service "ss-rust" >/dev/null 2>&1 || true
-    fi
-    if managed_service_present "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid" && ! service_is_running "ss-v2ray" '/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json' "/var/run/ss-v2ray.pid"; then
-        restart_named_service "ss-v2ray" >/dev/null 2>&1 || true
-    fi
     if managed_service_present "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid" && ! service_is_running "xray" '/usr/local/bin/xray run -c /usr/local/etc/xray/config.json' "/var/run/xray.pid"; then
         restart_named_service "xray" >/dev/null 2>&1 || true
     fi
@@ -5185,29 +5276,28 @@ core_cache_menu() {
         clear 2>/dev/null || true
         echo -e "${CYAN}========= 核心缓存与更新中心 =========${RESET}"
         echo
-        echo -e "${GREEN} 1.${RESET} 更新 SS-Rust 核心"
-        echo -e "${GREEN} 2.${RESET} 更新 Xray 核心"
-        echo -e "${YELLOW} 3.${RESET} 一键更新全部核心"
-        echo -e "${YELLOW} 4.${RESET} 清理全部核心缓存"
+        echo -e "${GREEN} 1.${RESET} 更新 Xray 核心"
+        echo -e "${YELLOW} 2.${RESET} 清理全部核心缓存（含旧 SS-Rust 缓存）"
+        echo -e "${YELLOW} 3.${RESET} 清理旧版 SS-Rust / v2ray-plugin 残留"
         echo -e " 0. 返回主菜单"
-        read -rp "输入数字 [0-4]: " cache_num
+        read -rp "输入数字 [0-3]: " cache_num
         case "$cache_num" in
-            1) update_ss_rust_if_needed; report_update_result "SS-Rust" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
-            2) update_xray_if_needed; report_update_result "Xray" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
-            3)
-                update_ss_rust_if_needed; report_update_result "SS-Rust" "$?"
-                update_xray_if_needed; report_update_result "Xray" "$?"
-                read -n 1 -s -r -p "按任意键继续..."
-                ;;
-            4)
+            1) update_xray_if_needed; report_update_result "Xray" "$?"; read -n 1 -s -r -p "按任意键继续..." ;;
+            2)
                 core_cache_clear_all
                 echo -e "${GREEN}✅ 本地核心缓存已清理。${RESET}"
                 read -n 1 -s -r -p "按任意键继续..."
                 ;;
+            3)
+                cleanup_legacy_ss_backends
+                read -n 1 -s -r -p "按任意键继续..."
+                ;;
             0) return ;;
+            *) msg_err "无效选项"; sleep 1 ;;
         esac
     done
 }
+
 
 daily_task() {
     # 例行任务：仅清理，不自动更新核心（更新已独立到核心缓存与更新中心）
@@ -5460,10 +5550,8 @@ get_quic_status_brief() {
 }
 
 count_proxy_nodes_brief() {
-    local c=0 name
-    for name in ss-rust ss-v2ray xray; do
-        managed_service_exists "$name" && c=$((c+1))
-    done
+    local c=0
+    managed_service_exists "xray" && c=1
     printf %s "$c"
 }
 
@@ -8054,18 +8142,20 @@ ssr_deploy_menu() {
     while true; do
         clear 2>/dev/null || true
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}           代理节点部署中心 (SSR)          ${RESET}"
+        echo -e "${CYAN}         Xray 协议部署中心 (VLESS / SS2022)${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 安装 SS-Rust"
+        echo -e "${YELLOW} 1.${RESET} 安装 VLESS Reality (Xray)"
         echo -e "${YELLOW} 2.${RESET} 安装 Shadowsocks-2022 (Xray)"
-        echo -e "${YELLOW} 3.${RESET} 安装 VLESS Reality"
+        echo -e "${YELLOW} 3.${RESET} 安装双协议 (VLESS + Shadowsocks-2022)"
+        echo -e "${YELLOW} 4.${RESET} 清理旧版 SS-Rust / v2ray-plugin 残留"
         echo -e " 0. 返回上一级"
         echo -e "${CYAN}--------------------------------------------${RESET}"
-        read -rp "请输入数字 [0-3]: " choice
+        read -rp "请输入数字 [0-4]: " choice
         case "$choice" in
-            1) install_ss_rust_native ;;
+            1) install_vless_native ;;
             2) install_ss_v2ray_plugin_native ;;
-            3) install_vless_native ;;
+            3) install_dual_xray_native ;;
+            4) cleanup_legacy_ss_backends; read -n1 -rsp "按任意键返回..." _ ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
         esac
@@ -8730,11 +8820,9 @@ status_page_loop() {
         status_timesync_line
         echo -e ""
         echo -e "${GREEN}代理节点${RESET}"
-        status_service_brief_line "ss-rust" "SS-Rust"
-        echo -e "  ${CYAN}SS-Rust 版本${RESET}: ${YELLOW}${ss_ver}${RESET}"
-        status_service_brief_line "ss-v2ray" "Shadowsocks-2022 (Xray)"
-        status_service_brief_line "xray" "VLESS Reality"
+        status_service_brief_line "xray" "Xray (VLESS / Shadowsocks-2022)"
         echo -e "  ${CYAN}Xray 版本${RESET}: ${YELLOW}${xr_ver}${RESET}"
+        echo -e "  ${CYAN}协议状态${RESET}: VLESS=$(xray_protocol_exists "vless" && echo 已启用 || echo 未启用) / SS2022=$(xray_protocol_exists "shadowsocks" && echo 已启用 || echo 未启用)"
         echo -e ""
         echo -e "${GREEN}端口转发 / Nginx${RESET}"
         if [[ "$nft_rules" =~ ^[0-9]+$ && "$nft_rules" -gt 0 ]]; then
