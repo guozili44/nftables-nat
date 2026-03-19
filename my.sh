@@ -551,10 +551,63 @@ xray_release_asset_name() {
     printf 'Xray-linux-%s.zip' "$asset_arch"
 }
 
+zip_list_entries() {
+    local zipf="$1"
+    [[ -s "$zipf" ]] || return 1
+    if have_cmd python3; then
+        python3 - "$zipf" <<'PY'
+import sys, zipfile
+zf = sys.argv[1]
+try:
+    with zipfile.ZipFile(zf, 'r') as z:
+        for name in z.namelist():
+            print(name)
+except Exception:
+    raise SystemExit(1)
+PY
+        return $?
+    fi
+    if have_cmd bsdtar; then
+        bsdtar -tf "$zipf" 2>/dev/null
+        return $?
+    fi
+    if unzip -Z1 "$zipf" >/dev/null 2>&1; then
+        unzip -Z1 "$zipf" 2>/dev/null
+        return $?
+    fi
+    unzip -l "$zipf" 2>/dev/null | awk 'NR>3 {print $4}' | sed '/^$/d;/^Name$/d;/^--------/d'
+}
+
+zip_test_valid() {
+    local zipf="$1"
+    [[ -s "$zipf" ]] || return 1
+    if unzip -t "$zipf" >/dev/null 2>&1; then
+        return 0
+    fi
+    if have_cmd python3; then
+        python3 - "$zipf" <<'PY'
+import sys, zipfile
+zf = sys.argv[1]
+try:
+    with zipfile.ZipFile(zf, 'r') as z:
+        bad = z.testzip()
+        raise SystemExit(0 if bad is None else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+        return $?
+    fi
+    if have_cmd bsdtar; then
+        bsdtar -tf "$zipf" >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
 xray_zip_has_binary() {
     local zipf="$1"
     [[ -s "$zipf" ]] || return 1
-    unzip -Z1 "$zipf" 2>/dev/null | sed 's#^\./##' | grep -qx 'xray'
+    zip_list_entries "$zipf" 2>/dev/null | sed 's#^\./##; s#/*$##' | grep -Eiq '(^|/)xray$'
 }
 
 xray_zip_looks_like_html() {
@@ -566,7 +619,7 @@ xray_zip_looks_like_html() {
 xray_zip_valid() {
     local zipf="$1"
     [[ -s "$zipf" ]] || return 1
-    unzip -t "$zipf" >/dev/null 2>&1 || return 1
+    zip_test_valid "$zipf" || return 1
     xray_zip_has_binary "$zipf"
 }
 
@@ -608,6 +661,44 @@ xray_zip_matches_dgst() {
 
 XRAY_LAST_DOWNLOAD_URL=""
 XRAY_LAST_DOWNLOAD_REASON=""
+XRAY_DOWNLOAD_LOG="${TMPDIR:-/tmp}/xray-download.log"
+
+xray_download_log_reset() {
+    : > "$XRAY_DOWNLOAD_LOG" 2>/dev/null || true
+}
+
+xray_download_log_append() {
+    local msg="$1"
+    [[ -n "$msg" ]] || return 0
+    printf '%s %s\n' "$(date '+%F %T' 2>/dev/null || echo '-')" "$msg" >> "$XRAY_DOWNLOAD_LOG" 2>/dev/null || true
+}
+
+extract_xray_from_zip() {
+    local zipf="$1" outdir="$2" member=""
+    [[ -s "$zipf" && -n "$outdir" ]] || return 1
+    mkdir -p "$outdir" >/dev/null 2>&1 || true
+    if unzip -qo "$zipf" xray -d "$outdir" >/dev/null 2>&1 && [[ -x "$outdir/xray" || -f "$outdir/xray" ]]; then
+        chmod +x "$outdir/xray" 2>/dev/null || true
+        return 0
+    fi
+    member=$(zip_list_entries "$zipf" 2>/dev/null | sed 's#^\./##; s#/*$##' | awk 'tolower($0) ~ /(^|\/)xray$/ {print; exit}')
+    [[ -n "$member" ]] || return 1
+    if have_cmd python3; then
+        python3 - "$zipf" "$member" "$outdir/xray" <<'PY'
+import os, stat, sys, zipfile
+zf_path, member, out_path = sys.argv[1:4]
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+with zipfile.ZipFile(zf_path, 'r') as zf:
+    with zf.open(member) as src, open(out_path, 'wb') as dst:
+        dst.write(src.read())
+os.chmod(out_path, os.stat(out_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+PY
+        return $?
+    fi
+    unzip -p "$zipf" "$member" > "$outdir/xray" 2>/dev/null || return 1
+    chmod +x "$outdir/xray" 2>/dev/null || true
+    [[ -s "$outdir/xray" ]]
+}
 
 xray_related_url() {
     local url="$1" suffix="$2"
@@ -633,13 +724,16 @@ xray_download_zip_any() {
     local u="" dgst_tmp="" dgst_url="" expected=""
     XRAY_LAST_DOWNLOAD_URL=""
     XRAY_LAST_DOWNLOAD_REASON=""
-    [[ -n "$dest" ]] || { XRAY_LAST_DOWNLOAD_REASON="missing destination"; return 1; }
+    xray_download_log_reset
+    [[ -n "$dest" ]] || { XRAY_LAST_DOWNLOAD_REASON="missing destination"; xray_download_log_append "[error] missing destination"; return 1; }
     for u in "$@"; do
         [[ -n "$u" ]] || continue
         XRAY_LAST_DOWNLOAD_URL="$u"
         XRAY_LAST_DOWNLOAD_REASON="download failed"
+        xray_download_log_append "[try] $u"
         rm -f "$dest" 2>/dev/null || true
         if ! download_file "$u" "$dest"; then
+            xray_download_log_append "[fail] download failed"
             rm -f "$dest" 2>/dev/null || true
             continue
         fi
@@ -648,6 +742,7 @@ xray_download_zip_any() {
             if xray_zip_looks_like_html "$dest"; then
                 XRAY_LAST_DOWNLOAD_REASON="html landing page returned instead of zip"
             fi
+            xray_download_log_append "[fail] $XRAY_LAST_DOWNLOAD_REASON"
             rm -f "$dest" 2>/dev/null || true
             continue
         fi
@@ -657,19 +752,24 @@ xray_download_zip_any() {
             expected=$(xray_dgst_expected_sha256 "$dgst_tmp" 2>/dev/null || true)
             if [[ -n "$expected" ]] && ! xray_zip_matches_dgst "$dest" "$dgst_tmp"; then
                 XRAY_LAST_DOWNLOAD_REASON="sha256 mismatch"
+                xray_download_log_append "[fail] $XRAY_LAST_DOWNLOAD_REASON :: $dgst_url"
                 rm -f "$dgst_tmp" "$dest" 2>/dev/null || true
                 continue
             fi
+            [[ -n "$expected" ]] && xray_download_log_append "[ok] sha256 matched :: $dgst_url"
+        else
+            [[ -n "$dgst_url" ]] && xray_download_log_append "[skip] dgst unavailable :: $dgst_url"
         fi
         rm -f "$dgst_tmp" 2>/dev/null || true
         XRAY_LAST_DOWNLOAD_REASON=""
+        xray_download_log_append "[ok] zip accepted"
         [[ -s "$dest" ]] && return 0
     done
     rm -f "$dest" 2>/dev/null || true
     [[ -n "$XRAY_LAST_DOWNLOAD_REASON" ]] || XRAY_LAST_DOWNLOAD_REASON="all candidate urls failed"
+    xray_download_log_append "[done] all candidate urls failed"
     return 1
 }
-
 xray_remote_latest_tag() {
     local file tag=""
     file="${CORE_TAG_CACHE_DIR}/xray.tag"
@@ -3588,12 +3688,13 @@ install_vless_native() {
             echo -e "${RED}❌ 核心下载或校验失败（候选下载地址全部失败，或 ZIP / SHA256 校验未通过）。${RESET}"
             [[ -n "$XRAY_LAST_DOWNLOAD_URL" ]] && echo -e "${YELLOW}最后失败地址: ${XRAY_LAST_DOWNLOAD_URL}${RESET}"
             [[ -n "$XRAY_LAST_DOWNLOAD_REASON" ]] && echo -e "${YELLOW}最后失败原因: ${XRAY_LAST_DOWNLOAD_REASON}${RESET}"
+            [[ -n "$XRAY_DOWNLOAD_LOG" ]] && echo -e "${YELLOW}下载诊断日志: ${XRAY_DOWNLOAD_LOG}${RESET}"
             rm -rf "$tmpdir"
             sleep 3
             return
         fi
 
-        unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
+        extract_xray_from_zip "$zipf" "$tmpdir" >/dev/null 2>&1 || true
         if [[ ! -x "${tmpdir}/xray" ]]; then
             echo -e "${RED}❌ 解压失败：未找到 xray。${RESET}"
             rm -rf "$tmpdir"
@@ -4159,10 +4260,11 @@ update_xray_if_needed() {
         if ! xray_download_zip_any "$zipf" "${xray_urls[@]}"; then
             [[ -n "$XRAY_LAST_DOWNLOAD_URL" ]] && echo -e "${YELLOW}Xray 更新下载失败地址: ${XRAY_LAST_DOWNLOAD_URL}${RESET}" >&2
             [[ -n "$XRAY_LAST_DOWNLOAD_REASON" ]] && echo -e "${YELLOW}Xray 更新下载失败原因: ${XRAY_LAST_DOWNLOAD_REASON}${RESET}" >&2
+            [[ -n "$XRAY_DOWNLOAD_LOG" ]] && echo -e "${YELLOW}Xray 更新下载诊断日志: ${XRAY_DOWNLOAD_LOG}${RESET}" >&2
             rm -rf "$tmpdir"
             return 2
         fi
-        unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
+        extract_xray_from_zip "$zipf" "$tmpdir" >/dev/null 2>&1 || true
         [[ -x "$candidate" ]] || { rm -rf "$tmpdir"; return 2; }
         run_with_timeout 3 "$candidate" version >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
         run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
