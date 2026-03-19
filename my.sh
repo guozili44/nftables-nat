@@ -489,7 +489,7 @@ xray_current_tag() {
     [[ -n "$v" ]] && echo "v${v}"
 }
 
-readonly XRAY_FALLBACK_TAG="v1.8.24"
+readonly XRAY_FALLBACK_TAG="v26.2.6"
 
 xray_normalize_tag() {
     local raw="$1" tag=""
@@ -1112,7 +1112,7 @@ ensure_ss_rust_binary() {
         asset_name="shadowsocks-${ss_latest}.${candidate_arch}.tar.xz"
         official_url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${ss_latest}/${asset_name}"
         api_url=$(github_release_asset_url "shadowsocks/shadowsocks-rust" "$ss_latest" "$asset_name" 2>/dev/null || true)
-        proxy_url="https://ghproxy.net/${official_url#https://}"
+        proxy_url=$(github_proxy_wrap "$official_url")
         rm -f "$tarball" "${tmpdir}/ssserver" >/dev/null 2>&1 || true
         if ! download_file_any "$tarball" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
             continue
@@ -1983,6 +1983,17 @@ PYKEYS
     fi
     [[ -n "$keys" ]] || return 1
     printf '%s\n' "$keys" | sed 's/\r$//' | sed '/^[[:space:]]*$/d'
+}
+
+github_proxy_wrap() {
+    local url="$1"
+    [[ -n "$url" ]] || return 1
+    case "$url" in
+        https://*|http://*) printf '%s
+' "https://ghproxy.net/${url}" ;;
+        *) printf '%s
+' "$url" ;;
+    esac
 }
 
 github_latest_release_redirect_tag() {
@@ -3335,12 +3346,12 @@ install_vless_native() {
         local asset_name official_url api_url proxy_url latest_url latest_proxy fallback_url fallback_proxy chosen_tag="" ok_url="" display_tag=""
         asset_name="Xray-linux-${xray_arch}.zip"
         latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
-        latest_proxy="https://ghproxy.net/${latest_url#https://}"
+        latest_proxy=$(github_proxy_wrap "$latest_url")
         official_url="https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/${asset_name}"
         api_url=$(github_release_asset_url "XTLS/Xray-core" "$xray_latest" "$asset_name" 2>/dev/null || true)
-        proxy_url="https://ghproxy.net/${official_url#https://}"
+        proxy_url=$(github_proxy_wrap "$official_url")
         fallback_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_FALLBACK_TAG}/${asset_name}"
-        fallback_proxy="https://ghproxy.net/${fallback_url#https://}"
+        fallback_proxy=$(github_proxy_wrap "$fallback_url")
         display_tag="$xray_latest"
         [[ -n "$display_tag" ]] || display_tag="latest"
 
@@ -3352,7 +3363,7 @@ install_vless_native() {
             [[ -n "$chosen_tag" ]] || chosen_tag="$XRAY_FALLBACK_TAG"
         fi
         if [[ -z "$ok_url" ]]; then
-            echo -e "${RED}❌ 核心下载或校验失败。${RESET}"
+            echo -e "${RED}❌ 核心下载或校验失败（GitHub直连/代理均未成功，或下载内容不是有效 ZIP）。${RESET}"
             rm -rf "$tmpdir"
             sleep 3
             return
@@ -3478,7 +3489,7 @@ install_ss_v2ray_plugin_native() {
         asset_name="${asset_name}-${vp_latest}.tar.gz"
         official_url="https://github.com/shadowsocks/v2ray-plugin/releases/download/${vp_latest}/${asset_name}"
         api_url=$(github_release_asset_url "shadowsocks/v2ray-plugin" "$vp_latest" "$asset_name" 2>/dev/null || true)
-        proxy_url="https://ghproxy.net/${official_url#https://}"
+        proxy_url=$(github_proxy_wrap "$official_url")
         echo -e "${CYAN}>>> 正在准备 v2ray-plugin: ${vp_latest} ...${RESET}"
         if ! download_file_any "$tarf" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$tarf" ]] || ! tar -tf "$tarf" >/dev/null 2>&1; then
             echo -e "${RED}❌ v2ray-plugin 下载失败。${RESET}"
@@ -3866,7 +3877,7 @@ update_ss_rust_if_needed() {
             asset_name="shadowsocks-${latest}.${candidate_arch}.tar.xz"
             official_url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${latest}/${asset_name}"
             api_url=$(github_release_asset_url "shadowsocks/shadowsocks-rust" "$latest" "$asset_name" 2>/dev/null || true)
-            proxy_url="https://ghproxy.net/${official_url#https://}"
+            proxy_url=$(github_proxy_wrap "$official_url")
             rm -f "$tarball" "$candidate" >/dev/null 2>&1 || true
             if ! download_file_any "$tarball" "$api_url" "$official_url" "$proxy_url" || [[ ! -s "$tarball" ]] || ! tar -tf "$tarball" >/dev/null 2>&1; then
                 continue
@@ -3918,12 +3929,12 @@ update_xray_if_needed() {
     local asset_name official_url api_url proxy_url latest_url latest_proxy fallback_url fallback_proxy ok_tag=""
     asset_name="Xray-linux-${xray_arch}.zip"
     latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
-    latest_proxy="https://ghproxy.net/${latest_url#https://}"
+    latest_proxy=$(github_proxy_wrap "$latest_url")
     official_url="https://github.com/XTLS/Xray-core/releases/download/${latest}/${asset_name}"
     api_url=$(github_release_asset_url "XTLS/Xray-core" "$latest" "$asset_name" 2>/dev/null || true)
-    proxy_url="https://ghproxy.net/${official_url#https://}"
+    proxy_url=$(github_proxy_wrap "$official_url")
     fallback_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_FALLBACK_TAG}/${asset_name}"
-    fallback_proxy="https://ghproxy.net/${fallback_url#https://}"
+    fallback_proxy=$(github_proxy_wrap "$fallback_url")
 
     if [[ -n "$latest" ]] && cache_restore_binary_tag "xray" "$latest" "$candidate" && run_with_timeout 3 "$candidate" version >/dev/null 2>&1 && run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1; then
         ok_tag="$latest"
