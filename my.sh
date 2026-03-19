@@ -500,21 +500,63 @@ xray_normalize_tag() {
     printf '%s' "$tag"
 }
 
+xray_tag_plausible() {
+    local tag="$1" major=""
+    [[ -n "$tag" ]] || return 1
+    [[ "$tag" =~ ^v([0-9]+)(\.[0-9]+){1,3}([._-][A-Za-z0-9]+)?$ ]] || return 1
+    major="${BASH_REMATCH[1]}"
+    [[ -n "$major" ]] || return 1
+    (( major >= 1 && major <= 5 )) || return 1
+}
+
+xray_remote_latest_tag() {
+    local file tag=""
+    file="${CORE_TAG_CACHE_DIR}/xray.tag"
+    mkdir -p "$CORE_TAG_CACHE_DIR" 2>/dev/null || true
+    tag=$(xray_normalize_tag "$(github_latest_release_redirect_tag "XTLS/Xray-core" 2>/dev/null || true)" 2>/dev/null || true)
+    if [[ -z "$tag" ]]; then
+        tag=$(xray_normalize_tag "$(github_latest_tag "XTLS/Xray-core" 2>/dev/null || true)" 2>/dev/null || true)
+    fi
+    if xray_tag_plausible "$tag"; then
+        printf '%s' "$tag" > "$file" 2>/dev/null || true
+        printf '%s' "$tag"
+        return 0
+    fi
+    return 1
+}
+
 xray_cached_or_latest_tag() {
     local file tag=""
     file="${CORE_TAG_CACHE_DIR}/xray.tag"
-    tag=$(xray_normalize_tag "$(cached_latest_tag "XTLS/Xray-core" "xray" 2>/dev/null || true)" 2>/dev/null || true)
-    if [[ -z "$tag" ]]; then
-        tag=$(xray_normalize_tag "$(github_latest_release_redirect_tag "XTLS/Xray-core" 2>/dev/null || true)" 2>/dev/null || true)
+
+    tag=$(xray_remote_latest_tag 2>/dev/null || true)
+    if xray_tag_plausible "$tag"; then
+        printf '%s' "$tag"
+        return 0
     fi
-    if [[ -z "$tag" ]]; then
-        tag=$(xray_normalize_tag "$(meta_get "XRAY_TAG" 2>/dev/null || true)" 2>/dev/null || true)
+
+    tag=$(xray_normalize_tag "$(xray_current_tag 2>/dev/null || true)" 2>/dev/null || true)
+    if xray_tag_plausible "$tag"; then
+        printf '%s' "$tag"
+        return 0
     fi
-    if [[ -z "$tag" ]]; then
+
+    if [[ -s "$file" ]]; then
+        tag=$(xray_normalize_tag "$(tr -d '[:space:]' < "$file" 2>/dev/null || true)" 2>/dev/null || true)
+        if xray_tag_plausible "$tag"; then
+            printf '%s' "$tag"
+            return 0
+        fi
         rm -f "$file" 2>/dev/null || true
-        tag="$XRAY_FALLBACK_TAG"
     fi
-    printf '%s' "$tag"
+
+    tag=$(xray_normalize_tag "$(meta_get "XRAY_TAG" 2>/dev/null || true)" 2>/dev/null || true)
+    if xray_tag_plausible "$tag"; then
+        printf '%s' "$tag"
+        return 0
+    fi
+
+    printf '%s' "$XRAY_FALLBACK_TAG"
 }
 
 core_cache_clear_all() {
@@ -3280,7 +3322,13 @@ install_vless_native() {
         [[ -z "$xray_latest" ]] && xray_latest=$(xray_current_tag || true)
     else
         echo -e "${CYAN}>>> 本地无可用 Xray 核心，开始联网下载...${RESET}"
-        xray_latest=$(xray_cached_or_latest_tag)
+        xray_latest=$(xray_remote_latest_tag 2>/dev/null || true)
+        if ! xray_tag_plausible "$xray_latest"; then
+            xray_latest=$(xray_cached_or_latest_tag 2>/dev/null || true)
+        fi
+        if ! xray_tag_plausible "$xray_latest"; then
+            xray_latest="$XRAY_FALLBACK_TAG"
+        fi
 
         tmpdir=$(mktemp -d /tmp/ssr-xray.XXXXXX)
         zipf="${tmpdir}/xray.zip"
@@ -3293,13 +3341,15 @@ install_vless_native() {
         proxy_url="https://ghproxy.net/${official_url#https://}"
         fallback_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_FALLBACK_TAG}/${asset_name}"
         fallback_proxy="https://ghproxy.net/${fallback_url#https://}"
-        display_tag="${xray_latest:-$XRAY_FALLBACK_TAG}"
+        display_tag="$xray_latest"
+        [[ -n "$display_tag" ]] || display_tag="latest"
 
         echo -e "${CYAN}>>> 下载核心: ${display_tag} (linux-${xray_arch}) ...${RESET}"
 
         if download_file_any "$zipf" "$latest_url" "$latest_proxy" "$api_url" "$official_url" "$proxy_url" "$fallback_url" "$fallback_proxy" && [[ -s "$zipf" ]] && unzip -t "$zipf" >/dev/null 2>&1; then
             ok_url=1
             chosen_tag="$xray_latest"
+            [[ -n "$chosen_tag" ]] || chosen_tag="$XRAY_FALLBACK_TAG"
         fi
         if [[ -z "$ok_url" ]]; then
             echo -e "${RED}❌ 核心下载或校验失败。${RESET}"
@@ -3847,10 +3897,19 @@ update_xray_if_needed() {
         armv7l|armv7|arm) xray_arch="arm32-v7a" ;;
     esac
 
-    local latest; latest=$(xray_cached_or_latest_tag)
+    local latest; latest=$(xray_remote_latest_tag 2>/dev/null || true)
+    if ! xray_tag_plausible "$latest"; then
+        latest=$(xray_cached_or_latest_tag 2>/dev/null || true)
+    fi
+    if ! xray_tag_plausible "$latest"; then
+        latest="$XRAY_FALLBACK_TAG"
+    fi
 
     local current; current=$(meta_get "XRAY_TAG" || true)
     current=$(xray_normalize_tag "$current" 2>/dev/null || true)
+    if ! xray_tag_plausible "$current"; then
+        current=""
+    fi
     [[ -z "$current" ]] && current=$(xray_current_tag || true)
     [[ -n "$latest" && -n "$current" && "$current" == "$latest" ]] && return 3
 
@@ -3880,6 +3939,7 @@ update_xray_if_needed() {
         run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
         ok_tag=$(run_with_timeout 3 "$candidate" version 2>/dev/null | head -n1 | grep -oE '([0-9]+\.){2}[0-9]+' | head -n1)
         [[ -n "$ok_tag" ]] && ok_tag="v${ok_tag}" || ok_tag="$latest"
+        xray_tag_plausible "$ok_tag" || ok_tag="$XRAY_FALLBACK_TAG"
     fi
     latest="$ok_tag"
 
