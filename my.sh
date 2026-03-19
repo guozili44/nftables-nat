@@ -182,58 +182,6 @@ txn_backup_file() {
     local txn="$1" target="$2" bak=""
     mkdir -p "$txn/files" >/dev/null 2>&1 || return 1
     if [[ -e "$target" ]]; then
-        bak=$(mktemp "$txn/files/$(basename "$target").XXXXXX") || ret    chmod 600 "$file" 2>/dev/null || true
-}
-
-state_migrate_file() {
-    local old="$1" new="$2"
-    [[ -e "$old" ]] || return 0
-    state_dir_ensure "$(dirname "$new")" || return 1
-    if [[ ! -e "$new" || ! -s "$new" ]]; then
-        cp -a "$old" "$new" >/dev/null 2>&1 || return 1
-    fi
-}
-
-state_migrate_dir() {
-    local old="$1" new="$2"
-    [[ -d "$old" ]] || return 0
-    state_dir_ensure "$new" || return 1
-    cp -a "$old"/. "$new"/ >/dev/null 2>&1 || true
-}
-
-txn_begin() {
-    local dir
-    dir=$(mktemp -d /tmp/my-txn.XXXXXX) || return 1
-    : > "$dir/stack"
-    echo "$dir"
-}
-
-txn_register() {
-    local txn="$1"; shift
-    local out="" q
-    [[ -n "$txn" ]] || return 1
-    for q in "$@"; do
-        printf -v q '%q' "$q"
-        out+="$q "
-    done
-    printf '%s
-' "${out% }" >> "$txn/stack"
-}
-
-_txn_restore_file() {
-    local dst="$1" bak="$2"
-    [[ -f "$bak" ]] || return 1
-    cp -a "$bak" "$dst" >/dev/null 2>&1 || return 1
-}
-
-_txn_remove_path() {
-    rm -rf "$1" >/dev/null 2>&1 || true
-}
-
-txn_backup_file() {
-    local txn="$1" target="$2" bak=""
-    mkdir -p "$txn/files" >/dev/null 2>&1 || return 1
-    if [[ -e "$target" ]]; then
         bak=$(mktemp "$txn/files/$(basename "$target").XXXXXX") || return 1
         cp -a "$target" "$bak" >/dev/null 2>&1 || { rm -f "$bak"; return 1; }
         txn_register "$txn" _txn_restore_file "$target" "$bak"
@@ -563,17 +511,36 @@ xray_linux_asset_arch() {
     case "$arch" in
         x86_64|amd64) echo "64" ;;
         i386|i486|i586|i686) echo "32" ;;
-        aarch64|arm64) echo "arm64-v8a" ;;
-        armv7l|armv7|armhf) echo "arm32-v7a" ;;
-        armv6l|armv6) echo "arm32-v6" ;;
         armv5tel|armv5) echo "arm32-v5" ;;
+        armv6l|armv6)
+            if grep -s 'Features' /proc/cpuinfo 2>/dev/null | grep -qw 'vfp'; then
+                echo "arm32-v6"
+            else
+                echo "arm32-v5"
+            fi
+            ;;
+        armv7|armv7l|armhf|arm)
+            if grep -s 'Features' /proc/cpuinfo 2>/dev/null | grep -qw 'vfp'; then
+                echo "arm32-v7a"
+            else
+                echo "arm32-v5"
+            fi
+            ;;
+        armv8|aarch64|arm64) echo "arm64-v8a" ;;
+        mips) echo "mips32" ;;
+        mipsle) echo "mips32le" ;;
+        mips64)
+            if lscpu 2>/dev/null | grep -q 'Little Endian'; then
+                echo "mips64le"
+            else
+                echo "mips64"
+            fi
+            ;;
+        mips64le) echo "mips64le" ;;
+        ppc64) echo "ppc64" ;;
+        ppc64le) echo "ppc64le" ;;
         s390x) echo "s390x" ;;
         riscv64) echo "riscv64" ;;
-        ppc64le) echo "ppc64le" ;;
-        mips64le) echo "mips64le" ;;
-        mips64) echo "mips64" ;;
-        mipsle) echo "mipsle_softfloat" ;;
-        mips) echo "mips_softfloat" ;;
         *) echo "64" ;;
     esac
 }
@@ -633,28 +600,44 @@ xray_zip_matches_dgst() {
     [[ "${actual,,}" == "$expected" ]]
 }
 
+XRAY_LAST_DOWNLOAD_URL=""
+XRAY_LAST_DOWNLOAD_REASON=""
+
 xray_download_zip_any() {
     local dest="$1"; shift
-    local u="" dgst_tmp="" dgst_seen=0
-    [[ -n "$dest" ]] || return 1
+    local u="" dgst_tmp="" expected=""
+    XRAY_LAST_DOWNLOAD_URL=""
+    XRAY_LAST_DOWNLOAD_REASON=""
+    [[ -n "$dest" ]] || { XRAY_LAST_DOWNLOAD_REASON="missing destination"; return 1; }
     for u in "$@"; do
         [[ -n "$u" ]] || continue
+        XRAY_LAST_DOWNLOAD_URL="$u"
+        XRAY_LAST_DOWNLOAD_REASON="download failed"
         rm -f "$dest" 2>/dev/null || true
-        download_file "$u" "$dest" || { rm -f "$dest" 2>/dev/null || true; continue; }
-        xray_zip_valid "$dest" || { rm -f "$dest" 2>/dev/null || true; continue; }
+        if ! download_file "$u" "$dest"; then
+            rm -f "$dest" 2>/dev/null || true
+            continue
+        fi
+        XRAY_LAST_DOWNLOAD_REASON="invalid zip or xray binary missing"
+        if ! xray_zip_valid "$dest"; then
+            rm -f "$dest" 2>/dev/null || true
+            continue
+        fi
         dgst_tmp=$(mktemp /tmp/xray-dgst.XXXXXX 2>/dev/null || true)
-        dgst_seen=0
         if [[ -n "$dgst_tmp" ]] && download_file "${u}.dgst" "$dgst_tmp"; then
-            dgst_seen=1
-            if ! xray_zip_matches_dgst "$dest" "$dgst_tmp"; then
+            expected=$(xray_dgst_expected_sha256 "$dgst_tmp" 2>/dev/null || true)
+            if [[ -n "$expected" ]] && ! xray_zip_matches_dgst "$dest" "$dgst_tmp"; then
+                XRAY_LAST_DOWNLOAD_REASON="sha256 mismatch"
                 rm -f "$dgst_tmp" "$dest" 2>/dev/null || true
                 continue
             fi
         fi
         rm -f "$dgst_tmp" 2>/dev/null || true
+        XRAY_LAST_DOWNLOAD_REASON=""
         [[ -s "$dest" ]] && return 0
     done
     rm -f "$dest" 2>/dev/null || true
+    [[ -n "$XRAY_LAST_DOWNLOAD_REASON" ]] || XRAY_LAST_DOWNLOAD_REASON="all candidate urls failed"
     return 1
 }
 
@@ -2086,12 +2069,12 @@ download_file() {
     if have_cmd curl; then
         curl --help all 2>/dev/null | grep -q -- '--retry-all-errors' && curl_supports_retry_all=1 || true
         if [[ $curl_supports_retry_all -eq 1 ]]; then
-            curl -A 'Mozilla/5.0' -fL --retry 3 --retry-delay 1 --retry-all-errors --connect-timeout 8 --max-time 120 "$url" -o "$dest" >/dev/null 2>&1
+            curl -A 'Mozilla/5.0' --http1.1 -fL --retry 3 --retry-delay 1 --retry-all-errors --connect-timeout 8 --max-time 300 "$url" -o "$dest" >/dev/null 2>&1
         else
-            curl -A 'Mozilla/5.0' -fL --retry 3 --retry-delay 1 --connect-timeout 8 --max-time 120 "$url" -o "$dest" >/dev/null 2>&1
+            curl -A 'Mozilla/5.0' --http1.1 -fL --retry 3 --retry-delay 1 --connect-timeout 8 --max-time 300 "$url" -o "$dest" >/dev/null 2>&1
         fi
     elif have_cmd wget; then
-        wget --user-agent='Mozilla/5.0' --tries=3 --waitretry=1 --timeout=30 -qO "$dest" "$url" >/dev/null 2>&1
+        wget --user-agent='Mozilla/5.0' --tries=3 --waitretry=1 --timeout=30 --read-timeout=300 -qO "$dest" "$url" >/dev/null 2>&1
     else
         return 1
     fi
@@ -2149,6 +2132,57 @@ github_proxy_wrap() {
         *) printf '%s
 ' "$url" ;;
     esac
+}
+
+github_proxy_candidate_urls() {
+    local url="$1" base="" extra_prefixes=""
+    [[ -n "$url" ]] || return 1
+    printf '%s\n' "$url"
+    case "$url" in
+        https://github.com/*|http://github.com/*)
+            extra_prefixes=$(printf '%s\n' "${GITHUB_PROXY_PREFIXES:-}" | tr ',\r' '  ')
+            for base in $extra_prefixes \
+                "https://ghproxy.net/" \
+                "https://gh-proxy.com/" \
+                "https://mirror.ghproxy.com/"
+            do
+                [[ -n "$base" ]] || continue
+                [[ "$base" == */ ]] || base="${base}/"
+                printf '%s%s\n' "$base" "$url"
+            done
+            ;;
+    esac
+}
+
+xray_sourceforge_candidate_urls() {
+    local tag="$1" asset_name="$2"
+    [[ -n "$tag" && -n "$asset_name" ]] || return 1
+    printf '%s\n' "https://sourceforge.net/projects/xray-core.mirror/files/${tag}/${asset_name}/download"
+    printf '%s\n' "https://downloads.sourceforge.net/project/xray-core.mirror/${tag}/${asset_name}"
+}
+
+xray_download_candidate_urls() {
+    local preferred_tag="$1" asset_name="$2" fallback_tag="$3"
+    local api_url="" official_url="" latest_url="" fallback_url="" manual_url=""
+    [[ -n "$asset_name" ]] || return 1
+    manual_url=$(printf '%s' "${XRAY_DOWNLOAD_URL:-}" | tr -d '\r[:space:]')
+    latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
+    if [[ -n "$preferred_tag" ]]; then
+        official_url="https://github.com/XTLS/Xray-core/releases/download/${preferred_tag}/${asset_name}"
+        api_url=$(github_release_asset_url "XTLS/Xray-core" "$preferred_tag" "$asset_name" 2>/dev/null || true)
+    fi
+    if [[ -n "$fallback_tag" ]]; then
+        fallback_url="https://github.com/XTLS/Xray-core/releases/download/${fallback_tag}/${asset_name}"
+    fi
+    {
+        [[ -n "$manual_url" ]] && printf '%s\n' "$manual_url"
+        [[ -n "$api_url" ]] && github_proxy_candidate_urls "$api_url"
+        [[ -n "$official_url" ]] && github_proxy_candidate_urls "$official_url"
+        github_proxy_candidate_urls "$latest_url"
+        [[ -n "$fallback_url" ]] && github_proxy_candidate_urls "$fallback_url"
+        [[ -n "$preferred_tag" ]] && xray_sourceforge_candidate_urls "$preferred_tag" "$asset_name"
+        [[ -n "$fallback_tag" && "$fallback_tag" != "$preferred_tag" ]] && xray_sourceforge_candidate_urls "$fallback_tag" "$asset_name"
+    } | awk 'NF && !seen[$0]++'
 }
 
 github_latest_release_redirect_tag() {
@@ -3495,27 +3529,25 @@ install_vless_native() {
 
         tmpdir=$(mktemp -d /tmp/ssr-xray.XXXXXX)
         zipf="${tmpdir}/xray.zip"
-        local asset_name official_url api_url proxy_url latest_url latest_proxy fallback_url fallback_proxy chosen_tag="" ok_url="" display_tag=""
+        local asset_name chosen_tag="" ok_url="" display_tag=""
+        local -a xray_urls=()
         asset_name=$(xray_release_asset_name "$xray_arch")
-        latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
-        latest_proxy=$(github_proxy_wrap "$latest_url")
-        official_url="https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/${asset_name}"
-        api_url=$(github_release_asset_url "XTLS/Xray-core" "$xray_latest" "$asset_name" 2>/dev/null || true)
-        proxy_url=$(github_proxy_wrap "$official_url")
-        fallback_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_FALLBACK_TAG}/${asset_name}"
-        fallback_proxy=$(github_proxy_wrap "$fallback_url")
         display_tag="$xray_latest"
         [[ -n "$display_tag" ]] || display_tag="latest"
 
+        mapfile -t xray_urls < <(xray_download_candidate_urls "$xray_latest" "$asset_name" "$XRAY_FALLBACK_TAG")
+
         echo -e "${CYAN}>>> 下载核心: ${display_tag} (linux-${xray_arch}) ...${RESET}"
 
-        if xray_download_zip_any "$zipf" "$latest_url" "$latest_proxy" "$api_url" "$official_url" "$proxy_url" "$fallback_url" "$fallback_proxy"; then
+        if xray_download_zip_any "$zipf" "${xray_urls[@]}"; then
             ok_url=1
             chosen_tag="$xray_latest"
             [[ -n "$chosen_tag" ]] || chosen_tag="$XRAY_FALLBACK_TAG"
         fi
         if [[ -z "$ok_url" ]]; then
             echo -e "${RED}❌ 核心下载或校验失败（候选下载地址全部失败，或 ZIP / SHA256 校验未通过）。${RESET}"
+            [[ -n "$XRAY_LAST_DOWNLOAD_URL" ]] && echo -e "${YELLOW}最后失败地址: ${XRAY_LAST_DOWNLOAD_URL}${RESET}"
+            [[ -n "$XRAY_LAST_DOWNLOAD_REASON" ]] && echo -e "${YELLOW}最后失败原因: ${XRAY_LAST_DOWNLOAD_REASON}${RESET}"
             rm -rf "$tmpdir"
             sleep 3
             return
@@ -4075,21 +4107,18 @@ update_xray_if_needed() {
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-xray.XXXXXX)
     local zipf="${tmpdir}/xray.zip" candidate="${tmpdir}/xray"
-    local asset_name official_url api_url proxy_url latest_url latest_proxy fallback_url fallback_proxy ok_tag=""
+    local asset_name ok_tag=""
+    local -a xray_urls=()
     asset_name=$(xray_release_asset_name "$xray_arch")
-    latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
-    latest_proxy=$(github_proxy_wrap "$latest_url")
-    official_url="https://github.com/XTLS/Xray-core/releases/download/${latest}/${asset_name}"
-    api_url=$(github_release_asset_url "XTLS/Xray-core" "$latest" "$asset_name" 2>/dev/null || true)
-    proxy_url=$(github_proxy_wrap "$official_url")
-    fallback_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_FALLBACK_TAG}/${asset_name}"
-    fallback_proxy=$(github_proxy_wrap "$fallback_url")
+    mapfile -t xray_urls < <(xray_download_candidate_urls "$latest" "$asset_name" "$XRAY_FALLBACK_TAG")
 
     if [[ -n "$latest" ]] && cache_restore_binary_tag "xray" "$latest" "$candidate" && run_with_timeout 3 "$candidate" version >/dev/null 2>&1 && run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1; then
         ok_tag="$latest"
     else
         rm -f "$zipf" "$candidate" >/dev/null 2>&1 || true
-        if ! xray_download_zip_any "$zipf" "$latest_url" "$latest_proxy" "$api_url" "$official_url" "$proxy_url" "$fallback_url" "$fallback_proxy"; then
+        if ! xray_download_zip_any "$zipf" "${xray_urls[@]}"; then
+            [[ -n "$XRAY_LAST_DOWNLOAD_URL" ]] && echo -e "${YELLOW}Xray 更新下载失败地址: ${XRAY_LAST_DOWNLOAD_URL}${RESET}" >&2
+            [[ -n "$XRAY_LAST_DOWNLOAD_REASON" ]] && echo -e "${YELLOW}Xray 更新下载失败原因: ${XRAY_LAST_DOWNLOAD_REASON}${RESET}" >&2
             rm -rf "$tmpdir"
             return 2
         fi
