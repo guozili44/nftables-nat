@@ -489,6 +489,34 @@ xray_current_tag() {
     [[ -n "$v" ]] && echo "v${v}"
 }
 
+readonly XRAY_FALLBACK_TAG="v1.8.24"
+
+xray_normalize_tag() {
+    local raw="$1" tag=""
+    tag=$(printf '%s' "$raw" | tr -d '
+[:space:]')
+    [[ -n "$tag" ]] || return 1
+    [[ "$tag" =~ ^v[0-9]+(\.[0-9]+){1,3}([._-][A-Za-z0-9]+)?$ ]] || return 1
+    printf '%s' "$tag"
+}
+
+xray_cached_or_latest_tag() {
+    local file tag=""
+    file="${CORE_TAG_CACHE_DIR}/xray.tag"
+    tag=$(xray_normalize_tag "$(cached_latest_tag "XTLS/Xray-core" "xray" 2>/dev/null || true)" 2>/dev/null || true)
+    if [[ -z "$tag" ]]; then
+        tag=$(xray_normalize_tag "$(github_latest_release_redirect_tag "XTLS/Xray-core" 2>/dev/null || true)" 2>/dev/null || true)
+    fi
+    if [[ -z "$tag" ]]; then
+        tag=$(xray_normalize_tag "$(meta_get "XRAY_TAG" 2>/dev/null || true)" 2>/dev/null || true)
+    fi
+    if [[ -z "$tag" ]]; then
+        rm -f "$file" 2>/dev/null || true
+        tag="$XRAY_FALLBACK_TAG"
+    fi
+    printf '%s' "$tag"
+}
+
 core_cache_clear_all() {
     rm -rf "$CORE_CACHE_DIR" 2>/dev/null || true
 }
@@ -3252,37 +3280,26 @@ install_vless_native() {
         [[ -z "$xray_latest" ]] && xray_latest=$(xray_current_tag || true)
     else
         echo -e "${CYAN}>>> 本地无可用 Xray 核心，开始联网下载...${RESET}"
-        xray_latest=$(cached_latest_tag "XTLS/Xray-core" "xray")
-        xray_latest=$(printf '%s' "$xray_latest" | tr -d '[:space:]')
+        xray_latest=$(xray_cached_or_latest_tag)
 
         tmpdir=$(mktemp -d /tmp/ssr-xray.XXXXXX)
         zipf="${tmpdir}/xray.zip"
-        local asset_name official_url api_url proxy_url latest_url latest_proxy try_tag ok_url="" display_tag=""
+        local asset_name official_url api_url proxy_url latest_url latest_proxy fallback_url fallback_proxy chosen_tag="" ok_url="" display_tag=""
         asset_name="Xray-linux-${xray_arch}.zip"
         latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
         latest_proxy="https://ghproxy.net/${latest_url#https://}"
-        display_tag="${xray_latest:-latest}"
-        [[ -z "$display_tag" ]] && display_tag="latest"
+        official_url="https://github.com/XTLS/Xray-core/releases/download/${xray_latest}/${asset_name}"
+        api_url=$(github_release_asset_url "XTLS/Xray-core" "$xray_latest" "$asset_name" 2>/dev/null || true)
+        proxy_url="https://ghproxy.net/${official_url#https://}"
+        fallback_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_FALLBACK_TAG}/${asset_name}"
+        fallback_proxy="https://ghproxy.net/${fallback_url#https://}"
+        display_tag="${xray_latest:-$XRAY_FALLBACK_TAG}"
 
         echo -e "${CYAN}>>> 下载核心: ${display_tag} (linux-${xray_arch}) ...${RESET}"
 
-        # 先尝试 latest 直链，避免版本号获取失败时整个安装链路被卡死
-        if download_file_any "$zipf" "$latest_url" "$latest_proxy" && [[ -s "$zipf" ]] && unzip -t "$zipf" >/dev/null 2>&1; then
+        if download_file_any "$zipf" "$latest_url" "$latest_proxy" "$api_url" "$official_url" "$proxy_url" "$fallback_url" "$fallback_proxy" && [[ -s "$zipf" ]] && unzip -t "$zipf" >/dev/null 2>&1; then
             ok_url=1
-        else
-            rm -f "$zipf" >/dev/null 2>&1 || true
-            for try_tag in "$xray_latest" "v26.2.6"; do
-                [[ -n "$try_tag" ]] || continue
-                official_url="https://github.com/XTLS/Xray-core/releases/download/${try_tag}/${asset_name}"
-                api_url=$(github_release_asset_url "XTLS/Xray-core" "$try_tag" "$asset_name" 2>/dev/null || true)
-                proxy_url="https://ghproxy.net/${official_url#https://}"
-                rm -f "$zipf" >/dev/null 2>&1 || true
-                if download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" && [[ -s "$zipf" ]] && unzip -t "$zipf" >/dev/null 2>&1; then
-                    xray_latest="$try_tag"
-                    ok_url=1
-                    break
-                fi
-            done
+            chosen_tag="$xray_latest"
         fi
         if [[ -z "$ok_url" ]]; then
             echo -e "${RED}❌ 核心下载或校验失败。${RESET}"
@@ -3312,7 +3329,9 @@ install_vless_native() {
             sleep 3
             return
         }
-        cache_store_binary "xray" "$xray_latest" /usr/local/bin/xray >/dev/null 2>&1 || true
+        xray_latest=$(run_with_timeout 3 "${tmpdir}/xray" version 2>/dev/null | head -n1 | grep -oE '([0-9]+\.){2}[0-9]+' | head -n1)
+        [[ -n "$xray_latest" ]] && xray_latest="v${xray_latest}" || xray_latest="$chosen_tag"
+        [[ -n "$xray_latest" ]] && cache_store_binary "xray" "$xray_latest" /usr/local/bin/xray >/dev/null 2>&1 || true
     fi
 
     [[ -n "$xray_latest" ]] || xray_latest=$(xray_current_tag || true)
@@ -3828,40 +3847,39 @@ update_xray_if_needed() {
         armv7l|armv7|arm) xray_arch="arm32-v7a" ;;
     esac
 
-    local latest; latest=$(cached_latest_tag "XTLS/Xray-core" "xray")
-    latest=$(printf '%s' "$latest" | tr -d '[:space:]')
+    local latest; latest=$(xray_cached_or_latest_tag)
 
     local current; current=$(meta_get "XRAY_TAG" || true)
+    current=$(xray_normalize_tag "$current" 2>/dev/null || true)
     [[ -z "$current" ]] && current=$(xray_current_tag || true)
     [[ -n "$latest" && -n "$current" && "$current" == "$latest" ]] && return 3
 
     local tmpdir; tmpdir=$(mktemp -d /tmp/ssr-up-xray.XXXXXX)
     local zipf="${tmpdir}/xray.zip" candidate="${tmpdir}/xray"
-    local asset_name official_url api_url proxy_url latest_url latest_proxy try_tag ok_tag=""
+    local asset_name official_url api_url proxy_url latest_url latest_proxy fallback_url fallback_proxy ok_tag=""
     asset_name="Xray-linux-${xray_arch}.zip"
     latest_url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset_name}"
     latest_proxy="https://ghproxy.net/${latest_url#https://}"
+    official_url="https://github.com/XTLS/Xray-core/releases/download/${latest}/${asset_name}"
+    api_url=$(github_release_asset_url "XTLS/Xray-core" "$latest" "$asset_name" 2>/dev/null || true)
+    proxy_url="https://ghproxy.net/${official_url#https://}"
+    fallback_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_FALLBACK_TAG}/${asset_name}"
+    fallback_proxy="https://ghproxy.net/${fallback_url#https://}"
 
     if [[ -n "$latest" ]] && cache_restore_binary_tag "xray" "$latest" "$candidate" && run_with_timeout 3 "$candidate" version >/dev/null 2>&1 && run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1; then
         ok_tag="$latest"
     else
-        for try_tag in "$latest" "v26.2.6"; do
-            [[ -n "$try_tag" ]] || continue
-            official_url="https://github.com/XTLS/Xray-core/releases/download/${try_tag}/${asset_name}"
-            api_url=$(github_release_asset_url "XTLS/Xray-core" "$try_tag" "$asset_name" 2>/dev/null || true)
-            proxy_url="https://ghproxy.net/${official_url#https://}"
-            rm -f "$zipf" "$candidate" >/dev/null 2>&1 || true
-            if ! download_file_any "$zipf" "$api_url" "$official_url" "$proxy_url" "$latest_url" "$latest_proxy" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
-                continue
-            fi
-            unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
-            [[ -x "$candidate" ]] || continue
-            run_with_timeout 3 "$candidate" version >/dev/null 2>&1 || continue
-            run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1 || continue
-            ok_tag="$try_tag"
-            break
-        done
-        [[ -n "$ok_tag" ]] || { rm -rf "$tmpdir"; return 2; }
+        rm -f "$zipf" "$candidate" >/dev/null 2>&1 || true
+        if ! download_file_any "$zipf" "$latest_url" "$latest_proxy" "$api_url" "$official_url" "$proxy_url" "$fallback_url" "$fallback_proxy" || [[ ! -s "$zipf" ]] || ! unzip -t "$zipf" >/dev/null 2>&1; then
+            rm -rf "$tmpdir"
+            return 2
+        fi
+        unzip -qo "$zipf" xray -d "$tmpdir" >/dev/null 2>&1 || true
+        [[ -x "$candidate" ]] || { rm -rf "$tmpdir"; return 2; }
+        run_with_timeout 3 "$candidate" version >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
+        run_with_timeout 3 "$candidate" x25519 >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 2; }
+        ok_tag=$(run_with_timeout 3 "$candidate" version 2>/dev/null | head -n1 | grep -oE '([0-9]+\.){2}[0-9]+' | head -n1)
+        [[ -n "$ok_tag" ]] && ok_tag="v${ok_tag}" || ok_tag="$latest"
     fi
     latest="$ok_tag"
 
