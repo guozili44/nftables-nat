@@ -1635,17 +1635,50 @@ readonly REALITY_NGX_FALLBACK_KEY="${REALITY_NGX_FALLBACK_CERT_DIR}/privkey.pem"
 readonly REALITY_NGX_FALLBACK_WEBROOT="/var/www/my-reality-fallback"
 readonly REALITY_NGX_MIGRATE_BACKUP_DIR="/etc/nginx/my-reality-front-backup"
 
+reality_nginx_modules_path() {
+    local token path
+    token="$(nginx -V 2>&1 | tr " " "\n" | grep -m1 '^--modules-path=' || true)"
+    path="${token#--modules-path=}"
+    [[ -n "$path" ]] && printf '%s
+' "$path" || printf '%s
+' '/usr/lib/nginx/modules'
+}
+
+reality_nginx_stream_is_dynamic() {
+    nginx -V 2>&1 | grep -q -- '--with-stream=dynamic'
+}
+
+reality_nginx_stream_module_so() {
+    local base cand
+    base="$(reality_nginx_modules_path)"
+    for cand in         "$base/ngx_stream_module.so"         '/usr/lib/nginx/modules/ngx_stream_module.so'         '/usr/lib64/nginx/modules/ngx_stream_module.so'
+    do
+        [[ -f "$cand" ]] && { printf '%s
+' "$cand"; return 0; }
+    done
+    return 1
+}
+
 reality_nginx_stream_runtime_ok() {
-    local tmp_dir conf err
+    local tmp_dir conf err mod_so
     have_cmd nginx || return 1
     tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/nginx-stream-check.XXXXXX")" || return 1
     conf="${tmp_dir}/nginx.conf"
     err="${tmp_dir}/err.log"
-    cat > "$conf" <<'EOF'
+    {
+        if reality_nginx_stream_is_dynamic; then
+            mod_so="$(reality_nginx_stream_module_so || true)"
+            [[ -n "$mod_so" ]] || { rm -rf "$tmp_dir"; return 1; }
+            printf 'load_module %s;
+' "$mod_so"
+        fi
+        cat <<'EOF'
 events {}
 stream {
     server {
         listen 127.0.0.1:9;
+        ssl_preread on;
+        proxy_pass 127.0.0.1:12345;
     }
 }
 http {
@@ -1655,11 +1688,12 @@ http {
     }
 }
 EOF
+    } > "$conf"
     if nginx -t -c "$conf" >"$err" 2>&1; then
         rm -rf "$tmp_dir"
         return 0
     fi
-    if grep -qiE 'unknown directive "stream"|dlopen\(\).*ngx_stream.*failed|module ".*ngx_stream.*" is not binary compatible' "$err" 2>/dev/null; then
+    if grep -qiE 'unknown directive "stream"|unknown directive "ssl_preread"|dlopen\(\).*ngx_stream.*failed|module ".*ngx_stream.*" is not binary compatible|cannot open shared object file' "$err" 2>/dev/null; then
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -1667,31 +1701,44 @@ EOF
     return 0
 }
 
+reality_nginx_ensure_modules_include() {
+    local conf="/etc/nginx/nginx.conf" tmp
+    [[ -f "$conf" ]] || return 1
+    grep -q '/etc/nginx/modules-enabled/\*\.conf' "$conf" && return 0
+    tmp="$(mktemp "${TMPDIR:-/tmp}/nginx.conf.modules.XXXXXX")" || return 1
+    {
+        printf '%s
+' 'include /etc/nginx/modules-enabled/*.conf;'
+        cat "$conf"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    install -m 644 "$tmp" "$conf" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+}
+
 reality_nginx_enable_dynamic_stream_modules() {
+    local mod_so
     mkdir -p /etc/nginx/modules-enabled 2>/dev/null || true
-    if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]] && [[ ! -f /etc/nginx/modules-enabled/50-mod-stream.conf ]]; then
-        printf '%s\n' 'load_module modules/ngx_stream_module.so;' > /etc/nginx/modules-enabled/50-mod-stream.conf
-    fi
-    if [[ -f /usr/lib/nginx/modules/ngx_stream_ssl_preread_module.so ]] && [[ ! -f /etc/nginx/modules-enabled/70-mod-stream-ssl-preread.conf ]]; then
-        printf '%s\n' 'load_module modules/ngx_stream_ssl_preread_module.so;' > /etc/nginx/modules-enabled/70-mod-stream-ssl-preread.conf
-    fi
+    mod_so="$(reality_nginx_stream_module_so || true)"
+    [[ -n "$mod_so" ]] || return 1
+    printf 'load_module %s;
+' "$mod_so" > /etc/nginx/modules-enabled/50-mod-stream.conf
 }
 
 reality_nginx_ensure_stream_module() {
     have_cmd nginx || return 1
     if reality_nginx_stream_runtime_ok; then
+        reality_nginx_stream_is_dynamic && reality_nginx_enable_dynamic_stream_modules >/dev/null 2>&1 || true
         return 0
     fi
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null 2>&1 || true
-    apt-get install -y -qq libnginx-mod-stream >/dev/null 2>&1 \
-        || apt-get install -y -qq nginx-mod-stream >/dev/null 2>&1 \
-        || apt-get install -y -qq nginx-full >/dev/null 2>&1 \
-        || apt-get install -y -qq nginx-extras >/dev/null 2>&1 \
-        || true
-    reality_nginx_enable_dynamic_stream_modules
+    apt-get install -y -qq libnginx-mod-stream >/dev/null 2>&1         || apt-get install -y -qq nginx-mod-stream >/dev/null 2>&1         || apt-get install -y -qq nginx-full >/dev/null 2>&1         || apt-get install -y -qq nginx-extras >/dev/null 2>&1         || true
+    reality_nginx_enable_dynamic_stream_modules >/dev/null 2>&1 || true
     if reality_nginx_stream_runtime_ok; then
         return 0
+    fi
+    if reality_nginx_stream_is_dynamic && ! reality_nginx_stream_module_so >/dev/null 2>&1; then
+        echo -e "${YELLOW}>>> 当前 nginx 声明为 --with-stream=dynamic，但系统里缺少 ngx_stream_module.so；需要安装对应 stream 模块包。${RESET}"
     fi
     echo -e "${RED}❌ 当前 Nginx 不支持 stream/ssl_preread，无法启用前置过滤模式。${RESET}"
     return 1
@@ -1702,7 +1749,7 @@ reality_nginx_ensure_stream_include() {
     [[ -f "$conf" ]] || return 1
     grep -q '/etc/nginx/stream-conf.d/\*\.conf' "$conf" && return 0
     tmp="$(mktemp "${TMPDIR:-/tmp}/nginx.conf.XXXXXX")" || return 1
-    awk '
+    awk '''
         BEGIN { done=0 }
         { print }
         !done && $0 ~ /include[[:space:]]+\/etc\/nginx\/modules-enabled\/\*\.conf;/ {
@@ -1716,7 +1763,7 @@ reality_nginx_ensure_stream_include() {
                 print "include /etc/nginx/stream-conf.d/*.conf;"
             }
         }
-    ' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    ''' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
     install -m 644 "$tmp" "$conf" 2>/dev/null || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 }
@@ -1749,6 +1796,10 @@ reality_nginx_restore_migrated_confs() {
         mkdir -p "$(dirname "$dst")" 2>/dev/null || true
         cp -a "$src" "$dst" 2>/dev/null || true
     done < <(find "$REALITY_NGX_MIGRATE_BACKUP_DIR" -type f -print0 2>/dev/null)
+}
+
+reality_nginx_cleanup_front_conf() {
+    rm -f "$REALITY_NGX_STREAM_CONF" 2>/dev/null || true
 }
 
 reality_nginx_rewrite_listen_443_to_8443() {
@@ -1915,6 +1966,7 @@ EOF
 reality_nginx_prepare_front() {
     local sni="$1" xray_port="$2" fallback_backend="$3" conflicts ngx_module_file nginx_test_log
     ngx_module_file="${NGX_MODULE_FILE:-/usr/local/lib/my/nginx_module.sh}"
+    reality_nginx_cleanup_front_conf
     if declare -F ngx_install_dependencies >/dev/null 2>&1; then
         ngx_install_dependencies || return 1
     else
@@ -1924,7 +1976,15 @@ reality_nginx_prepare_front() {
         fi
         bash -lc 'source "$1" && ngx_install_dependencies' _ "$ngx_module_file" || return 1
     fi
-    reality_nginx_ensure_stream_module || return 1
+    reality_nginx_ensure_stream_module || {
+        reality_nginx_cleanup_front_conf
+        nginx -t >/dev/null 2>&1 || true
+        return 1
+    }
+    if ! reality_nginx_ensure_modules_include; then
+        echo -e "${RED}❌ 写入 Nginx modules include 失败。${RESET}"
+        return 1
+    fi
     if ! reality_nginx_ensure_stream_include; then
         echo -e "${RED}❌ 写入 Nginx stream include 失败。${RESET}"
         return 1
@@ -1958,6 +2018,7 @@ reality_nginx_prepare_front() {
     if ! nginx -t >"$nginx_test_log" 2>&1; then
         echo -e "${RED}❌ Nginx 配置测试失败，正在回滚自动迁移的 443 站点配置。${RESET}"
         reality_nginx_restore_migrated_confs >/dev/null 2>&1 || true
+        reality_nginx_cleanup_front_conf
         nginx -t >/dev/null 2>&1 || true
         echo -e "${YELLOW}>>> Nginx 测试日志：${nginx_test_log}${RESET}"
         tail -n 20 "$nginx_test_log" 2>/dev/null || true
