@@ -1384,7 +1384,7 @@ ssr_make_ss_link() {
     password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
     [[ -n "$ip" && -n "$port" && -n "$method" && -n "$password" ]] || return 1
     userinfo=$(ss_make_userinfo "$method" "$password")
-    printf 'ss://%s@%s:%s#SS-Rust' "$userinfo" "$ip" "$port"
+    printf 'ss://%s@%s:%s#Shadowsocks-Legacy' "$userinfo" "$ip" "$port"
 }
 
 show_ss_rust_summary() {
@@ -1511,7 +1511,7 @@ ensure_ss_rust_binary() {
         [[ -z "$ENSURED_SS_RUST_TAG" ]] && ENSURED_SS_RUST_TAG=$(ss_rust_current_tag || true)
         return 0
     fi
-    echo -e "${CYAN}>>> 本地无可用 SS-Rust 核心，开始联网下载...${RESET}"
+    echo -e "${CYAN}>>> 本地无可用旧版 Shadowsocks 核心，开始联网下载...${RESET}"
     ss_latest=$(cached_latest_tag "shadowsocks/shadowsocks-rust" "ss-rust")
     [[ -z "$ss_latest" ]] && ss_latest="v1.24.0"
     tmpdir=$(mktemp -d /tmp/ssr-ssrust.XXXXXX)
@@ -1534,7 +1534,7 @@ ensure_ss_rust_binary() {
         fi
     done
     if [[ -z "$ss_arch" || ! -x "${tmpdir}/ssserver" ]]; then
-        echo -e "${RED}❌ SS-Rust 新核心自检失败。已自动尝试 musl/gnu 两种构建，当前环境均无法运行。${RESET}"
+        echo -e "${RED}❌ 旧版 Shadowsocks 核心自检失败。已自动尝试 musl/gnu 两种构建，当前环境均无法运行。${RESET}"
         rm -rf "$tmpdir"
         sleep 3
         return 1
@@ -3137,7 +3137,7 @@ managed_service_description() {
 
 managed_service_label() {
     case "$1" in
-        ss-rust) printf %s "SS-Rust" ;;
+        ss-rust) printf %s "Shadowsocks-Legacy" ;;
         ss-v2ray) printf %s "Shadowsocks-2022 (Xray)" ;;
         xray) printf %s "Xray / VLESS Reality" ;;
         *) return 1 ;;
@@ -4501,10 +4501,27 @@ ensure_xray_core_ready() {
 }
 
 restart_xray_protocol_service() {
-    if managed_service_exists "xray"; then
-        restart_named_service "xray"
+    local name="xray" unit_content bg_cmd bg_match log_file pid_file
+    unit_content=$(managed_service_unit "$name") || return 1
+    bg_cmd=$(managed_service_exec "$name") || return 1
+    bg_match=$(managed_service_match "$name") || return 1
+    log_file=$(managed_service_log "$name") || return 1
+    pid_file=$(managed_service_pid "$name") || return 1
+
+    if service_use_systemd; then
+        mkdir -p /etc/systemd/system 2>/dev/null || true
+        printf '%s
+' "$unit_content" > "/etc/systemd/system/${name}.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable "$name" >/dev/null 2>&1 || true
+        if ! systemctl restart "$name" >/dev/null 2>&1; then
+            systemctl reset-failed "$name" >/dev/null 2>&1 || true
+            systemctl start "$name" >/dev/null 2>&1 || return 1
+        fi
+        sleep 1
+        service_is_running "$name" "$bg_match" "$pid_file" || return 1
     else
-        start_named_service "xray"
+        restart_named_service "$name" || start_named_service "$name" || return 1
     fi
 }
 
@@ -4595,12 +4612,23 @@ run_install_vless() {
     vless_inbound=$(build_vless_inbound "$port" "$uuid" "$domain" "$private_key" "$short_id") || return 1
     write_xray_protocol_config "$vless_inbound" "$ss_inbound" || return 1
 
-    if ! /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1; then
+    local test_output=""
+    if ! test_output=$(/usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json 2>&1); then
         echo -e "${RED}❌ Xray 配置自检失败。${RESET}"
+        [[ -n "$test_output" ]] && printf '%s
+' "$test_output"
         return 1
     fi
 
-    restart_xray_protocol_service || { echo -e "${RED}❌ Xray 启动失败。${RESET}"; return 1; }
+    if ! restart_xray_protocol_service; then
+        echo -e "${RED}❌ Xray 启动失败。${RESET}"
+        if service_use_systemd; then
+            journalctl -u xray -n 30 --no-pager 2>/dev/null || true
+        elif [[ -f /var/log/xray.log ]]; then
+            tail -n 30 /var/log/xray.log 2>/dev/null || true
+        fi
+        return 1
+    fi
     named_service_add_firewall "xray" "$port" >/dev/null 2>&1 || true
     meta_set "VLESS_FRONT_MODE" "direct"
     meta_set "VLESS_PUBLIC_PORT" "$port"
@@ -4622,12 +4650,23 @@ run_install_ss() {
     ss_inbound=$(build_ss_inbound "$port" "$password") || return 1
     write_xray_protocol_config "$vless_inbound" "$ss_inbound" || return 1
 
-    if ! /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1; then
+    local test_output=""
+    if ! test_output=$(/usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json 2>&1); then
         echo -e "${RED}❌ Xray 配置自检失败。${RESET}"
+        [[ -n "$test_output" ]] && printf '%s
+' "$test_output"
         return 1
     fi
 
-    restart_xray_protocol_service || { echo -e "${RED}❌ Xray 启动失败。${RESET}"; return 1; }
+    if ! restart_xray_protocol_service; then
+        echo -e "${RED}❌ Xray 启动失败。${RESET}"
+        if service_use_systemd; then
+            journalctl -u xray -n 30 --no-pager 2>/dev/null || true
+        elif [[ -f /var/log/xray.log ]]; then
+            tail -n 30 /var/log/xray.log 2>/dev/null || true
+        fi
+        return 1
+    fi
     named_service_add_firewall "xray" "$port" >/dev/null 2>&1 || true
     echo -e "${GREEN}✅ Shadowsocks-2022 安装完成！${RESET}"
     view_all_info
@@ -4660,12 +4699,23 @@ run_install_dual() {
     ss_inbound=$(build_ss_inbound "$ss_port" "$password") || return 1
     write_xray_protocol_config "$vless_inbound" "$ss_inbound" || return 1
 
-    if ! /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1; then
+    local test_output=""
+    if ! test_output=$(/usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json 2>&1); then
         echo -e "${RED}❌ Xray 配置自检失败。${RESET}"
+        [[ -n "$test_output" ]] && printf '%s
+' "$test_output"
         return 1
     fi
 
-    restart_xray_protocol_service || { echo -e "${RED}❌ Xray 启动失败。${RESET}"; return 1; }
+    if ! restart_xray_protocol_service; then
+        echo -e "${RED}❌ Xray 启动失败。${RESET}"
+        if service_use_systemd; then
+            journalctl -u xray -n 30 --no-pager 2>/dev/null || true
+        elif [[ -f /var/log/xray.log ]]; then
+            tail -n 30 /var/log/xray.log 2>/dev/null || true
+        fi
+        return 1
+    fi
     named_service_add_firewall "xray" "$vless_port" >/dev/null 2>&1 || true
     named_service_add_firewall "xray" "$ss_port" >/dev/null 2>&1 || true
     meta_set "VLESS_FRONT_MODE" "direct"
@@ -4689,9 +4739,9 @@ cleanup_legacy_ss_backends() {
     rm -f /usr/local/bin/v2ray-plugin "$SS_V2RAY_STATE" >/dev/null 2>&1 || true
     if [[ "$mode" != "silent" ]]; then
         if [[ "$cleaned" -eq 1 ]]; then
-            echo -e "${GREEN}✅ 旧版 SS-Rust / v2ray-plugin 残留已清理。${RESET}"
+            echo -e "${GREEN}✅ 旧版 Shadowsocks 后端残留已清理。${RESET}"
         else
-            echo -e "${YELLOW}未检测到旧版 SS-Rust / v2ray-plugin 残留。${RESET}"
+            echo -e "${YELLOW}未检测到旧版 Shadowsocks 后端残留。${RESET}"
         fi
     fi
     return 0
@@ -4829,7 +4879,7 @@ remove_xray_protocol() {
 
 install_ss_rust_native() {
     clear 2>/dev/null || true
-    echo -e "${YELLOW}⚠ 已移除旧版 SS-Rust 安装入口。请改用 Shadowsocks-2022 (Xray)。${RESET}"
+    echo -e "${YELLOW}⚠ 旧版 Shadowsocks 安装入口已移除。请改用 Shadowsocks-2022 (Xray)。${RESET}"
     cleanup_legacy_ss_backends
     read -n 1 -s -r -p "按任意键返回上一层..."
 }
@@ -4876,7 +4926,7 @@ unified_node_manager() {
         echo -e "${CYAN}========= 统一节点生命周期管控中心 =========${RESET}"
         echo -e "${YELLOW} 1)${RESET} Shadowsocks-2022 (Xray) 管理"
         echo -e "${YELLOW} 2)${RESET} VLESS Reality (Xray) 管理"
-        echo -e "${YELLOW} 3)${RESET} 清理旧版 SS-Rust / v2ray-plugin 残留"
+        echo -e "${YELLOW} 3)${RESET} 清理旧版 Shadowsocks 后端残留"
         echo -e "${RED} 4) ☢️ 全局强制核爆 (当前仅 Xray)${RESET}"
         echo -e " 0) 返回主菜单"
         read -rp "请选择 [0-4]: " node_choice
@@ -5277,8 +5327,8 @@ core_cache_menu() {
         echo -e "${CYAN}========= 核心缓存与更新中心 =========${RESET}"
         echo
         echo -e "${GREEN} 1.${RESET} 更新 Xray 核心"
-        echo -e "${YELLOW} 2.${RESET} 清理全部核心缓存（含旧 SS-Rust 缓存）"
-        echo -e "${YELLOW} 3.${RESET} 清理旧版 SS-Rust / v2ray-plugin 残留"
+        echo -e "${YELLOW} 2.${RESET} 清理全部核心缓存"
+        echo -e "${YELLOW} 3.${RESET} 清理旧版 Shadowsocks 后端残留"
         echo -e " 0. 返回主菜单"
         read -rp "输入数字 [0-3]: " cache_num
         case "$cache_num" in
@@ -8147,7 +8197,7 @@ ssr_deploy_menu() {
         echo -e "${YELLOW} 1.${RESET} 安装 VLESS Reality (Xray)"
         echo -e "${YELLOW} 2.${RESET} 安装 Shadowsocks-2022 (Xray)"
         echo -e "${YELLOW} 3.${RESET} 安装双协议 (VLESS + Shadowsocks-2022)"
-        echo -e "${YELLOW} 4.${RESET} 清理旧版 SS-Rust / v2ray-plugin 残留"
+        echo -e "${YELLOW} 4.${RESET} 清理旧版 Shadowsocks 后端残留"
         echo -e " 0. 返回上一级"
         echo -e "${CYAN}--------------------------------------------${RESET}"
         read -rp "请输入数字 [0-4]: " choice
@@ -8166,7 +8216,7 @@ ssr_hub_menu() {
     while true; do
         clear 2>/dev/null || true
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}           代理节点与热更中心 (SSR)       ${RESET}"
+        echo -e "${CYAN}           代理节点与热更中心 (Xray)       ${RESET}"
         echo -e "${CYAN}============================================${RESET}"
         echo -e "${YELLOW} 1.${RESET} 节点部署中心"
         echo -e "${YELLOW} 2.${RESET} 节点运维中心"
@@ -8901,7 +8951,7 @@ main_menu() {
     echo -e "${CYAN}      综合管理脚本 my  v${MY_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${YELLOW} 1.${RESET} 统一状态页 / 管理导航"
-    echo -e "${YELLOW} 2.${RESET} 代理节点与热更中心 (SSR)"
+    echo -e "${YELLOW} 2.${RESET} 代理节点与热更中心 (Xray)"
     echo -e "${YELLOW} 3.${RESET} 端口转发 / NFT 中心"
     echo -e "${YELLOW} 4.${RESET} 系统 / 建站 / 重装中心"
     echo -e "${YELLOW} 5.${RESET} GitHub 一键更新"
