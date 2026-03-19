@@ -557,6 +557,12 @@ xray_zip_has_binary() {
     unzip -Z1 "$zipf" 2>/dev/null | sed 's#^\./##' | grep -qx 'xray'
 }
 
+xray_zip_looks_like_html() {
+    local zipf="$1"
+    [[ -s "$zipf" ]] || return 1
+    head -c 512 "$zipf" 2>/dev/null | tr -d '\000' | grep -Eiq '<(html|!doctype html|head|body)|<?xml'
+}
+
 xray_zip_valid() {
     local zipf="$1"
     [[ -s "$zipf" ]] || return 1
@@ -603,9 +609,28 @@ xray_zip_matches_dgst() {
 XRAY_LAST_DOWNLOAD_URL=""
 XRAY_LAST_DOWNLOAD_REASON=""
 
+xray_related_url() {
+    local url="$1" suffix="$2"
+    local base="" query=""
+    [[ -n "$url" && -n "$suffix" ]] || return 1
+    base="${url%%\?*}"
+    if [[ "$url" == *\?* ]]; then
+        query="?${url#*\?}"
+    fi
+    case "$base" in
+        */download)
+            base="${base%/download}${suffix}/download"
+            ;;
+        *)
+            base="${base}${suffix}"
+            ;;
+    esac
+    printf '%s%s' "$base" "$query"
+}
+
 xray_download_zip_any() {
     local dest="$1"; shift
-    local u="" dgst_tmp="" expected=""
+    local u="" dgst_tmp="" dgst_url="" expected=""
     XRAY_LAST_DOWNLOAD_URL=""
     XRAY_LAST_DOWNLOAD_REASON=""
     [[ -n "$dest" ]] || { XRAY_LAST_DOWNLOAD_REASON="missing destination"; return 1; }
@@ -620,11 +645,15 @@ xray_download_zip_any() {
         fi
         XRAY_LAST_DOWNLOAD_REASON="invalid zip or xray binary missing"
         if ! xray_zip_valid "$dest"; then
+            if xray_zip_looks_like_html "$dest"; then
+                XRAY_LAST_DOWNLOAD_REASON="html landing page returned instead of zip"
+            fi
             rm -f "$dest" 2>/dev/null || true
             continue
         fi
         dgst_tmp=$(mktemp /tmp/xray-dgst.XXXXXX 2>/dev/null || true)
-        if [[ -n "$dgst_tmp" ]] && download_file "${u}.dgst" "$dgst_tmp"; then
+        dgst_url=$(xray_related_url "$u" ".dgst" 2>/dev/null || true)
+        if [[ -n "$dgst_tmp" && -n "$dgst_url" ]] && download_file "$dgst_url" "$dgst_tmp"; then
             expected=$(xray_dgst_expected_sha256 "$dgst_tmp" 2>/dev/null || true)
             if [[ -n "$expected" ]] && ! xray_zip_matches_dgst "$dest" "$dgst_tmp"; then
                 XRAY_LAST_DOWNLOAD_REASON="sha256 mismatch"
@@ -2156,9 +2185,20 @@ github_proxy_candidate_urls() {
 
 xray_sourceforge_candidate_urls() {
     local tag="$1" asset_name="$2"
+    local project="xray-core.mirror"
+    local rel_path="${tag}/${asset_name}"
+    local mirror=""
     [[ -n "$tag" && -n "$asset_name" ]] || return 1
-    printf '%s\n' "https://sourceforge.net/projects/xray-core.mirror/files/${tag}/${asset_name}/download"
-    printf '%s\n' "https://downloads.sourceforge.net/project/xray-core.mirror/${tag}/${asset_name}"
+    printf '%s
+' "https://sourceforge.net/projects/${project}/files/${rel_path}/download"
+    for mirror in twds zenlayer phoenixnap pilotfiber psychz cfhcable onboardcloud yer sitsa netactuate gigenet cytranet netix altushost excellmedia ixaustralia unlimited; do
+        printf '%s
+' "https://sourceforge.net/projects/${project}/files/${rel_path}/download?use_mirror=${mirror}"
+    done
+    for mirror in master twds zenlayer phoenixnap pilotfiber psychz cfhcable onboardcloud yer sitsa netactuate gigenet cytranet netix altushost excellmedia ixaustralia unlimited; do
+        printf '%s
+' "https://${mirror}.dl.sourceforge.net/project/${project}/${rel_path}?viasf=1"
+    done
 }
 
 xray_download_candidate_urls() {
