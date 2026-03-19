@@ -1633,6 +1633,7 @@ readonly REALITY_NGX_FALLBACK_CERT_DIR="/etc/nginx/ssl/my-reality-fallback"
 readonly REALITY_NGX_FALLBACK_CERT="${REALITY_NGX_FALLBACK_CERT_DIR}/fullchain.pem"
 readonly REALITY_NGX_FALLBACK_KEY="${REALITY_NGX_FALLBACK_CERT_DIR}/privkey.pem"
 readonly REALITY_NGX_FALLBACK_WEBROOT="/var/www/my-reality-fallback"
+readonly REALITY_NGX_MIGRATE_BACKUP_DIR="/etc/nginx/my-reality-front-backup"
 
 reality_nginx_ensure_stream_module() {
     have_cmd nginx || return 1
@@ -1687,6 +1688,85 @@ reality_nginx_detect_public_443_conflicts() {
     [[ -z "$hits" ]] && return 0
     echo "$hits"
     return 1
+}
+
+reality_nginx_backup_conf_file() {
+    local src="$1" rel dst
+    [[ -f "$src" ]] || return 0
+    rel="${src#/etc/nginx/}"
+    [[ "$rel" == "$src" ]] && rel="$(basename "$src")"
+    dst="${REALITY_NGX_MIGRATE_BACKUP_DIR}/${rel}"
+    mkdir -p "$(dirname "$dst")" 2>/dev/null || return 1
+    if [[ ! -f "$dst" ]]; then
+        cp -a "$src" "$dst" 2>/dev/null || return 1
+    fi
+}
+
+reality_nginx_restore_migrated_confs() {
+    local src dst
+    [[ -d "$REALITY_NGX_MIGRATE_BACKUP_DIR" ]] || return 0
+    while IFS= read -r -d '' src; do
+        dst="/etc/nginx/${src#${REALITY_NGX_MIGRATE_BACKUP_DIR}/}"
+        mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+        cp -a "$src" "$dst" 2>/dev/null || true
+    done < <(find "$REALITY_NGX_MIGRATE_BACKUP_DIR" -type f -print0 2>/dev/null)
+}
+
+reality_nginx_rewrite_listen_443_to_8443() {
+    local file="$1" tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/ng443.XXXXXX")" || return 1
+    python3 - "$file" > "$tmp" <<'PYLISTEN'
+import re, sys
+path = sys.argv[1]
+text = open(path, 'r', encoding='utf-8', errors='ignore').read()
+out = []
+changed = False
+for line in text.splitlines(True):
+    if re.match(r'^\s*listen\s+.*(?:\b443\b|:443\b)', line) and ';' in line and not line.lstrip().startswith('#'):
+        indent = re.match(r'^(\s*)', line).group(1)
+        body = line.strip()
+        body = re.sub(r'^listen\s+', '', body)
+        body = body[:-1].strip() if body.endswith(';') else body
+        tokens = body.split()
+        if not tokens:
+            out.append(line)
+            continue
+        addr = tokens[0]
+        rest = ' '.join(tokens[1:])
+        new_addr = '[::1]:8443' if '[::]' in addr else '127.0.0.1:8443'
+        newline = f"{indent}listen {new_addr}"
+        if rest:
+            newline += f" {rest}"
+        newline += ';\n'
+        if newline != line:
+            changed = True
+        out.append(newline)
+    else:
+        out.append(line)
+if not changed:
+    sys.stdout.write(text)
+else:
+    sys.stdout.write(''.join(out))
+PYLISTEN
+    install -m 644 "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+}
+
+reality_nginx_migrate_public_443_sites() {
+    local conflicts file
+    conflicts="$1"
+    [[ -n "$conflicts" ]] || return 0
+    if ! have_cmd python3; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y -qq python3 >/dev/null 2>&1 || return 1
+    fi
+    mkdir -p "$REALITY_NGX_MIGRATE_BACKUP_DIR" 2>/dev/null || return 1
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        reality_nginx_backup_conf_file "$file" || return 1
+        reality_nginx_rewrite_listen_443_to_8443 "$file" || return 1
+    done <<< "$conflicts"
 }
 
 reality_nginx_write_local_fallback_site() {
@@ -1806,26 +1886,47 @@ reality_nginx_prepare_front() {
         return 1
     fi
     if ! conflicts=$(reality_nginx_detect_public_443_conflicts); then
-        echo -e "${RED}❌ 检测到现有 Nginx 公网 443 站点，无法同时启用前置 stream 过滤。${RESET}"
-        echo -e "${YELLOW}冲突配置:${RESET}"
+        echo -e "${YELLOW}>>> 检测到现有 Nginx 公网 443 站点，正在自动迁移到 127.0.0.1:8443 以兼容前置 stream 过滤...${RESET}"
+        echo -e "${YELLOW}涉及配置:${RESET}"
         printf '%s\n' "$conflicts"
-        echo -e "${YELLOW}请先迁移/删除这些 443 站点，或改用非前置模式。${RESET}"
-        return 1
+        if [[ -n "$fallback_backend" && "$fallback_backend" != "127.0.0.1:8443" ]]; then
+            echo -e "${YELLOW}>>> 已忽略自定义回落后端，改为复用本机现有 HTTPS 站点：127.0.0.1:8443${RESET}"
+        fi
+        fallback_backend="127.0.0.1:8443"
+        reality_nginx_migrate_public_443_sites "$conflicts" || {
+            echo -e "${RED}❌ 自动迁移现有 443 站点失败。${RESET}"
+            reality_nginx_restore_migrated_confs >/dev/null 2>&1 || true
+            return 1
+        }
     fi
     if [[ -z "$fallback_backend" || "$fallback_backend" == "127.0.0.1:8443" ]]; then
         fallback_backend="127.0.0.1:8443"
-        reality_nginx_write_local_fallback_site || return 1
+        if [[ -z "$conflicts" ]]; then
+            reality_nginx_write_local_fallback_site || return 1
+        else
+            rm -f "$REALITY_NGX_FALLBACK_CONF" 2>/dev/null || true
+        fi
     else
         rm -f "$REALITY_NGX_FALLBACK_CONF" 2>/dev/null || true
     fi
     reality_nginx_write_stream_conf "$sni" "$xray_port" "$fallback_backend" || return 1
-    nginx -t >/dev/null 2>&1 || return 1
+    if ! nginx -t >/dev/null 2>&1; then
+        echo -e "${RED}❌ Nginx 配置测试失败，正在回滚自动迁移的 443 站点配置。${RESET}"
+        reality_nginx_restore_migrated_confs >/dev/null 2>&1 || true
+        nginx -t >/dev/null 2>&1 || true
+        return 1
+    fi
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl restart nginx >/dev/null 2>&1 || systemctl reload nginx >/dev/null 2>&1 || return 1
     add_firewall_rule 443 tcp >/dev/null 2>&1 || true
     meta_set "VLESS_FRONT_MODE" "nginx-stream"
     meta_set "VLESS_PUBLIC_PORT" "443"
     meta_set "VLESS_FALLBACK_BACKEND" "$fallback_backend"
+    if [[ -n "$conflicts" ]]; then
+        meta_set "VLESS_NGINX_MIGRATED_443" "1"
+    else
+        meta_set "VLESS_NGINX_MIGRATED_443" "0"
+    fi
     return 0
 }
 
