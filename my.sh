@@ -342,6 +342,9 @@ readonly SSH_PORT_DROPIN="/etc/ssh/sshd_config.d/00-my-port.conf"
 readonly ROOT_SSH_DIR="/root/.ssh"
 readonly ROOT_AUTH_KEYS_FILE="${ROOT_SSH_DIR}/authorized_keys"
 readonly JOURNALD_BACKUP_FILE="${META_DIR}/journald.conf.bak"
+readonly QUIC_STATE_FILE="${SSR_STATE_DIR}/quic.conf"
+readonly QUIC_NFT_TABLE="my_quic"
+readonly QUIC_RULE_COMMENT="my-quic-udp443"
 
 readonly DNS_BACKUP_DIR="${SSR_STATE_DIR}/dns"
 readonly LEGACY_DNS_BACKUP_DIR="/usr/local/etc/ssr_dns_backup"
@@ -4495,6 +4498,24 @@ get_cf_ddns_brief_status() {
     fi
 }
 
+quic_state_init_if_needed() {
+    state_dir_ensure "$SSR_STATE_DIR" >/dev/null 2>&1 || true
+    touch "$QUIC_STATE_FILE" >/dev/null 2>&1 || true
+    chmod 600 "$QUIC_STATE_FILE" >/dev/null 2>&1 || true
+}
+
+quic_meta_get() {
+    local key="$1"
+    quic_state_init_if_needed
+    state_kv_get "$QUIC_STATE_FILE" "$key"
+}
+
+quic_meta_set() {
+    local key="$1" value="$2"
+    quic_state_init_if_needed
+    state_kv_set "$QUIC_STATE_FILE" "$key" "$value"
+}
+
 quic_rule_blocked_ufw() {
     have_cmd ufw || return 1
     ufw status 2>/dev/null | grep -F '443/udp' | grep -qi 'DENY'
@@ -4506,18 +4527,26 @@ quic_rule_blocked_firewalld() {
 }
 
 quic_rule_blocked_iptables() {
-    iptables -C INPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
-    iptables -C OUTPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
-    ip6tables -C INPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
-    ip6tables -C OUTPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
+    have_cmd iptables && iptables -C INPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
+    have_cmd iptables && iptables -C OUTPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
+    have_cmd ip6tables && ip6tables -C INPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
+    have_cmd ip6tables && ip6tables -C OUTPUT -p udp --dport 443 -j DROP >/dev/null 2>&1 && return 0
     return 1
 }
 
-get_quic_backend() {
-    if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
+quic_rule_blocked_nft() {
+    have_cmd nft || return 1
+    nft list table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 || return 1
+    nft list table inet "$QUIC_NFT_TABLE" 2>/dev/null | grep -q "$QUIC_RULE_COMMENT"
+}
+
+quic_detect_block_backend() {
+    if quic_rule_blocked_ufw; then
         printf %s "ufw"
-    elif have_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
+    elif quic_rule_blocked_firewalld; then
         printf %s "firewalld"
+    elif quic_rule_blocked_nft; then
+        printf %s "nftables"
     elif quic_rule_blocked_iptables; then
         printf %s "iptables"
     else
@@ -4525,36 +4554,44 @@ get_quic_backend() {
     fi
 }
 
-get_quic_state() {
-    local backend
-    backend=$(get_quic_backend)
-    case "$backend" in
-        ufw)
-            quic_rule_blocked_ufw && printf %s "blocked" || printf %s "open"
-            ;;
-        firewalld)
-            quic_rule_blocked_firewalld && printf %s "blocked" || printf %s "open"
-            ;;
-        iptables)
-            quic_rule_blocked_iptables && printf %s "blocked" || printf %s "open"
-            ;;
-        *)
-            printf %s "open"
-            ;;
+get_quic_backend() {
+    local actual saved
+    actual=$(quic_detect_block_backend)
+    if [[ "$actual" != "none" ]]; then
+        printf %s "$actual"
+        return 0
+    fi
+    saved=$(quic_meta_get BACKEND 2>/dev/null || true)
+    case "$saved" in
+        ufw|firewalld|nftables|iptables) printf %s "$saved" ;;
+        *) printf %s "none" ;;
     esac
 }
 
+get_quic_state() {
+    local actual
+    actual=$(quic_detect_block_backend)
+    if [[ "$actual" != "none" ]]; then
+        printf %s "blocked"
+    else
+        printf %s "open"
+    fi
+}
+
 get_quic_status_brief() {
-    local state backend
+    local state backend managed
     state=$(get_quic_state)
     backend=$(get_quic_backend)
+    managed=$(quic_meta_get MANAGED 2>/dev/null || true)
     if [[ "$state" == "blocked" ]]; then
         printf %s "已阻断(${backend})"
     else
         if [[ "$backend" == "none" ]]; then
             printf %s "默认放行(未托管)"
-        else
+        elif [[ "$managed" == "1" ]]; then
             printf %s "已放行(${backend})"
+        else
+            printf %s "默认放行(${backend})"
         fi
     fi
 }
@@ -4596,45 +4633,122 @@ get_nginx_status_brief() {
     fi
 }
 
-manage_quic_udp443() {
-    local action="$1"
+select_quic_backend() {
     if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
-        if [[ "$action" == "block" ]]; then
-            ufw deny in 443/udp >/dev/null 2>&1
-            ufw deny out 443/udp >/dev/null 2>&1
-        else
-            ufw delete deny in 443/udp >/dev/null 2>&1
-            ufw delete deny out 443/udp >/dev/null 2>&1
-        fi
-        ufw reload >/dev/null 2>&1
+        printf %s "ufw"
     elif have_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
-        if [[ "$action" == "block" ]]; then
-            firewall-cmd --permanent --add-rich-rule='rule family="ipv4" port port="443" protocol="udp" drop' >/dev/null 2>&1
-            firewall-cmd --permanent --add-rich-rule='rule family="ipv6" port port="443" protocol="udp" drop' >/dev/null 2>&1
-        else
-            firewall-cmd --permanent --remove-rich-rule='rule family="ipv4" port port="443" protocol="udp" drop' >/dev/null 2>&1
-            firewall-cmd --permanent --remove-rich-rule='rule family="ipv6" port port="443" protocol="udp" drop' >/dev/null 2>&1
-        fi
-        firewall-cmd --reload >/dev/null 2>&1
+        printf %s "firewalld"
+    elif have_cmd iptables || have_cmd ip6tables; then
+        printf %s "iptables"
+    elif have_cmd nft; then
+        printf %s "nftables"
     else
-        if [[ "$action" == "block" ]]; then
-            iptables -I INPUT -p udp --dport 443 -j DROP 2>/dev/null
-            iptables -I OUTPUT -p udp --dport 443 -j DROP 2>/dev/null
-            ip6tables -I INPUT -p udp --dport 443 -j DROP 2>/dev/null
-            ip6tables -I OUTPUT -p udp --dport 443 -j DROP 2>/dev/null
-            have_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
-        else
-            while iptables -D INPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
-            while iptables -D OUTPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
-            while ip6tables -D INPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
-            while ip6tables -D OUTPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
-            have_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
-        fi
+        printf %s "none"
     fi
+}
 
+quic_apply_backend() {
+    local backend="$1" action="$2"
+    case "$backend" in
+        ufw)
+            if [[ "$action" == "block" ]]; then
+                ufw deny in 443/udp >/dev/null 2>&1
+                ufw deny out 443/udp >/dev/null 2>&1
+            else
+                ufw delete deny in 443/udp >/dev/null 2>&1
+                ufw delete deny out 443/udp >/dev/null 2>&1
+            fi
+            ufw reload >/dev/null 2>&1
+            ;;
+        firewalld)
+            if [[ "$action" == "block" ]]; then
+                firewall-cmd --permanent --add-rich-rule='rule family="ipv4" port port="443" protocol="udp" drop' >/dev/null 2>&1
+                firewall-cmd --permanent --add-rich-rule='rule family="ipv6" port port="443" protocol="udp" drop' >/dev/null 2>&1
+            else
+                firewall-cmd --permanent --remove-rich-rule='rule family="ipv4" port port="443" protocol="udp" drop' >/dev/null 2>&1
+                firewall-cmd --permanent --remove-rich-rule='rule family="ipv6" port port="443" protocol="udp" drop' >/dev/null 2>&1
+            fi
+            firewall-cmd --reload >/dev/null 2>&1
+            ;;
+        iptables)
+            if [[ "$action" == "block" ]]; then
+                have_cmd iptables && iptables -I INPUT -p udp --dport 443 -j DROP 2>/dev/null || true
+                have_cmd iptables && iptables -I OUTPUT -p udp --dport 443 -j DROP 2>/dev/null || true
+                have_cmd ip6tables && ip6tables -I INPUT -p udp --dport 443 -j DROP 2>/dev/null || true
+                have_cmd ip6tables && ip6tables -I OUTPUT -p udp --dport 443 -j DROP 2>/dev/null || true
+                have_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+            else
+                if have_cmd iptables; then
+                    while iptables -D INPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
+                    while iptables -D OUTPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
+                fi
+                if have_cmd ip6tables; then
+                    while ip6tables -D INPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
+                    while ip6tables -D OUTPUT -p udp --dport 443 -j DROP 2>/dev/null; do :; done
+                fi
+                have_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+            fi
+            ;;
+        nftables)
+            if [[ "$action" == "block" ]]; then
+                nft list table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 && nft delete table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 || true
+                nft add table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 || return 1
+                nft 'add chain inet '"$QUIC_NFT_TABLE"' input { type filter hook input priority 0; policy accept; }' >/dev/null 2>&1 || return 1
+                nft 'add chain inet '"$QUIC_NFT_TABLE"' output { type filter hook output priority 0; policy accept; }' >/dev/null 2>&1 || return 1
+                nft add rule inet "$QUIC_NFT_TABLE" input udp dport 443 drop comment "$QUIC_RULE_COMMENT" >/dev/null 2>&1 || return 1
+                nft add rule inet "$QUIC_NFT_TABLE" output udp dport 443 drop comment "$QUIC_RULE_COMMENT" >/dev/null 2>&1 || return 1
+            else
+                nft list table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 && nft delete table inet "$QUIC_NFT_TABLE" >/dev/null 2>&1 || true
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+quic_unblock_all_backends() {
+    quic_apply_backend "ufw" "unblock" || true
+    quic_apply_backend "firewalld" "unblock" || true
+    quic_apply_backend "iptables" "unblock" || true
+    quic_apply_backend "nftables" "unblock" || true
+}
+
+manage_quic_udp443() {
+    local action="$1" backend actual
     if [[ "$action" == "block" ]]; then
-        echo -e "${GREEN}✅ 已成功阻断 UDP 443 端口 (QUIC 已关闭)。${RESET}"
+        backend=$(select_quic_backend)
+        if [[ "$backend" == "none" ]]; then
+            echo -e "${RED}❌ 未找到可用防火墙后端（ufw / firewalld / iptables / nftables）。${RESET}"
+            sleep 2
+            return 1
+        fi
+        quic_apply_backend "$backend" "block" || true
+        actual=$(quic_detect_block_backend)
+        if [[ "$actual" == "none" ]]; then
+            echo -e "${RED}❌ UDP 443 阻断未生效：后端 ${backend} 未成功写入规则。${RESET}"
+            sleep 2
+            return 1
+        fi
+        quic_meta_set MANAGED 1
+        quic_meta_set BACKEND "$actual"
+        quic_meta_set LAST_ACTION block
+        echo -e "${GREEN}✅ 已成功阻断 UDP 443 端口 (QUIC 已关闭) / 后端: ${actual}${RESET}"
     else
+        backend=$(get_quic_backend)
+        quic_unblock_all_backends
+        actual=$(quic_detect_block_backend)
+        if [[ "$actual" != "none" ]]; then
+            echo -e "${RED}❌ UDP 443 放行未完全生效：当前仍检测到阻断后端 ${actual}。${RESET}"
+            sleep 2
+            return 1
+        fi
+        case "$backend" in
+            ufw|firewalld|iptables|nftables) quic_meta_set MANAGED 1; quic_meta_set BACKEND "$backend" ;;
+            *) quic_meta_set MANAGED 0; quic_meta_set BACKEND none ;;
+        esac
+        quic_meta_set LAST_ACTION unblock
         echo -e "${GREEN}✅ 已成功放行 UDP 443 端口 (QUIC 已开启)。${RESET}"
     fi
     sleep 2
@@ -4660,6 +4774,8 @@ quic_menu() {
     done
 }
 
+# =======================================================
+# 系统菜单
 # =======================================================
 # 系统菜单
 sys_menu() {
