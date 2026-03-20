@@ -113,6 +113,60 @@ msg_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
 msg_err()  { echo -e "${RED}$*${PLAIN}"; }
 msg_info() { echo -e "${CYAN}$*${PLAIN}"; }
 
+service_execstart_cmd() {
+    local name="$1" line=""
+    have_cmd systemctl || return 1
+    line=$(systemctl cat "${name}.service" 2>/dev/null | awk -F= '/^[[:space:]]*ExecStart=/{print substr($0, index($0, "=")+1); exit}')
+    [[ -n "$line" ]] || return 1
+    printf '%s' "$line"
+}
+
+service_execstart_config_path() {
+    local name="$1" cmd path
+    cmd=$(service_execstart_cmd "$name" 2>/dev/null || true)
+    [[ -n "$cmd" ]] || return 1
+    path=$(printf '%s\n' "$cmd" | sed -n 's/.*[[:space:]]-c[[:space:]]\([^[:space:]]\+\).*/\1/p' | head -n1)
+    [[ -n "$path" ]] || return 1
+    path="${path#\"}"
+    path="${path%\"}"
+    path="${path#\'}"
+    path="${path%\'}"
+    [[ -n "$path" ]] || return 1
+    printf '%s' "$path"
+}
+
+resolve_managed_config_path() {
+    local name="$1" cfg="" cand
+    cfg=$(service_execstart_config_path "$name" 2>/dev/null || true)
+    if [[ -n "$cfg" && -f "$cfg" ]]; then
+        printf '%s' "$cfg"
+        return 0
+    fi
+    case "$name" in
+        ss-rust)
+            for cand in /etc/ss-rust/config.json /usr/local/etc/ss-rust/config.json /etc/shadowsocks-rust/config.json; do
+                [[ -f "$cand" ]] && { printf '%s' "$cand"; return 0; }
+            done
+            ;;
+        ss-v2ray)
+            for cand in /etc/ss-v2ray/config.json /usr/local/etc/ss-v2ray/config.json /etc/shadowsocks-v2ray/config.json; do
+                [[ -f "$cand" ]] && { printf '%s' "$cand"; return 0; }
+            done
+            ;;
+        xray)
+            for cand in /usr/local/etc/xray/config.json /etc/xray/config.json /usr/local/share/xray/config.json; do
+                [[ -f "$cand" ]] && { printf '%s' "$cand"; return 0; }
+            done
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    cfg=$(service_execstart_config_path "$name" 2>/dev/null || true)
+    [[ -n "$cfg" ]] || return 1
+    printf '%s' "$cfg"
+}
+
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         msg_err "错误: 必须使用 root 权限运行！"
@@ -3058,10 +3112,23 @@ remove_firewall_rule() {
 }
 
 managed_service_exec() {
-    case "$1" in
-        ss-rust) printf %s "/usr/local/bin/ss-rust -c /etc/ss-rust/config.json" ;;
-        ss-v2ray) printf %s "/usr/local/bin/ss-rust -c /etc/ss-v2ray/config.json" ;;
-        xray) printf %s "/usr/local/bin/xray run -c /usr/local/etc/xray/config.json" ;;
+    local name="$1" cfg exec_cmd
+    exec_cmd=$(service_execstart_cmd "$name" 2>/dev/null || true)
+    [[ -n "$exec_cmd" ]] && { printf '%s' "$exec_cmd"; return 0; }
+    cfg=$(resolve_managed_config_path "$name" 2>/dev/null || true)
+    case "$name" in
+        ss-rust)
+            [[ -n "$cfg" ]] || cfg="/etc/ss-rust/config.json"
+            printf '%s' "/usr/local/bin/ss-rust -c $cfg"
+            ;;
+        ss-v2ray)
+            [[ -n "$cfg" ]] || cfg="$SS_V2RAY_CONF"
+            printf '%s' "/usr/local/bin/ss-rust -c $cfg"
+            ;;
+        xray)
+            [[ -n "$cfg" ]] || cfg="/usr/local/etc/xray/config.json"
+            printf '%s' "/usr/local/bin/xray run -c $cfg"
+            ;;
         *) return 1 ;;
     esac
 }
@@ -3115,7 +3182,13 @@ managed_service_label() {
 }
 
 managed_service_config_path() {
-    case "$1" in
+    local name="$1" cfg
+    cfg=$(resolve_managed_config_path "$name" 2>/dev/null || true)
+    if [[ -n "$cfg" ]]; then
+        printf '%s' "$cfg"
+        return 0
+    fi
+    case "$name" in
         ss-rust) printf %s "/etc/ss-rust/config.json" ;;
         ss-v2ray) printf %s "$SS_V2RAY_CONF" ;;
         xray) printf %s "/usr/local/etc/xray/config.json" ;;
@@ -4209,7 +4282,13 @@ ensure_jq_available() {
 }
 
 xray_protocol_config_path() {
-    printf %s "/usr/local/etc/xray/config.json"
+    local cfg
+    cfg=$(resolve_managed_config_path xray 2>/dev/null || true)
+    if [[ -n "$cfg" ]]; then
+        printf '%s' "$cfg"
+    else
+        printf %s "/usr/local/etc/xray/config.json"
+    fi
 }
 
 xray_protocol_exists() {
@@ -8934,6 +9013,9 @@ status_page_loop() {
         status_service_brief_line "xray" "Xray (VLESS / Shadowsocks-2022)"
         echo -e "  ${CYAN}Xray 版本${RESET}: ${YELLOW}${xr_ver}${RESET}"
         echo -e "  ${CYAN}协议状态${RESET}: VLESS=$(xray_protocol_exists "vless" && echo 已启用 || echo 未启用) / SS2022=$(xray_protocol_exists "shadowsocks" && echo 已启用 || echo 未启用)"
+        local xcfg_show
+        xcfg_show=$(xray_protocol_config_path 2>/dev/null || true)
+        [[ -n "$xcfg_show" ]] && echo -e "  ${CYAN}配置路径${RESET}: ${YELLOW}${xcfg_show}${RESET}"
         echo -e ""
         echo -e "${GREEN}端口转发 / Nginx${RESET}"
         if [[ "$nft_rules" =~ ^[0-9]+$ && "$nft_rules" -gt 0 ]]; then
