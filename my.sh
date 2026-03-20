@@ -1134,6 +1134,234 @@ normalize_ssh_root_login_mode() {
     esac
 }
 
+uri_encode() {
+    local raw="$1"
+    if have_cmd python3; then
+        python3 - "$raw" <<'PYURL'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=''))
+PYURL
+        return 0
+    fi
+    local out="" i ch hex
+    for ((i=0; i<${#raw}; i++)); do
+        ch="${raw:i:1}"
+        case "$ch" in
+            [a-zA-Z0-9.~_-]) out+="$ch" ;;
+            *) printf -v hex '%%%02X' "'${ch}"; out+="$hex" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+ss_make_userinfo() {
+    local method="$1" password="$2"
+    [[ -n "$method" && -n "$password" ]] || return 1
+    if [[ "$method" == 2022-* ]]; then
+        printf '%s:%s' "$(uri_encode "$method")" "$(uri_encode "$password")"
+    else
+        printf '%s' "${method}:${password}" | base64_nw
+    fi
+}
+
+ss_build_link() {
+    local method="$1" password="$2" host="$3" port="$4" tag="$5"
+    local userinfo=""
+    [[ -n "$host" && -n "$port" ]] || return 1
+    userinfo=$(ss_make_userinfo "$method" "$password" 2>/dev/null) || return 1
+    [[ -n "$userinfo" ]] || return 1
+    printf 'ss://%s@%s:%s#%s' "$userinfo" "$host" "$port" "$tag"
+}
+
+
+history_source_files() {
+    local f
+    [[ -f /root/.bash_history ]] && printf '%s\n' /root/.bash_history
+    for f in /home/*/.bash_history; do
+        [[ -f "$f" ]] && printf '%s\n' "$f"
+    done
+}
+
+history_extract_uris() {
+    local proto="$1" f
+    while IFS= read -r f; do
+        grep -aEo "${proto}://[^[:space:]\"'<>]+" "$f" 2>/dev/null || true
+    done < <(history_source_files)
+}
+
+history_iter_uris_latest() {
+    local proto="$1"
+    if have_cmd tac; then
+        history_extract_uris "$proto" | tail -n 200 | tac
+    else
+        history_extract_uris "$proto" | tail -n 200 | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'
+    fi
+}
+
+parse_ss_uri() {
+    local uri="$1"
+    [[ "$uri" == ss://* ]] || return 1
+    have_cmd python3 || return 1
+    python3 - "$uri" <<'PYSS'
+import base64
+import sys
+import urllib.parse
+
+uri = sys.argv[1].strip().strip("\"'")
+if not uri.startswith("ss://"):
+    raise SystemExit(1)
+rest = uri[5:]
+rest = rest.split('#', 1)[0]
+rest = rest.split('/?', 1)[0]
+if '@' not in rest:
+    raise SystemExit(1)
+userinfo, hostport = rest.rsplit('@', 1)
+userinfo = userinfo.strip()
+if not userinfo:
+    raise SystemExit(1)
+if hostport.startswith('['):
+    if ']:' not in hostport:
+        raise SystemExit(1)
+    host, port = hostport[1:].split(']:', 1)
+else:
+    if ':' not in hostport:
+        raise SystemExit(1)
+    host, port = hostport.rsplit(':', 1)
+port = port.strip()
+if not port.isdigit():
+    raise SystemExit(1)
+if ':' in userinfo:
+    method, password = userinfo.split(':', 1)
+    method = urllib.parse.unquote(method)
+    password = urllib.parse.unquote(password)
+else:
+    data = userinfo.encode()
+    padding = b'=' * (-len(data) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(data + padding).decode()
+    except Exception:
+        raise SystemExit(1)
+    if ':' not in decoded:
+        raise SystemExit(1)
+    method, password = decoded.split(':', 1)
+print('|'.join([method, password, host.strip(), port, 'history']))
+PYSS
+}
+
+parse_vless_uri() {
+    local uri="$1"
+    [[ "$uri" == vless://* ]] || return 1
+    have_cmd python3 || return 1
+    python3 - "$uri" <<'PYVL'
+import sys
+import urllib.parse
+
+uri = sys.argv[1].strip().strip("\"'")
+if not uri.startswith("vless://"):
+    raise SystemExit(1)
+p = urllib.parse.urlparse(uri)
+if not p.username or not p.hostname or p.port is None:
+    raise SystemExit(1)
+qs = urllib.parse.parse_qs(p.query)
+sni = qs.get('sni', [''])[0]
+pbk = qs.get('pbk', [''])[0]
+sid = qs.get('sid', [''])[0]
+frag = urllib.parse.unquote(p.fragment or '')
+print('|'.join([p.username, p.hostname, str(p.port), sni, pbk, sid, frag or 'history']))
+PYVL
+}
+
+history_recover_ss_record() {
+    local prefer_port="${1:-}" uri rec="" best=""
+    while IFS= read -r uri; do
+        rec=$(parse_ss_uri "$uri" 2>/dev/null || true)
+        [[ -n "$rec" ]] || continue
+        IFS='|' read -r _m _p _h _pt _tag <<<"$rec"
+        if [[ -n "$prefer_port" && "$prefer_port" == "$_pt" ]]; then
+            printf '%s' "$rec"
+            return 0
+        fi
+        [[ -z "$best" ]] && best="$rec"
+    done < <(history_iter_uris_latest ss)
+    [[ -n "$best" ]] || return 1
+    printf '%s' "$best"
+}
+
+history_recover_vless_record() {
+    local prefer_port="${1:-}" uri rec="" best=""
+    while IFS= read -r uri; do
+        rec=$(parse_vless_uri "$uri" 2>/dev/null || true)
+        [[ -n "$rec" ]] || continue
+        IFS='|' read -r _uuid _host _port _sni _pbk _sid _tag <<<"$rec"
+        if [[ -n "$prefer_port" && "$prefer_port" == "$_port" ]]; then
+            printf '%s' "$rec"
+            return 0
+        fi
+        [[ -z "$best" ]] && best="$rec"
+    done < <(history_iter_uris_latest vless)
+    [[ -n "$best" ]] || return 1
+    printf '%s' "$best"
+}
+
+history_has_ss_record() {
+    history_recover_ss_record >/dev/null 2>&1
+}
+
+history_has_vless_record() {
+    history_recover_vless_record >/dev/null 2>&1
+}
+
+history_rebuild_ss_config_and_service() {
+    ensure_jq_available || return 1
+    local rec method password host port _tag cfg vless_inbound ss_inbound test_output=""
+    rec="${1:-}"
+    [[ -n "$rec" ]] || rec=$(history_recover_ss_record 2>/dev/null || true)
+    [[ -n "$rec" ]] || { echo -e "${RED}❌ 未从历史记录中找到可恢复的 SS2022 参数。${RESET}"; return 1; }
+    IFS='|' read -r method password host port _tag <<<"$rec"
+    [[ -n "$method" && -n "$password" && "$port" =~ ^[0-9]+$ ]] || {
+        echo -e "${RED}❌ 历史记录中的 SS2022 参数不完整，无法重建。${RESET}"
+        return 1
+    }
+    ensure_xray_core_ready || return 1
+    cleanup_legacy_ss_backends silent >/dev/null 2>&1 || true
+    cfg=$(xray_protocol_config_path)
+    mkdir -p "$(dirname "$cfg")"
+    vless_inbound=$(xray_protocol_get_inbound "vless" || true)
+    ss_inbound=$(build_ss_inbound "$port" "$password" "$method") || return 1
+    write_xray_protocol_config "$vless_inbound" "$ss_inbound" || return 1
+    if ! test_output=$(/usr/local/bin/xray run -test -c "$cfg" 2>&1); then
+        echo -e "${RED}❌ 使用历史参数重建后的 Xray 配置自检失败。${RESET}"
+        [[ -n "$test_output" ]] && printf '%s
+' "$test_output"
+        return 1
+    fi
+    if ! restart_xray_protocol_service; then
+        echo -e "${RED}❌ Xray 启动失败。${RESET}"
+        if service_use_systemd; then
+            journalctl -u xray -n 30 --no-pager 2>/dev/null || true
+        elif [[ -f /var/log/xray.log ]]; then
+            tail -n 30 /var/log/xray.log 2>/dev/null || true
+        fi
+        return 1
+    fi
+    named_service_add_firewall "xray" "$port" >/dev/null 2>&1 || true
+    add_firewall_rule "$port" udp >/dev/null 2>&1 || true
+    echo -e "${GREEN}✅ 已根据历史记录一键重建 SS2022(Xray) 配置与 systemd 服务。${RESET}"
+    echo -e "来源: ${YELLOW}${host:-历史记录}${RESET} / 端口 ${GREEN}${port}${RESET} / 加密 ${GREEN}${method}${RESET}"
+    view_all_info
+    return 0
+}
+
+history_rebuild_vless_config_and_service() {
+    local rec
+    rec="${1:-}"
+    [[ -n "$rec" ]] || rec=$(history_recover_vless_record 2>/dev/null || true)
+    [[ -n "$rec" ]] || { echo -e "${RED}❌ 未从历史记录中找到可恢复的 VLESS 参数。${RESET}"; return 1; }
+    echo -e "${YELLOW}⚠ 当前只能从历史链接恢复 VLESS 的公开参数（UUID/SNI/PublicKey/ShortId），无法反推出服务端私钥。${RESET}"
+    echo -e "${YELLOW}⚠ 因此不能保证一键重建出与旧客户端完全一致的 Reality 服务。请提供旧配置或 privateKey。${RESET}"
+    return 1
+}
+
 ssr_extract_first_ip() {
     local raw="$1" token=""
     token=$(printf '%s\n' "$raw" | tr -d '\r' | awk '{for(i=1;i<=NF;i++) print $i}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | head -n1)
@@ -1237,31 +1465,56 @@ ssr_fetch_node_address() {
 }
 
 ssr_make_ss_link() {
-    local ip port method password userinfo
+    local ip port method password rec r_method r_password r_host r_port _tag
     ip="${1:-$(ssr_fetch_node_address)}"
     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
     method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
     password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
+    if [[ -z "$port" || -z "$method" || -z "$password" ]]; then
+        rec=$(history_recover_ss_record "$port" 2>/dev/null || true)
+        if [[ -n "$rec" ]]; then
+            IFS='|' read -r r_method r_password r_host r_port _tag <<<"$rec"
+            [[ -z "$port" ]] && port="$r_port"
+            [[ -z "$method" ]] && method="$r_method"
+            [[ -z "$password" ]] && password="$r_password"
+            if [[ -z "$ip" || "$ip" == "0.0.0.0" ]]; then
+                ip="$r_host"
+            fi
+        fi
+    fi
     [[ -n "$ip" && -n "$port" && -n "$method" && -n "$password" ]] || return 1
-    userinfo=$(ss_make_userinfo "$method" "$password")
-    printf 'ss://%s@%s:%s#Shadowsocks-Legacy' "$userinfo" "$ip" "$port"
+    ss_build_link "$method" "$password" "$ip" "$port" 'Shadowsocks-Legacy'
 }
 
 show_ss_rust_summary() {
-    local ip port method password link
+    local ip port method password link rec r_method r_password r_host r_port _tag source_note=""
     ip=$(ssr_fetch_node_address)
     port=$(json_get_path /etc/ss-rust/config.json server_port 2>/dev/null)
     method=$(json_get_path /etc/ss-rust/config.json method 2>/dev/null)
     password=$(json_get_path /etc/ss-rust/config.json password 2>/dev/null)
-    link=$(ssr_make_ss_link "$ip" 2>/dev/null || true)
+    if [[ -z "$port" || -z "$method" || -z "$password" ]]; then
+        rec=$(history_recover_ss_record "$port" 2>/dev/null || true)
+        if [[ -n "$rec" ]]; then
+            IFS='|' read -r r_method r_password r_host r_port _tag <<<"$rec"
+            [[ -z "$port" ]] && port="$r_port"
+            [[ -z "$method" ]] && method="$r_method"
+            [[ -z "$password" ]] && password="$r_password"
+            if [[ -z "$ip" || "$ip" == "0.0.0.0" ]]; then
+                ip="$r_host"
+            fi
+            source_note="历史记录恢复"
+        fi
+    fi
+    link=$(ss_build_link "$method" "$password" "$ip" "$port" 'Shadowsocks-Legacy' 2>/dev/null || true)
     if is_ipv4 "$ip" || is_ipv6 "$ip"; then
         echo -e "IP: ${GREEN}${ip}${RESET}"
     else
-        echo -e "地址: ${GREEN}${ip}${RESET}"
+        echo -e "地址: ${GREEN}${ip:-未读取}${RESET}"
     fi
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
     echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
+    [[ -n "$source_note" ]] && echo -e "来源: ${YELLOW}${source_note}${RESET}"
     [[ -n "$link" ]] && echo -e "${YELLOW}链接:${RESET}
 ${link}"
 }
@@ -1430,7 +1683,8 @@ ss_v2ray_make_link() {
     host=$(plugin_state_get "$SS_V2RAY_STATE" HOST 2>/dev/null || true)
     path=$(plugin_state_get "$SS_V2RAY_STATE" PATH 2>/dev/null || true)
     [[ -n "$ip" && -n "$port" && -n "$method" && -n "$password" && -n "$host" && -n "$path" ]] || return 1
-    userinfo=$(ss_make_userinfo "$method" "$password")
+    userinfo=$(ss_make_userinfo "$method" "$password" 2>/dev/null) || return 1
+    [[ -n "$userinfo" ]] || return 1
     plugin_raw="v2ray-plugin;mode=websocket;host=${host};path=${path}"
     plugin_enc=$(uri_encode "$plugin_raw")
     printf 'ss://%s@%s:%s/?plugin=%s#SS2022-v2ray-plugin' "$userinfo" "$ip" "$port" "$plugin_enc"
@@ -1439,36 +1693,57 @@ ss_v2ray_make_link() {
 
 show_ss_v2ray_summary() {
     ensure_jq_available || return 1
-    local ip ss_inbound port method password userinfo link
+    local ip ss_inbound port method password link rec r_method r_password r_host r_port _tag source_note=""
     ss_inbound=$(xray_protocol_get_inbound "shadowsocks" || true)
-    [[ -n "$ss_inbound" ]] || { echo -e "${RED}❌ 未检测到 Shadowsocks-2022 (Xray) 配置。${RESET}"; return 1; }
     ip=$(ssr_fetch_node_address)
-    port=$(printf '%s' "$ss_inbound" | jq -r '.port')
-    method=$(printf '%s' "$ss_inbound" | jq -r '.settings.method')
-    password=$(printf '%s' "$ss_inbound" | jq -r '.settings.password')
-    userinfo=$(ss_make_userinfo "$method" "$password")
-    link="ss://${userinfo}@${ip}:${port}#SS2022-Xray"
+    if [[ -n "$ss_inbound" ]]; then
+        port=$(printf '%s' "$ss_inbound" | jq -r '.port')
+        method=$(printf '%s' "$ss_inbound" | jq -r '.settings.method')
+        password=$(printf '%s' "$ss_inbound" | jq -r '.settings.password')
+    fi
+    if [[ -z "$port" || -z "$method" || -z "$password" ]]; then
+        rec=$(history_recover_ss_record "$port" 2>/dev/null || true)
+        if [[ -n "$rec" ]]; then
+            IFS='|' read -r r_method r_password r_host r_port _tag <<<"$rec"
+            [[ -z "$port" ]] && port="$r_port"
+            [[ -z "$method" ]] && method="$r_method"
+            [[ -z "$password" ]] && password="$r_password"
+            if [[ -z "$ip" || "$ip" == "0.0.0.0" ]]; then
+                ip="$r_host"
+            fi
+            source_note="历史记录恢复"
+        fi
+    fi
+    [[ -n "$port" || -n "$method" || -n "$password" ]] || { echo -e "${RED}❌ 未检测到 Shadowsocks-2022 (Xray) 配置，也未从历史记录恢复到参数。${RESET}"; return 1; }
+    link=$(ss_build_link "$method" "$password" "$ip" "$port" 'SS2022-Xray' 2>/dev/null || true)
     if is_ipv4 "$ip" || is_ipv6 "$ip"; then
         echo -e "IP: ${GREEN}${ip}${RESET}"
     else
-        echo -e "地址: ${GREEN}${ip}${RESET}"
+        echo -e "地址: ${GREEN}${ip:-未读取}${RESET}"
     fi
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "协议: ${GREEN}${method:-未读取}${RESET}"
     echo -e "密码: ${GREEN}${password:-未读取}${RESET}"
-    echo -e "${YELLOW}链接:${RESET}
+    [[ -n "$source_note" ]] && echo -e "来源: ${YELLOW}${source_note}${RESET}"
+    if [[ -n "$link" ]]; then
+        echo -e "${YELLOW}链接:${RESET}
 ${link}"
+    else
+        echo -e "${RED}❌ 链接生成失败：未能从配置或历史记录中提取完整的加密方式/密钥。${RESET}"
+    fi
 }
 
 
 show_vless_summary() {
-    local ip port uuid sni priv pub sid link front_mode public_port fallback_backend
+    local ip port uuid sni priv pub sid link front_mode public_port fallback_backend rec r_uuid r_host r_port r_sni r_pbk r_sid _tag source_note="" cfg
     ip=$(ssr_fetch_node_address)
-    port=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.port 2>/dev/null)
-    uuid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.settings.clients.0.id 2>/dev/null)
-    sni=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.serverNames.0 2>/dev/null)
-    priv=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.privateKey 2>/dev/null)
-    sid=$(json_get_path /usr/local/etc/xray/config.json inbounds.0.streamSettings.realitySettings.shortIds.0 2>/dev/null)
+    cfg=$(xray_protocol_config_path 2>/dev/null || true)
+    [[ -n "$cfg" && -f "$cfg" ]] || cfg="/usr/local/etc/xray/config.json"
+    port=$(json_get_path "$cfg" inbounds.0.port 2>/dev/null)
+    uuid=$(json_get_path "$cfg" inbounds.0.settings.clients.0.id 2>/dev/null)
+    sni=$(json_get_path "$cfg" inbounds.0.streamSettings.realitySettings.serverNames.0 2>/dev/null)
+    priv=$(json_get_path "$cfg" inbounds.0.streamSettings.realitySettings.privateKey 2>/dev/null)
+    sid=$(json_get_path "$cfg" inbounds.0.streamSettings.realitySettings.shortIds.0 2>/dev/null)
     front_mode=$(meta_get "VLESS_FRONT_MODE" 2>/dev/null || true)
     public_port=$(meta_get "VLESS_PUBLIC_PORT" 2>/dev/null || true)
     fallback_backend=$(meta_get "VLESS_FALLBACK_BACKEND" 2>/dev/null || true)
@@ -1478,14 +1753,30 @@ show_vless_summary() {
     if [[ -n "$priv" && -x /usr/local/bin/xray ]]; then
         pub=$(xray_extract_reality_public_key "$(/usr/local/bin/xray x25519 -i "$priv" 2>/dev/null || true)")
     fi
+    if [[ -z "$port" || -z "$uuid" || -z "$sni" || -z "$sid" || -z "$pub" ]]; then
+        rec=$(history_recover_vless_record "$port" 2>/dev/null || true)
+        if [[ -n "$rec" ]]; then
+            IFS='|' read -r r_uuid r_host r_port r_sni r_pbk r_sid _tag <<<"$rec"
+            [[ -z "$port" ]] && port="$r_port"
+            [[ -z "$uuid" ]] && uuid="$r_uuid"
+            [[ -z "$sni" ]] && sni="$r_sni"
+            [[ -z "$sid" ]] && sid="$r_sid"
+            [[ -z "$pub" ]] && pub="$r_pbk"
+            if [[ -z "$ip" || "$ip" == "0.0.0.0" ]]; then
+                ip="$r_host"
+            fi
+            source_note="历史记录恢复"
+        fi
+    fi
     if is_ipv4 "$ip" || is_ipv6 "$ip"; then
         echo -e "IP: ${GREEN}${ip}${RESET}"
     else
-        echo -e "地址: ${GREEN}${ip}${RESET}"
+        echo -e "地址: ${GREEN}${ip:-未读取}${RESET}"
     fi
     echo -e "端口: ${GREEN}${port:-未读取}${RESET}"
     echo -e "UUID: ${GREEN}${uuid:-未读取}${RESET}"
     echo -e "SNI: ${GREEN}${sni:-未读取}${RESET}"
+    [[ -n "$source_note" ]] && echo -e "来源: ${YELLOW}${source_note}${RESET}"
     if [[ "$front_mode" == "nginx-stream" ]]; then
         echo -e "前置过滤: ${GREEN}Nginx stream / ssl_preread${RESET}"
         echo -e "回落后端: ${GREEN}${fallback_backend:-127.0.0.1:8443}${RESET}"
@@ -4458,17 +4749,15 @@ build_vless_inbound() {
 }
 
 build_ss_inbound() {
-    local port="$1" password="$2"
-    jq -cn \
-        --argjson port "$port" \
-        --arg password "$password" \
-        '{
+    local port="$1" password="$2" method="${3:-2022-blake3-aes-128-gcm}"
+    jq -cn         --argjson port "$port"         --arg password "$password"         --arg method "$method"         '{
           "listen": "0.0.0.0",
           "port": $port,
           "protocol": "shadowsocks",
           "settings": {
-            "method": "2022-blake3-aes-128-gcm",
-            "password": $password
+            "method": $method,
+            "password": $password,
+            "network": "tcp,udp"
           }
         }'
 }
@@ -4611,7 +4900,27 @@ view_all_info() {
     ensure_jq_available || return 1
     local cfg ip host links=()
     cfg=$(xray_protocol_config_path)
-    [[ -f "$cfg" ]] || { echo -e "${RED}❌ 未找到 Xray 配置。${RESET}"; return 1; }
+    if [[ ! -f "$cfg" ]]; then
+        local any=0
+        clear 2>/dev/null || true
+        echo -e "${CYAN}========= Xray 节点订阅信息 =========${RESET}"
+        if history_has_vless_record; then
+            show_vless_summary
+            echo
+            any=1
+        fi
+        if history_has_ss_record; then
+            show_ss_v2ray_summary
+            echo
+            any=1
+        fi
+        if [[ $any -eq 0 ]]; then
+            echo -e "${RED}❌ 未找到 Xray 配置，也未从历史记录中恢复到节点参数。${RESET}"
+            return 1
+        fi
+        echo -e "${YELLOW}当前展示的是历史恢复结果；如需恢复服务，请进入 Xray 节点中心执行一键重建。${RESET}"
+        return 0
+    fi
 
     ip=$(ssr_fetch_node_address)
     host=$(hostname)
@@ -4647,12 +4956,11 @@ view_all_info() {
     fi
 
     if [[ -n "$ss_inbound" ]]; then
-        local port method password userinfo link
+        local port method password link
         port=$(printf '%s' "$ss_inbound" | jq -r '.port')
         method=$(printf '%s' "$ss_inbound" | jq -r '.settings.method')
         password=$(printf '%s' "$ss_inbound" | jq -r '.settings.password')
-        userinfo=$(ss_make_userinfo "$method" "$password")
-        link="ss://${userinfo}@${ip}:${port}#${host// /%20}-SS2022"
+        link=$(ss_build_link "$method" "$password" "$ip" "$port" "${host// /%20}-SS2022" 2>/dev/null || true)
         echo -e "${GREEN}[ Shadowsocks-2022 ]${RESET}"
         echo -e "地址: ${GREEN}${ip}${RESET}"
         echo -e "端口: ${GREEN}${port}${RESET}"
@@ -4722,14 +5030,14 @@ run_install_vless() {
 
 run_install_ss() {
     ensure_jq_available || return 1
-    local port="$1" password="$2"
+    local port="$1" password="$2" method="${3:-2022-blake3-aes-128-gcm}"
     local vless_inbound ss_inbound
     ensure_xray_core_ready || return 1
     cleanup_legacy_ss_backends silent >/dev/null 2>&1 || true
 
     mkdir -p /usr/local/etc/xray
     vless_inbound=$(xray_protocol_get_inbound "vless" || true)
-    ss_inbound=$(build_ss_inbound "$port" "$password") || return 1
+    ss_inbound=$(build_ss_inbound "$port" "$password" "$method") || return 1
     write_xray_protocol_config "$vless_inbound" "$ss_inbound" || return 1
 
     local test_output=""
@@ -4895,12 +5203,13 @@ modify_vless_config() {
 
 modify_ss_config() {
     ensure_jq_available || return 1
-    local ss_inbound vless_inbound current_port current_password port password new_ss_inbound
+    local ss_inbound vless_inbound current_port current_password current_method port password new_ss_inbound
     ss_inbound=$(xray_protocol_get_inbound "shadowsocks" || true)
     [[ -n "$ss_inbound" ]] || { echo -e "${RED}❌ 未检测到 Shadowsocks-2022 配置。${RESET}"; return 1; }
 
     current_port=$(printf '%s' "$ss_inbound" | jq -r '.port')
     current_password=$(printf '%s' "$ss_inbound" | jq -r '.settings.password')
+    current_method=$(printf '%s' "$ss_inbound" | jq -r '.settings.method')
 
     while true; do
         read -rp "新端口 [当前 ${current_port}, 留空不改]: " port
@@ -4913,7 +5222,7 @@ modify_ss_config() {
     [[ -z "$password" ]] && password="$current_password"
 
     vless_inbound=$(xray_protocol_get_inbound "vless" || true)
-    new_ss_inbound=$(build_ss_inbound "$port" "$password") || return 1
+    new_ss_inbound=$(build_ss_inbound "$port" "$password" "$current_method") || return 1
     write_xray_protocol_config "$vless_inbound" "$new_ss_inbound" || return 1
     if ! /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1; then
         echo -e "${RED}❌ 修改后的 Xray 配置自检失败。${RESET}"
@@ -5003,6 +5312,8 @@ unified_node_manager() {
         local has_ss=0 has_vless=0
         xray_protocol_exists "shadowsocks" && has_ss=1
         xray_protocol_exists "vless" && has_vless=1
+        [[ $has_ss -eq 0 ]] && history_has_ss_record && has_ss=2 || true
+        [[ $has_vless -eq 0 ]] && history_has_vless_record && has_vless=2 || true
         echo -e "${CYAN}========= Xray 节点运维中心 =========${RESET}"
         echo -e "${YELLOW} 1)${RESET} Shadowsocks-2022 管理"
         echo -e "${YELLOW} 2)${RESET} VLESS Reality 管理"
@@ -5030,6 +5341,24 @@ unified_node_manager() {
                         fi
                         sleep 1
                     fi
+                elif [[ $has_ss -eq 2 ]]; then
+                    while true; do
+                        clear 2>/dev/null || true
+                        echo -e "${YELLOW}当前未检测到本机 SS2022 配置，以下信息来自历史记录恢复。${RESET}"
+                        echo -e "---------------------------------"
+                        echo -e "${YELLOW}1) 查看恢复到的链接信息${RESET} | ${GREEN}2) 一键重建本机配置与 systemd 服务${RESET} | 0) 返回"
+                        read -rp "输入操作: " op
+                        if [[ "$op" == "1" ]]; then
+                            show_ss_v2ray_summary
+                            read -n1 -rsp "按任意键返回..." _
+                        elif [[ "$op" == "2" ]]; then
+                            history_rebuild_ss_config_and_service
+                            read -n1 -rsp "按任意键返回..." _
+                            break
+                        elif [[ "$op" == "0" ]]; then
+                            break
+                        fi
+                    done
                 else
                     echo -e "${YELLOW}未检测到 Shadowsocks-2022 (Xray) 节点。${RESET}"
                     sleep 1
@@ -5062,6 +5391,23 @@ unified_node_manager() {
                         fi
                         sleep 1
                     fi
+                elif [[ $has_vless -eq 2 ]]; then
+                    while true; do
+                        clear 2>/dev/null || true
+                        echo -e "${YELLOW}当前未检测到本机 VLESS 配置，以下信息来自历史记录恢复。${RESET}"
+                        echo -e "---------------------------------"
+                        echo -e "${YELLOW}1) 查看恢复到的链接信息${RESET} | ${YELLOW}2) 尝试一键恢复${RESET} | 0) 返回"
+                        read -rp "输入操作: " op
+                        if [[ "$op" == "1" ]]; then
+                            show_vless_summary
+                            read -n1 -rsp "按任意键返回..." _
+                        elif [[ "$op" == "2" ]]; then
+                            history_rebuild_vless_config_and_service
+                            read -n1 -rsp "按任意键返回..." _
+                        elif [[ "$op" == "0" ]]; then
+                            break
+                        fi
+                    done
                 else
                     echo -e "${YELLOW}未检测到 VLESS Reality (Xray) 节点。${RESET}"
                     sleep 1
@@ -8170,7 +8516,7 @@ verify_update_file() {
     [[ "$size" =~ ^[0-9]+$ ]] || return 15
     (( size >= 15000 )) || return 16
 
-    head_sample=$(head -c 1024 "$f" 2>/dev/null | tr -d ' ')
+    head_sample=$(head -c 1024 "$f" 2>/dev/null | tr -d '\000')
     if printf '%s' "$head_sample" | grep -Eiq '<(html|!doctype html|head|body)|<title>|<meta '; then
         return 21
     fi
@@ -8873,8 +9219,25 @@ ssr_cli() {
                     ;;
             esac
             ;;
+        recover|recover-history)
+            case "${2:-ss}" in
+                ss|ss2022|shadowsocks)
+                    ( source "${SSR_MODULE_FILE}" || exit 1; history_rebuild_ss_config_and_service )
+                    ;;
+                vless)
+                    ( source "${SSR_MODULE_FILE}" || exit 1; history_rebuild_vless_config_and_service )
+                    ;;
+                all)
+                    ( source "${SSR_MODULE_FILE}" || exit 1; history_rebuild_ss_config_and_service )
+                    ;;
+                *)
+                    msg_err "用法: my ssr recover [ss|vless|all]"
+                    return 1
+                    ;;
+            esac
+            ;;
         *)
-            msg_err "用法: my ssr <daemon_check|ddns|regular [stable|extreme]|nat [stable|extreme]|dns ...>"
+            msg_err "用法: my ssr <daemon_check|ddns|regular [stable|extreme]|nat [stable|extreme]|dns ...|recover [ss|vless|all]>"
             return 1
             ;;
     esac
@@ -9059,7 +9422,10 @@ status_page_loop() {
         echo -e "${GREEN}代理节点${RESET}"
         status_service_brief_line "xray" "Xray (VLESS / Shadowsocks-2022)"
         echo -e "  ${CYAN}Xray 版本${RESET}: ${YELLOW}${xr_ver}${RESET}"
-        echo -e "  ${CYAN}协议状态${RESET}: VLESS=$(xray_protocol_exists "vless" && echo 已启用 || echo 未启用) / SS2022=$(xray_protocol_exists "shadowsocks" && echo 已启用 || echo 未启用)"
+        local vless_brief ss_brief
+        if xray_protocol_exists "vless"; then vless_brief="已启用"; elif history_has_vless_record; then vless_brief="历史可恢复"; else vless_brief="未启用"; fi
+        if xray_protocol_exists "shadowsocks"; then ss_brief="已启用"; elif history_has_ss_record; then ss_brief="历史可恢复"; else ss_brief="未启用"; fi
+        echo -e "  ${CYAN}协议状态${RESET}: VLESS=${vless_brief} / SS2022=${ss_brief}"
         local xcfg_show
         xcfg_show=$(xray_protocol_config_path 2>/dev/null || true)
         [[ -n "$xcfg_show" ]] && echo -e "  ${CYAN}配置路径${RESET}: ${YELLOW}${xcfg_show}${RESET}"
