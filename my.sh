@@ -8121,20 +8121,66 @@ download_to() {
     return 0
 }
 
+normalize_update_file() {
+    local f="$1" tmp=""
+    [[ -f "$f" ]] || return 1
+    tmp="$(mktemp /tmp/my.update.norm.XXXXXX)" || return 1
+    python3 - "$f" "$tmp" <<'PYNORM'
+import pathlib, sys
+src = pathlib.Path(sys.argv[1]).read_bytes()
+if src.startswith(b'ï»¿'):
+    src = src[3:]
+src = src.replace(b'
+', b'
+').replace(b'
+', b'
+')
+pathlib.Path(sys.argv[2]).write_bytes(src)
+PYNORM
+    [[ -s "$tmp" ]] || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+update_verify_message() {
+    case "$1" in
+        10) echo "文件为空或下载失败" ;;
+        11) echo "缺少 shebang" ;;
+        12) echo "缺少 CMD_NAME 标记" ;;
+        13) echo "缺少 MY_SCRIPT_ID 标记" ;;
+        14) echo "bash 语法检查失败" ;;
+        15) echo "无法读取文件大小" ;;
+        16) echo "文件体积异常偏小，疑似代理页或错误页" ;;
+        17) echo "缺少 github_update 函数" ;;
+        18) echo "缺少 main_menu 函数" ;;
+        19) echo "缺少 init 函数" ;;
+        20) echo "无法计算 sha256" ;;
+        21) echo "下载结果疑似 HTML 页面，不是脚本" ;;
+        *) echo "未知校验失败" ;;
+    esac
+}
+
 verify_update_file() {
-    local f="$1" size="" checksum=""
+    local f="$1" size="" checksum="" head_sample=""
 
     [[ -s "$f" ]] || return 10
+    normalize_update_file "$f" || return 10
+
     size=$(wc -c < "$f" 2>/dev/null | tr -d '[:space:]')
     [[ "$size" =~ ^[0-9]+$ ]] || return 15
-    (( size >= 50000 )) || return 16
+    (( size >= 15000 )) || return 16
+
+    head_sample=$(head -c 1024 "$f" 2>/dev/null | tr -d ' ')
+    if printf '%s' "$head_sample" | grep -Eiq '<(html|!doctype html|head|body)|<title>|<meta '; then
+        return 21
+    fi
 
     grep -q '^#!/bin/bash' "$f" || return 11
-    grep -q 'CMD_NAME="my"' "$f" || return 12
-    grep -q 'MY_SCRIPT_ID="my-manager"' "$f" || return 13
-    grep -q '^github_update()' "$f" || return 17
-    grep -q '^main_menu()' "$f" || return 18
-    grep -q '^init()' "$f" || return 19
+    grep -Eq '^[[:space:]]*CMD_NAME="my"' "$f" || return 12
+    grep -Eq '^[[:space:]]*MY_SCRIPT_ID="my-manager"' "$f" || return 13
+    grep -Eq '^[[:space:]]*github_update[[:space:]]*\(\)' "$f" || return 17
+    grep -Eq '^[[:space:]]*main_menu[[:space:]]*\(\)' "$f" || return 18
+    grep -Eq '^[[:space:]]*init[[:space:]]*\(\)' "$f" || return 19
 
     bash -n "$f" >/dev/null 2>&1 || return 14
 
@@ -8146,7 +8192,7 @@ verify_update_file() {
 github_update() {
     require_root
 
-    local tmp used rc dst bak="" new_sha="" old_sha=""
+    local tmp used rc dst bak="" new_sha="" old_sha="" reason=""
     tmp="$(mktemp /tmp/my.update.XXXXXX)" || {
         msg_err "更新失败：无法创建临时文件。"
         return 1
@@ -8168,8 +8214,9 @@ github_update() {
     verify_update_file "$tmp"
     rc=$?
     if (( rc != 0 )); then
+        reason=$(update_verify_message "$rc")
         rm -f "$tmp"
-        msg_err "更新失败：下载文件校验不通过（错误码 $rc），已终止替换。"
+        msg_err "更新失败：下载文件校验不通过（错误码 $rc：$reason），已终止替换。"
         return 1
     fi
 
