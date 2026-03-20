@@ -1156,21 +1156,34 @@ PYURL
 
 ss_make_userinfo() {
     local method="$1" password="$2"
+    local raw out
     [[ -n "$method" && -n "$password" ]] || return 1
-    if [[ "$method" == 2022-* ]]; then
-        printf '%s:%s' "$(uri_encode "$method")" "$(uri_encode "$password")"
-    else
-        printf '%s' "${method}:${password}" | base64_nw
+    raw="${method}:${password}"
+    if have_cmd python3; then
+        out=$(python3 - "$raw" <<'PYSSUSER'
+import base64, sys
+print(base64.urlsafe_b64encode(sys.argv[1].encode()).decode().rstrip('='))
+PYSSUSER
+)
+        [[ -n "$out" ]] && { printf '%s' "$out"; return 0; }
     fi
+    out=$(printf '%s' "$raw" | base64_nw | tr '+/' '-_' | tr -d '=')
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out"
 }
 
 ss_build_link() {
     local method="$1" password="$2" host="$3" port="$4" tag="$5"
-    local userinfo=""
-    [[ -n "$host" && -n "$port" ]] || return 1
-    userinfo=$(ss_make_userinfo "$method" "$password" 2>/dev/null) || return 1
+    local userinfo="" tag_enc=""
+    [[ -n "$method" && -n "$password" && -n "$host" && -n "$port" ]] || return 1
+    userinfo=$(ss_make_userinfo "$method" "$password" 2>/dev/null || true)
+    [[ -n "$userinfo" ]] || {
+        userinfo=$(printf '%s' "${method}:${password}" | base64_nw | tr '+/' '-_' | tr -d '=' 2>/dev/null || true)
+    }
     [[ -n "$userinfo" ]] || return 1
-    printf 'ss://%s@%s:%s#%s' "$userinfo" "$host" "$port" "$tag"
+    tag_enc=$(uri_encode "$tag" 2>/dev/null || true)
+    [[ -n "$tag_enc" ]] || tag_enc="$tag"
+    printf 'ss://%s@%s:%s#%s' "$userinfo" "$host" "$port" "$tag_enc"
 }
 
 
@@ -1729,7 +1742,7 @@ show_ss_v2ray_summary() {
         echo -e "${YELLOW}链接:${RESET}
 ${link}"
     else
-        echo -e "${RED}❌ 链接生成失败：未能从配置或历史记录中提取完整的加密方式/密钥。${RESET}"
+        echo -e "${RED}❌ 链接生成失败：userinfo 编码未成功，请更新脚本后重试。${RESET}"
     fi
 }
 
