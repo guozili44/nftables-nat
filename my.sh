@@ -2,7 +2,7 @@
 # 综合管理脚本：my
 # 快捷命令：my
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v1.3.5  (build 2026-03-19+ip-detect-fix)
+# 版本：v1.3.7  (build 2026-03-20+menu-lf-fix)
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 
 set -o pipefail
@@ -15,7 +15,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # --------------------------
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="1.3.6"
+MY_VERSION="1.3.7"
 
 MY_INSTALL_DIR="/usr/local/lib/my"
 MY_STATE_DIR="${MY_INSTALL_DIR}/state"
