@@ -55,6 +55,10 @@ msg_err()  { echo -e "${RED}$*${PLAIN}"; }
 msg_info() { echo -e "${CYAN}$*${PLAIN}"; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+service_use_systemd() {
+    have_cmd systemctl || return 1
+    [[ -d /run/systemd/system ]] || [[ "$(cat /proc/1/comm 2>/dev/null)" == "systemd" ]]
+}
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -622,8 +626,7 @@ readonly XRAY_FALLBACK_TAG="v26.2.6"
 
 xray_normalize_tag() {
     local raw="$1" tag=""
-    tag=$(printf '%s' "$raw" | tr -d '
-[:space:]')
+    tag=$(printf '%s' "$raw" | tr -d '[:space:]')
     [[ -n "$tag" ]] || return 1
     [[ "$tag" =~ ^v[0-9]+(\.[0-9]+){1,3}([._-][A-Za-z0-9]+)?$ ]] || return 1
     printf '%s' "$tag"
@@ -2641,7 +2644,7 @@ smart_dns_apply() {
     echo -e "${CYAN}   备用 DNS: ${f1} ${f2}   模式: ${mode}   应用方式: ${actual_action}${RESET}"
 }
 
-render_sysctl_profile() { {
+render_sysctl_profile() {
     local target="$1" env="$2" mode="$(profile_alias "$3")" tier="${4:-medium}" cc qdisc
     local rmax wmax rmem wmem somax backlog filemax fin_timeout keepalive_time keepalive_intvl keepalive_probes
     cc="$(best_congestion_control)"
@@ -4300,14 +4303,11 @@ prompt_for_vless_config() {
     read -rp "UUID [留空自动生成]: " p_uuid
     if [[ -z "$p_uuid" ]]; then
         if [[ -r /proc/sys/kernel/random/uuid ]]; then
-            p_uuid=$(tr -d '
-' < /proc/sys/kernel/random/uuid)
+            p_uuid=$(tr -d '\r\n' < /proc/sys/kernel/random/uuid)
         elif have_cmd uuidgen; then
-            p_uuid=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' | tr -d '
-')
+            p_uuid=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' | tr -d '\r\n')
         else
-            p_uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '
-')
+            p_uuid=$(/usr/local/bin/xray uuid 2>/dev/null | head -n1 | tr -d '\r\n')
         fi
     fi
 
@@ -4684,14 +4684,12 @@ run_install_dual() {
     cleanup_legacy_ss_backends silent >/dev/null 2>&1 || true
 
     mkdir -p /usr/local/etc/xray
-    key_pair=$(/usr/local/bin/xray x25519 2>&1 | tr -d '
-')
+    key_pair=$(/usr/local/bin/xray x25519 2>&1 | tr -d '\r')
     private_key=$(xray_extract_reality_private_key "$key_pair")
     if have_cmd openssl; then
         short_id=$(openssl rand -hex 8 2>/dev/null)
     else
-        short_id=$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' 
-')
+        short_id=$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
     fi
     if [[ -z "$private_key" || -z "$short_id" ]]; then
         echo -e "${RED}❌ 生成 REALITY 密钥材料失败。${RESET}"
@@ -8280,7 +8278,21 @@ ssr_hub_menu() {
     done
 }
 
+validate_runtime_modules() {
+    local mod rc=0
+    for mod in "$COMMON_MODULE_FILE" "$SSR_MODULE_FILE" "$NFT_MODULE_FILE" "$NGX_MODULE_FILE"; do
+        [[ -f "$mod" ]] || { msg_err "模块缺失: $mod"; rc=1; continue; }
+        if ! bash -n "$mod" >/dev/null 2>&1; then
+            msg_err "模块语法损坏: $mod"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
 run_ssr_module_menu() {
+    ensure_runtime_ready_for_cli
+    validate_runtime_modules || { read -n 1 -s -r -p "按任意键返回..."; return 1; }
     my_enable_ssr_cron_tasks
     (
       source "${SSR_MODULE_FILE}" || exit 1
@@ -8290,6 +8302,8 @@ run_ssr_module_menu() {
 }
 
 run_system_module_menu() {
+    ensure_runtime_ready_for_cli
+    validate_runtime_modules || { read -n 1 -s -r -p "按任意键返回..."; return 1; }
     (
       source "${SSR_MODULE_FILE}" || exit 1
       sys_menu
@@ -8297,6 +8311,8 @@ run_system_module_menu() {
 }
 
 run_nft_module_menu() {
+    ensure_runtime_ready_for_cli
+    validate_runtime_modules || { read -n 1 -s -r -p "按任意键返回..."; return 1; }
     (
       source "${NFT_MODULE_FILE}" || exit 1
       require_root
@@ -8309,6 +8325,8 @@ run_nft_module_menu() {
 }
 
 run_nginx_module_menu() {
+    ensure_runtime_ready_for_cli
+    validate_runtime_modules || { read -n 1 -s -r -p "按任意键返回..."; return 1; }
     (
       source "${NGX_MODULE_FILE}" || exit 1
       nginx_menu
@@ -8953,6 +8971,7 @@ status_page_loop() {
 
 run_status_page() {
     ensure_runtime_ready_for_cli
+    validate_runtime_modules || { read -n 1 -s -r -p "按任意键返回..."; return 1; }
     (
       source "${COMMON_MODULE_FILE}" || exit 1
       source "${SSR_MODULE_FILE}" || exit 1
