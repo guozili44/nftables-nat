@@ -6,12 +6,6 @@
 
 set -o pipefail
 
-# 脚本签名（用于安全自更新，防止误更新到其它脚本）
-SCRIPT_ID="nftmgr-pro"
-SCRIPT_FINGERPRINT_1="CMD_NAME=\"nftmgr\""
-SCRIPT_FINGERPRINT_2="nft_mgr_nat"
-SCRIPT_FINGERPRINT_3="update_script()"
-
 # 兼容 cron/systemd 的精简 PATH
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
@@ -37,14 +31,6 @@ LOG_DIR="/var/log/nft_ddns"
 LOCK_FILE="/var/lock/nft_mgr.lock"
 
 CMD_NAME="nftmgr"
-
-RAW_URL="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/ssr.sh"
-PROXY_URL="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
-RAW_URL_FALLBACK="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/nft_mgr.sh"
-PROXY_URL_FALLBACK="https://ghproxy.net/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/ssr.sh"
-# 可选：自定义更新地址（写入 SETTINGS_FILE：/etc/nft_forward_settings.conf）
-# UPDATE_URL_DIRECT="https://raw.githubusercontent.com/<you>/<repo>/main/nftmgr.sh"
-# UPDATE_URL_PROXY="https://ghproxy.net/https://raw.githubusercontent.com/<you>/<repo>/main/nftmgr.sh"
 
 
 # --------------------------
@@ -80,6 +66,18 @@ PLAIN='\033[0m'
 msg_ok()   { echo -e "${GREEN}$*${PLAIN}"; }
 msg_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
 msg_err()  { echo -e "${RED}$*${PLAIN}"; }
+msg_info() { echo -e "${CYAN}$*${PLAIN}"; }
+
+script_realpath() {
+    local src="$0"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$src"
+    elif command -v readlink >/dev/null 2>&1; then
+        readlink -f "$src" 2>/dev/null || printf '%s\n' "$src"
+    else
+        printf '%s\n' "$src"
+    fi
+}
 
 # 基础工具
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -92,40 +90,15 @@ require_root() {
     [[ $EUID -ne 0 ]] && msg_err "错误: 必须使用 root 权限运行!" && exit 1
 }
 
-detect_pkg_mgr() {
-    if have_cmd apt-get; then
-        echo "apt"
-    elif have_cmd dnf; then
-        echo "dnf"
-    elif have_cmd yum; then
-        echo "yum"
-    else
-        echo ""
-    fi
-}
-
-install_deps() {
-    local mgr
-    mgr="$(detect_pkg_mgr)"
-    [[ -z "$mgr" ]] && return 1
-
-    # 依赖：nft/dig/curl/flock/ss
-    if [[ "$mgr" == "apt" ]]; then
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -yqq nftables dnsutils curl util-linux iproute2 >/dev/null 2>&1 || true
-    else
-        # dnf/yum
-        "$mgr" install -y nftables bind-utils curl util-linux iproute >/dev/null 2>&1 || true
-    fi
-}
-
 check_env() {
-    # 自动装依赖（尽量温和）
+    # 仅检查依赖，不自动安装，避免产生额外外连和系统改动
     local need=0
     for c in nft dig curl flock ss sysctl; do
         have_cmd "$c" || need=1
     done
-    [[ $need -eq 1 ]] && install_deps
+    if [[ $need -eq 1 ]]; then
+        msg_warn "缺少依赖，请手动安装：nftables dnsutils(bind-utils) curl util-linux iproute2/iproute"
+    fi
 
     # 再次检查
     for c in nft dig curl flock ss sysctl; do
@@ -168,7 +141,7 @@ with_lock() {
 # --------------------------
 # 参数/输入校验
 # --------------------------
-# DDNS 定时任务联动（当新增规则目标为域名时，自动启用每分钟检测）
+# DDNS 定时任务辅助函数（默认不自动启用，由用户手动开启）
 # --------------------------
 ensure_ddns_cron_enabled() {
     local script_path="/usr/local/bin/${CMD_NAME}"
@@ -179,8 +152,8 @@ ensure_ddns_cron_enabled() {
         return 0
     fi
 
-    # 追加定时任务：每分钟运行一次 DDNS 更新
-    (crontab -l 2>/dev/null; echo "* * * * * ${script_path} --cron > /dev/null 2>&1") | crontab - 2>/dev/null || true
+    # 追加定时任务：每 5 分钟运行一次 DDNS 更新
+    (crontab -l 2>/dev/null; echo "*/5 * * * * ${script_path} --cron > /dev/null 2>&1") | crontab - 2>/dev/null || true
     return 0
 }
 
@@ -218,7 +191,7 @@ ensure_ddns_cron_disabled_if_unused() {
 
     if crontab -l 2>/dev/null | grep -Fq "${script_path} --cron" || crontab -l 2>/dev/null | grep -Eq '(^|\s)(/usr/local/bin/nftmgr|nftmgr)\s+--cron(\s|$)'; then
         remove_ddns_cron_task
-        msg_info "已无域名转发规则：已自动移除 DDNS 每分钟检测任务（crontab）。"
+        msg_info "已无域名转发规则：已自动移除 DDNS 定时检测任务（crontab）。"
     fi
     return 0
 }
@@ -798,12 +771,6 @@ add_forward_impl() {
 
     manage_firewall "add" "$lport" "$proto" || true
 
-    # 目标为域名：自动启用 DDNS 每分钟检测（联动）
-    if ! is_ipv4 "$taddr"; then
-        ensure_ddns_cron_enabled
-        msg_info "已检测到目标为域名：已自动启用 DDNS 每分钟检测（crontab）。"
-    fi
-
     msg_ok "添加成功！映射路径: [本机] ${lport}/${proto} -> [目标] ${taddr}:${tport} (${tip})"
     sleep 2
     return 0
@@ -812,25 +779,9 @@ add_forward_impl() {
 add_forward() { with_lock add_forward_impl; }
 
 # --------------------------
-# 流量看板与规则管理（删除）
+# 规则管理（查看/删除）
 # --------------------------
-get_traffic_snapshot() { nft -a list table ip nft_mgr_nat 2>/dev/null || true; }
-
-extract_bytes_for_prerouting() {
-    # args: snapshot proto lp ip tp
-    local snapshot="$1" proto="$2" lp="$3" ip="$4" tp="$5"
-    # match: "<proto> dport <lp> ... dnat to <ip>:<tp>"
-    echo "$snapshot" | grep -E "${proto} dport ${lp}.*dnat to ${ip}:${tp}" | sed -n 's/.*bytes \([0-9]\+\).*/\1/p' | head -n 1
-}
-
-extract_bytes_for_postrouting() {
-    # args: snapshot proto ip tp
-    local snapshot="$1" proto="$2" ip="$3" tp="$4"
-    # match: "ip daddr <ip> <proto> dport <tp> ... masquerade"
-    echo "$snapshot" | grep -E "ip daddr ${ip} ${proto} dport ${tp}.*masquerade" | sed -n 's/.*bytes \([0-9]\+\).*/\1/p' | head -n 1
-}
-
-view_and_del_forward_impl() {
+list_and_del_forward_impl() {
     clear
     if [[ ! -s "$CONFIG_FILE" ]]; then
         msg_warn "当前没有任何转发规则。"
@@ -838,15 +789,9 @@ view_and_del_forward_impl() {
         return 0
     fi
 
-    local traffic_data
-    traffic_data="$(get_traffic_snapshot)"
-
-    local total_in=0
-    local total_out=0
-
-    echo -e "${CYAN}=========================== 实时流量看板 ===========================${PLAIN}"
-    printf "%-4s | %-6s | %-5s | %-16s | %-6s | %-10s | %-10s\n" "序号" "本地" "协议" "目标地址" "目标" "接收(RX)" "发送(TX)"
-    echo "--------------------------------------------------------------------"
+    echo -e "${CYAN}=========================== 规则管理 ===========================${PLAIN}"
+    printf "%-4s | %-6s | %-5s | %-24s | %-6s\n" "序号" "本地" "协议" "目标地址" "目标"
+    echo "----------------------------------------------------------------"
 
     local i=1
     while IFS='|' read -r lp addr tp last_ip proto; do
@@ -854,51 +799,13 @@ view_and_del_forward_impl() {
         proto="$(normalize_proto "$proto")"
         is_port "$lp" || continue
         is_port "$tp" || continue
-
-        local in_bytes out_bytes
-        # 计算 RX/TX：按协议分别匹配并相加
-        local ip_now
-        ip_now="$last_ip"
-        [[ -z "$ip_now" ]] && ip_now="$(get_ip "$addr")"
-        [[ -z "$ip_now" ]] && ip_now="0.0.0.0"
-
-        in_bytes=0
-        out_bytes=0
-
-        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
-            local ib ob
-            ib="$(extract_bytes_for_prerouting "$traffic_data" "tcp" "$lp" "$ip_now" "$tp")"; [[ -z "$ib" ]] && ib=0
-            ob="$(extract_bytes_for_postrouting "$traffic_data" "tcp" "$ip_now" "$tp")"; [[ -z "$ob" ]] && ob=0
-            in_bytes=$((in_bytes + ib))
-            out_bytes=$((out_bytes + ob))
-        fi
-        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
-            local ib ob
-            ib="$(extract_bytes_for_prerouting "$traffic_data" "udp" "$lp" "$ip_now" "$tp")"; [[ -z "$ib" ]] && ib=0
-            ob="$(extract_bytes_for_postrouting "$traffic_data" "udp" "$ip_now" "$tp")"; [[ -z "$ob" ]] && ob=0
-            in_bytes=$((in_bytes + ib))
-            out_bytes=$((out_bytes + ob))
-        fi
-        [[ -z "$in_bytes" ]] && in_bytes=0
-        [[ -z "$out_bytes" ]] && out_bytes=0
-
-        total_in=$((total_in + in_bytes))
-        total_out=$((total_out + out_bytes))
-
-        local in_str out_str
-        in_str="$(format_bytes "$in_bytes")"
-        out_str="$(format_bytes "$out_bytes")"
-
-        local short_addr="${addr:0:15}"
-        printf "%-4s | %-6s | %-5s | %-16s | %-6s | %-10s | %-10s\n" "$i" "$lp" "$proto" "$short_addr" "$tp" "$in_str" "$out_str"
+        printf "%-4s | %-6s | %-5s | %-24s | %-6s\n" "$i" "$lp" "$proto" "$addr" "$tp"
         ((i++))
     done < "$CONFIG_FILE"
 
-    echo "--------------------------------------------------------------------"
-    echo -e "${CYAN}[ 全局总流量 ]  接收(RX): ${GREEN}$(format_bytes "$total_in")${CYAN}  |  发送(TX): ${YELLOW}$(format_bytes "$total_out")${PLAIN}"
-    echo -e "${CYAN}====================================================================${PLAIN}"
-
+    echo "----------------------------------------------------------------"
     echo -e "\n${YELLOW}提示: 输入规则前面的【序号】即可删除，输入【0】或直接按回车返回。${PLAIN}"
+
     local action
     read -rp "请选择操作: " action
 
@@ -912,7 +819,14 @@ view_and_del_forward_impl() {
     fi
 
     local total_lines
-    total_lines="$(awk -F'|' 'BEGIN{c=0} $0!~/^\s*($|#)/{ if($1~/^[0-9]+$/ && $1>=1 && $1<=65535 && $3~/^[0-9]+$/ && $3>=1 && $3<=65535){c++}} END{print c+0}' "$CONFIG_FILE" 2>/dev/null)"
+    total_lines="$(awk -F'|' 'BEGIN{c=0}
+        $0!~/^[[:space:]]*($|#)/{
+            if($1~/^[0-9]+$/ && $1>=1 && $1<=65535 && $3~/^[0-9]+$/ && $3>=1 && $3<=65535){
+                c++
+            }
+        }
+        END{print c+0}' "$CONFIG_FILE" 2>/dev/null)"
+
     if [[ "$action" -lt 1 || "$action" -gt "$total_lines" ]]; then
         msg_err "序号超出范围！"
         sleep 2
@@ -921,11 +835,13 @@ view_and_del_forward_impl() {
 
     local line_no
     line_no="$(awk -F'|' -v N="$action" 'BEGIN{c=0}
-        $0!~/^\s*($|#)/{
+        $0!~/^[[:space:]]*($|#)/{
             if($1~/^[0-9]+$/ && $1>=1 && $1<=65535 && $3~/^[0-9]+$/ && $3>=1 && $3<=65535){
-                c++; if(c==N){print NR; exit}
+                c++
+                if(c==N){print NR; exit}
             }
         }' "$CONFIG_FILE")"
+
     [[ -z "$line_no" ]] && { msg_err "删除失败：无法定位规则行。"; sleep 2; return 1; }
 
     local del_line del_port del_proto
@@ -949,8 +865,6 @@ view_and_del_forward_impl() {
     rm -f "$conf_bak" 2>/dev/null || true
 
     manage_firewall "del" "$del_port" "$del_proto" || true
-
-    # 联动：若已无域名规则，则自动清理 DDNS 定时任务
     ensure_ddns_cron_disabled_if_unused
 
     msg_ok "已成功删除本地端口为 ${del_port}/${del_proto} 的转发规则。"
@@ -958,7 +872,7 @@ view_and_del_forward_impl() {
     return 0
 }
 
-view_and_del_forward() { with_lock view_and_del_forward_impl; }
+list_and_del_forward() { with_lock list_and_del_forward_impl; }
 
 # --------------------------
 # DDNS 追踪更新（域名 -> IP 变化） + 严格模式失败通知
@@ -1037,7 +951,7 @@ manage_cron() {
     else
         echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) --- [未启用]${PLAIN}"
     fi
-    echo "1. 自动添加定时任务 (每分钟检测，默认非严格)"
+    echo "1. 手动添加定时任务 (每 5 分钟检测)"
     echo "2. 一键删除定时任务"
     echo "3. 查看 DDNS 变动历史日志 (仅保留最近7天)"
     echo "0. 返回主菜单"
@@ -1054,8 +968,8 @@ manage_cron() {
                 sleep 2
                 return
             fi
-            (crontab -l 2>/dev/null; echo "* * * * * ${SCRIPT_PATH} --cron > /dev/null 2>&1") | crontab - 2>/dev/null
-            msg_ok "定时任务已添加！将自动检查 IP 并生成日志。"
+            (crontab -l 2>/dev/null; echo "*/5 * * * * ${SCRIPT_PATH} --cron > /dev/null 2>&1") | crontab - 2>/dev/null
+            msg_ok "定时任务已添加！将每 5 分钟检查 IP 并生成日志。"
             sleep 2
             ;;
         2)
@@ -1077,112 +991,6 @@ manage_cron() {
         0) return ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
-}
-
-# --------------------------
-# 安全自更新
-# --------------------------
-download_to() {
-    local url="$1"
-    local out="$2"
-    if have_cmd curl; then
-        curl -fsSL --retry 2 --connect-timeout 8 --max-time 120 "$url" -o "$out" >/dev/null 2>&1
-    elif have_cmd wget; then
-        wget -qO "$out" "$url" >/dev/null 2>&1
-    else
-        return 1
-    fi
-}
-
-update_script() {
-    clear
-    echo -e "${GREEN}--- 脚本更新（无感安全模式） ---${PLAIN}"
-    echo "1. GitHub 官方直连更新 (推荐海外机)"
-    echo "2. GHProxy 代理更新 (推荐国内机)"
-    echo "0. 取消并返回主菜单"
-    echo "--------------------------------"
-    local up_choice
-    read -rp "请选择更新线路 [0-2]: " up_choice
-
-    # 允许在 SETTINGS_FILE 覆盖更新 URL
-    local u_direct u_proxy
-    u_direct="$(settings_get "UPDATE_URL_DIRECT" 2>/dev/null || true)"
-    u_proxy="$(settings_get "UPDATE_URL_PROXY" 2>/dev/null || true)"
-
-    local primary_url fallback_url
-    case "$up_choice" in
-        1)
-            primary_url="${u_direct:-$RAW_URL}"
-            fallback_url="$RAW_URL_FALLBACK"
-            ;;
-        2)
-            primary_url="${u_proxy:-$PROXY_URL}"
-            fallback_url="$PROXY_URL_FALLBACK"
-            ;;
-        0) return ;;
-        *) msg_err "无效选项。"; sleep 1; return ;;
-    esac
-
-    echo -e "${CYAN}正在拉取最新代码...${PLAIN}"
-    local tmp
-    tmp="$(mktemp /tmp/nftmgr-update.XXXXXX)"
-
-    if ! download_to "$primary_url" "$tmp" || [[ ! -s "$tmp" ]]; then
-        rm -f "$tmp"
-        tmp="$(mktemp /tmp/nftmgr-update.XXXXXX)"
-        if ! download_to "$fallback_url" "$tmp" || [[ ! -s "$tmp" ]]; then
-            msg_err "失败: 无法连接服务器或下载为空。"
-            rm -f "$tmp"
-            sleep 2
-            return
-        fi
-    fi
-
-    # 基本合法性校验
-    if ! head -n 1 "$tmp" | grep -q "^#!/bin/bash"; then
-        msg_err "失败: 文件内容非法（缺少 shebang）。"
-        rm -f "$tmp"
-        sleep 2
-        return
-    fi
-
-    if ! bash -n "$tmp" >/dev/null 2>&1; then
-        msg_err "失败: 新脚本语法校验失败，已中止替换。"
-        rm -f "$tmp"
-        sleep 2
-        return
-    fi
-
-    # 防误更新：避免把“更新”更新成别的脚本（出现‘更新变卸载’的根因就是更新源不对）
-    if ! grep -Fq "$SCRIPT_FINGERPRINT_1" "$tmp" || ! grep -Fq "$SCRIPT_FINGERPRINT_2" "$tmp" || ! grep -Fq "$SCRIPT_FINGERPRINT_3" "$tmp"; then
-        # 发现不匹配：再尝试一次 fallback 源（可能主源指向了别的脚本）
-        rm -f "$tmp"
-        tmp="$(mktemp /tmp/nftmgr-update.XXXXXX)"
-        if download_to "$fallback_url" "$tmp" && [[ -s "$tmp" ]] && bash -n "$tmp" >/dev/null 2>&1; then
-            if ! grep -Fq "$SCRIPT_FINGERPRINT_1" "$tmp" || ! grep -Fq "$SCRIPT_FINGERPRINT_2" "$tmp" || ! grep -Fq "$SCRIPT_FINGERPRINT_3" "$tmp"; then
-                msg_err "失败: 主源与备用源下载内容均与当前 nftmgr 不匹配（已阻止误更新）。"
-                msg_err "如你确实要更新成其它脚本，请改用你自己的 UPDATE_URL_DIRECT/UPDATE_URL_PROXY。"
-                rm -f "$tmp"
-                sleep 3
-                return
-            fi
-        else
-            msg_err "失败: 下载到的脚本与当前 nftmgr 不匹配，且备用源获取失败（已阻止误更新）。"
-            rm -f "$tmp"
-            sleep 3
-            return
-        fi
-    fi
-
-    local dest="/usr/local/bin/${CMD_NAME}"
-    cp -a "$dest" "${dest}.bak.$(date +%s)" 2>/dev/null || true
-    install -m 755 "$tmp" "${dest}.new" >/dev/null 2>&1 || { msg_err "失败: 写入失败。"; rm -f "$tmp"; return; }
-    mv -f "${dest}.new" "$dest"
-    rm -f "$tmp"
-
-    msg_ok "✅ 更新成功！面板正在热重启..."
-    sleep 1
-    exec "$dest"
 }
 
 # --------------------------
@@ -1299,7 +1107,6 @@ uninstall_script_impl() {
 }
 
 uninstall_script() { with_lock uninstall_script_impl; }
- { with_lock uninstall_script_impl; }
 
 # --------------------------
 # 主菜单
@@ -1311,24 +1118,22 @@ main_menu() {
     echo -e "${GREEN}==========================================${PLAIN}"
     echo "1. 开启 BBR + 转发 + 自启动 (稳定/性能)"
     echo "2. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
-    echo "3. 流量看板与规则管理 (查看/删除)"
+    echo "3. 规则管理 (查看/删除)"
     echo "4. 清空所有转发规则"
     echo "5. 管理 DDNS 定时监控与日志"
-    echo "6. 从 GitHub 更新当前脚本 (安全更新)"
-    echo "7. 一键完全卸载本脚本"
+    echo "6. 一键完全卸载本脚本"
     echo "0. 退出面板"
     echo "------------------------------------------"
     local choice
-    read -rp "请选择操作 [0-7]: " choice
+    read -rp "请选择操作 [0-6]: " choice
 
     case "$choice" in
         1) optimize_system ;;
         2) add_forward ;;
-        3) view_and_del_forward ;;
+        3) list_and_del_forward ;;
         4) clear_all_rules ;;
         5) manage_cron ;;
-        6) update_script ;;
-        7) uninstall_script ;;
+        6) uninstall_script ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
