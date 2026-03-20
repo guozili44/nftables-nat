@@ -1,8 +1,8 @@
 #!/bin/bash
-# my 综合管理（优化专用精简版）
-# 已物理移除：Xray / Reality / SS2022 / NFT 转发相关代码
+# my 综合管理（优化专用版）
+# 已移除：Xray / Reality / SS2022 / NFT 转发相关代码
 # 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
-# 版本：v2.0.0-clean
+# 版本：v2.1.0-optimized
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 
 set -o pipefail
@@ -10,9 +10,10 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="2.0.1-clean"
+MY_VERSION="2.1.0-optimized"
 MY_STATE_DIR="/usr/local/lib/my/state"
 DNS_STATE_DIR="${MY_STATE_DIR}/dns"
+DDNS_STATE_DIR="${MY_STATE_DIR}/ddns"
 UPDATE_URL_DIRECT="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh"
 UPDATE_URL_PROXY="https://mirror.ghproxy.com/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh"
 REINSTALL_UPSTREAM_GLOBAL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
@@ -24,6 +25,9 @@ SSH_AUTH_DROPIN="/etc/ssh/sshd_config.d/00-my-auth.conf"
 SYSCTL_OPT_FILE="/etc/sysctl.d/99-my-optimizer.conf"
 DNS_BACKUP_FILE="${DNS_STATE_DIR}/resolv.conf.bak"
 DNS_META_FILE="${DNS_STATE_DIR}/meta.conf"
+DDNS_CFG_FILE="${DDNS_STATE_DIR}/cloudflare.env"
+DDNS_LOG_FILE="${DDNS_STATE_DIR}/update.log"
+GITHUB_KNOWN_HOSTS="/root/.ssh/known_hosts"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -74,7 +78,7 @@ run_with_timeout() {
     fi
 }
 ensure_state_dirs() {
-    mkdir -p "$MY_STATE_DIR" "$DNS_STATE_DIR" 2>/dev/null || true
+    mkdir -p "$MY_STATE_DIR" "$DNS_STATE_DIR" "$DDNS_STATE_DIR" /root/.ssh 2>/dev/null || true
 }
 install_self_command() {
     local self
@@ -88,7 +92,7 @@ install_self_command() {
 pkg_update_once() {
     if have_cmd apt-get; then
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y >/dev/null 2>&1 || apt-get update >/dev/null 2>&1 || return 1
+        run_with_timeout 20 apt-get update -y >/dev/null 2>&1 || run_with_timeout 20 apt-get update >/dev/null 2>&1 || return 1
         return 0
     fi
     return 0
@@ -96,11 +100,11 @@ pkg_update_once() {
 pkg_install() {
     if have_cmd apt-get; then
         export DEBIAN_FRONTEND=noninteractive
-        apt-get install -y "$@"
+        run_with_timeout 30 apt-get install -y "$@"
     elif have_cmd dnf; then
-        dnf install -y "$@"
+        run_with_timeout 30 dnf install -y "$@"
     elif have_cmd yum; then
-        yum install -y "$@"
+        run_with_timeout 30 yum install -y "$@"
     else
         return 1
     fi
@@ -112,18 +116,18 @@ ensure_base_tools() {
     have_cmd sed || missing+=(sed)
     have_cmd grep || missing+=(grep)
     have_cmd ss || missing+=(iproute2)
+    have_cmd python3 || missing+=(python3)
     if [[ ${#missing[@]} -gt 0 ]]; then
         pkg_update_once >/dev/null 2>&1 || true
         pkg_install "${missing[@]}" >/dev/null 2>&1 || true
     fi
 }
-ensure_dns_tools() {
-    if have_cmd dig; then
-        return 0
-    fi
+ensure_jq_or_python() {
+    have_cmd jq && return 0
+    have_cmd python3 && return 0
     pkg_update_once >/dev/null 2>&1 || true
-    pkg_install dnsutils >/dev/null 2>&1 || pkg_install bind-utils >/dev/null 2>&1 || true
-    have_cmd dig
+    pkg_install jq python3 >/dev/null 2>&1 || pkg_install python3 >/dev/null 2>&1 || true
+    have_cmd jq || have_cmd python3
 }
 
 status_colorize() {
@@ -179,7 +183,7 @@ status_ssh_line() {
     echo -e "  SSH: $(status_colorize info "$active") / 端口 ${YELLOW}${port}${RESET} / 密码登录 ${YELLOW}${auth}${RESET}"
 }
 nginx_site_count() {
-    find /etc/nginx/conf.d /etc/nginx/sites-enabled -maxdepth 1 -type f \( -name '*.conf' -o -type l \) 2>/dev/null | wc -l | awk '{print $1}'
+    find /etc/nginx/conf.d /etc/nginx/sites-enabled -maxdepth 1 \( -type f -o -type l \) -name '*.conf' 2>/dev/null | wc -l | awk '{print $1}'
 }
 status_nginx_line() {
     local sites
@@ -190,17 +194,18 @@ status_nginx_line() {
         echo -e "  Nginx 状态: $(status_colorize warn '未运行') / 站点 ${YELLOW}${sites}${RESET}"
     fi
 }
-get_dns_servers_brief() {
-    if have_cmd resolvectl && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        resolvectl dns 2>/dev/null | awk '{for(i=3;i<=NF;i++) print $i}' | paste -sd ',' -
-        return
+status_ddns_line() {
+    if [[ -s "$DDNS_CFG_FILE" ]]; then
+        echo -e "  DDNS: $(status_colorize ok '已配置') / $(awk -F= '/^RECORD_NAME=/{print $2}' "$DDNS_CFG_FILE" 2>/dev/null)"
+    else
+        echo -e "  DDNS: $(status_colorize warn '未配置')"
     fi
-    awk '/^nameserver /{print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ',' -
 }
-get_dns_brief_status() {
-    local s
-    s="$(get_dns_servers_brief 2>/dev/null || true)"
-    [[ -n "$s" ]] && echo 已配置 || echo 未配置
+status_opt_mode() {
+    local mode
+    mode="$(awk -F= '/^profile=/{print $2}' "$MY_STATE_DIR/optimizer.conf" 2>/dev/null | tail -n1)"
+    [[ -n "$mode" ]] || mode="未应用"
+    printf '%s' "$mode"
 }
 
 cron_remove_regex() {
@@ -226,13 +231,35 @@ daily_clean() {
     apt-get clean >/dev/null 2>&1 || true
 }
 
+port_in_use() {
+    local port="$1"
+    ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && return 0
+    ss -lnuH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && return 0
+    return 1
+}
+random_free_port() {
+    local p
+    for p in 20000 20100 20200 20300 20400 20500 20600 20700 20800 20900; do
+        port_in_use "$p" || { echo "$p"; return 0; }
+    done
+    echo 20000
+}
+
+random_id() {
+    if have_cmd openssl; then
+        openssl rand -hex 8 2>/dev/null | tr 'A-Z' 'a-z'
+    else
+        date +%s | sha256sum 2>/dev/null | cut -c1-16
+    fi
+}
+
 download_to() {
     local url="$1" dest="$2"
     [[ -n "$url" && -n "$dest" ]] || return 1
     if have_cmd curl; then
-        curl -fL --connect-timeout 10 --retry 2 --retry-delay 1 -o "$dest" "$url"
+        curl -fsSL --connect-timeout 8 --max-time 25 --retry 2 --retry-delay 1 -o "$dest" "$url"
     elif have_cmd wget; then
-        wget -O "$dest" "$url"
+        wget -qO "$dest" "$url"
     else
         return 1
     fi
@@ -241,8 +268,7 @@ normalize_update_file() {
     local f="$1"
     [[ -f "$f" ]] || return 1
     sed -i '1s/^ï»¿//' "$f" 2>/dev/null || true
-    tr -d '
-' < "$f" > "${f}.lf" 2>/dev/null && mv -f "${f}.lf" "$f" || true
+    tr -d '\r' < "$f" > "${f}.lf" 2>/dev/null && mv -f "${f}.lf" "$f" || true
     return 0
 }
 verify_update_file() {
@@ -287,7 +313,7 @@ github_update() {
                     return 1
                 fi
                 install_self_command >/dev/null 2>&1 || true
-                new_ver=$(grep -m1 '^MY_VERSION=' "$self" | sed -E 's/^[^"]*"([^"]+)".*//')
+                new_ver="$(grep -m1 '^MY_VERSION=' "$self" | sed -E 's/^[^"]*"([^"]+)".*/\1/')"
                 msg_ok "在线自更新成功。当前版本：${new_ver:-未知}"
                 msg_info "备份文件：${bak}"
                 rm -f "$tmp"
@@ -314,35 +340,50 @@ github_update() {
     return 1
 }
 
-sysctl_key_supported() {
-    sysctl -aN 2>/dev/null | grep -qx "$1"
+write_optimizer_profile() {
+    local profile="$1"
+    printf 'profile=%s\nupdated_at=%s\n' "$profile" "$(date '+%F %T')" > "$MY_STATE_DIR/optimizer.conf"
 }
-apply_sysctl_optimizer() {
-    local tmp
-    tmp="$(mktemp /tmp/my-sysctl.XXXXXX)" || return 1
-    cat > "$tmp" <<'SYSCTL_EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.ip_local_port_range = 10240 65535
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
-vm.swappiness = 10
-SYSCTL_EOF
-    awk 'BEGIN{ok=1}
-        {
-            line=$0
-            if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) {print line; next}
-            split(line,a,"=")
-            gsub(/[[:space:]]+$/, "", a[1])
-            gsub(/^[[:space:]]+/, "", a[1])
-            print line
-        }' "$tmp" > "$SYSCTL_OPT_FILE"
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_OPT_FILE" >/dev/null 2>&1
+apply_sysctl_lines() {
+    local profile="$1"
+    shift
+    printf '%s\n' "$@" > "$SYSCTL_OPT_FILE"
+    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_OPT_FILE" >/dev/null 2>&1 || return 1
+    write_optimizer_profile "$profile"
+}
+apply_general_extreme_opt() {
+    apply_sysctl_lines "general-extreme" \
+"net.core.default_qdisc = fq" \
+"net.ipv4.tcp_congestion_control = bbr" \
+"net.ipv4.tcp_fastopen = 3" \
+"net.ipv4.tcp_mtu_probing = 1" \
+"net.ipv4.tcp_slow_start_after_idle = 0" \
+"net.ipv4.ip_local_port_range = 10240 65535" \
+"net.ipv4.tcp_fin_timeout = 15" \
+"net.ipv4.tcp_keepalive_time = 600" \
+"net.ipv4.tcp_keepalive_intvl = 30" \
+"net.ipv4.tcp_keepalive_probes = 5" \
+"net.core.somaxconn = 4096" \
+"net.ipv4.tcp_max_syn_backlog = 8192" \
+"vm.swappiness = 10"
+}
+apply_nat_extreme_opt() {
+    apply_sysctl_lines "nat-extreme" \
+"net.core.default_qdisc = fq" \
+"net.ipv4.tcp_congestion_control = bbr" \
+"net.ipv4.tcp_fastopen = 3" \
+"net.ipv4.tcp_mtu_probing = 1" \
+"net.ipv4.tcp_slow_start_after_idle = 0" \
+"net.ipv4.ip_local_port_range = 10240 65535" \
+"net.ipv4.tcp_fin_timeout = 15" \
+"net.ipv4.tcp_tw_reuse = 1" \
+"net.netfilter.nf_conntrack_max = 262144" \
+"net.netfilter.nf_conntrack_tcp_timeout_established = 1200" \
+"net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30" \
+"net.core.somaxconn = 8192" \
+"net.ipv4.tcp_max_syn_backlog = 16384" \
+"net.netfilter.nf_conntrack_buckets = 65536" \
+"vm.swappiness = 10"
 }
 
 _dns_now_ms() {
@@ -354,7 +395,9 @@ PY
 dns_candidate_servers() {
     cat <<'EOF_DNS'
 223.5.5.5|aliyun
+223.6.6.6|aliyun
 119.29.29.29|tencent
+1.12.12.12|tencent
 180.76.76.76|baidu
 1.1.1.1|cloudflare
 8.8.8.8|google
@@ -362,14 +405,34 @@ dns_candidate_servers() {
 94.140.14.14|adguard
 EOF_DNS
 }
+ensure_dns_probe_tool() {
+    have_cmd dig && { echo dig; return 0; }
+    have_cmd nslookup && { echo nslookup; return 0; }
+    pkg_update_once >/dev/null 2>&1 || true
+    pkg_install dnsutils >/dev/null 2>&1 || pkg_install bind-utils >/dev/null 2>&1 || true
+    have_cmd dig && { echo dig; return 0; }
+    have_cmd nslookup && { echo nslookup; return 0; }
+    echo none
+    return 1
+}
+dns_probe_once() {
+    local tool="$1" server="$2" domain="$3" start end
+    start="$(_dns_now_ms)"
+    if [[ "$tool" == "dig" ]]; then
+        run_with_timeout 3 dig +time=1 +tries=1 +short @"$server" "$domain" A 2>/dev/null | grep -q '.' || return 1
+    elif [[ "$tool" == "nslookup" ]]; then
+        run_with_timeout 3 nslookup "$domain" "$server" 2>/dev/null | grep -Eiq 'Address:|Addresses:' || return 1
+    else
+        return 1
+    fi
+    end="$(_dns_now_ms)"
+    echo $((end-start))
+}
 dns_probe_avg_ms() {
-    local server="$1" total=0 ok=0 i start end elapsed domain
-    ensure_dns_tools || return 1
+    local tool="$1" server="$2" total=0 ok=0 elapsed domain
     for domain in www.cloudflare.com www.baidu.com www.qq.com; do
-        start="$(_dns_now_ms)"
-        if dig +time=1 +tries=1 +short @"$server" "$domain" A >/dev/null 2>&1; then
-            end="$(_dns_now_ms)"
-            elapsed=$((end-start))
+        elapsed="$(dns_probe_once "$tool" "$server" "$domain" 2>/dev/null || true)"
+        if [[ "$elapsed" =~ ^[0-9]+$ ]]; then
             total=$((total+elapsed))
             ok=$((ok+1))
         fi
@@ -378,13 +441,20 @@ dns_probe_avg_ms() {
     echo $((total/ok))
 }
 dns_pick_best_servers() {
-    local line ip provider ms scored
+    local tool line ip provider ms used_providers="|"
+    tool="$(ensure_dns_probe_tool 2>/dev/null || echo none)"
+    [[ "$tool" != none ]] || return 1
     while IFS='|' read -r ip provider; do
         [[ -n "$ip" ]] || continue
-        ms="$(dns_probe_avg_ms "$ip" 2>/dev/null || true)"
+        ms="$(dns_probe_avg_ms "$tool" "$ip" 2>/dev/null || true)"
         [[ "$ms" =~ ^[0-9]+$ ]] || continue
         printf '%s|%s|%s\n' "$ms" "$ip" "$provider"
-    done < <(dns_candidate_servers) | sort -n | head -n 3 | awk -F'|' '{print $2}'
+    done < <(dns_candidate_servers) | sort -n | while IFS='|' read -r ms ip provider; do
+        if [[ "$used_providers" != *"|$provider|"* ]]; then
+            echo "$ip"
+            used_providers+="$provider|"
+        fi
+    done | head -n 3
 }
 dns_backup() {
     ensure_state_dirs
@@ -395,7 +465,7 @@ dns_backup() {
 dns_write_meta() {
     local mode="$1" servers="$2"
     ensure_state_dirs
-    printf 'mode=%s\nservers=%s\n' "$mode" "$servers" > "$DNS_META_FILE"
+    printf 'mode=%s\nservers=%s\nupdated_at=%s\n' "$mode" "$servers" "$(date '+%F %T')" > "$DNS_META_FILE"
 }
 dns_apply_resolvconf() {
     local servers=() s
@@ -439,13 +509,19 @@ dns_apply_servers() {
     fi
 }
 dns_auto_tune() {
-    local best=()
+    local best=() started now
+    started="$(_dns_now_ms)"
     while read -r line; do
         [[ -n "$line" ]] && best+=("$line")
     done < <(dns_pick_best_servers)
+    now="$(_dns_now_ms)"
+    if (( now - started > 20000 )); then
+        msg_warn "DNS 探测耗时较长，已自动中止并回退。"
+        best=(223.5.5.5 119.29.29.29 1.1.1.1)
+    fi
     if [[ ${#best[@]} -eq 0 ]]; then
-        msg_err "智能 DNS 测试失败。"
-        return 1
+        msg_warn "智能 DNS 探测未得到稳定结果，改用安全回退组。"
+        best=(223.5.5.5 119.29.29.29 1.1.1.1)
     fi
     dns_apply_servers "${best[@]}" || { msg_err "应用 DNS 失败。"; return 1; }
     msg_ok "DNS 智能调优完成：${best[*]}"
@@ -470,6 +546,18 @@ dns_unlock_restore() {
     fi
     rm -f "$DNS_META_FILE" 2>/dev/null || true
     msg_ok "DNS 已恢复。"
+}
+get_dns_servers_brief() {
+    if have_cmd resolvectl && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        resolvectl dns 2>/dev/null | awk '{for(i=3;i<=NF;i++) print $i}' | paste -sd ',' -
+        return
+    fi
+    awk '/^nameserver /{print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ',' -
+}
+get_dns_brief_status() {
+    local s
+    s="$(get_dns_servers_brief 2>/dev/null || true)"
+    [[ -n "$s" ]] && echo 已配置 || echo 未配置
 }
 dns_status() {
     local mode servers
@@ -522,9 +610,7 @@ change_ssh_port() {
     fi
     msg_ok "SSH 端口已修改为 ${new_port}。"
 }
-change_root_password() {
-    passwd root
-}
+change_root_password() { passwd root; }
 disable_password_login() {
     write_ssh_auth_dropin no
     sshd -t || { rm -f "$SSH_AUTH_DROPIN"; msg_err "sshd 配置校验失败。"; return 1; }
@@ -538,6 +624,49 @@ restore_password_login() {
     msg_ok "已恢复 SSH 密码登录。"
 }
 
+github_keys_auto_fetch() {
+    local tmp keys_ok=0
+    mkdir -p /root/.ssh 2>/dev/null || true
+    touch "$GITHUB_KNOWN_HOSTS" 2>/dev/null || true
+    chmod 600 "$GITHUB_KNOWN_HOSTS" 2>/dev/null || true
+    tmp="$(mktemp /tmp/my-ghkeys.XXXXXX)" || return 1
+    if download_to "https://api.github.com/meta" "$tmp" >/dev/null 2>&1; then
+        if have_cmd python3; then
+            python3 - "$tmp" "$GITHUB_KNOWN_HOSTS" <<'PY'
+import json,sys
+meta=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+keys=meta.get('ssh_keys',[])
+out=[]
+for k in keys:
+    out.append(f"github.com {k}")
+    out.append(f"ssh.github.com {k}")
+existing=set()
+try:
+    with open(sys.argv[2],'r',encoding='utf-8') as f:
+        existing={line.rstrip('\n') for line in f if line.strip()}
+except FileNotFoundError:
+    pass
+with open(sys.argv[2],'a',encoding='utf-8') as f:
+    for line in out:
+        if line not in existing:
+            f.write(line+'\n')
+PY
+            keys_ok=1
+        fi
+    fi
+    rm -f "$tmp"
+    if (( keys_ok == 0 )) && have_cmd ssh-keyscan; then
+        run_with_timeout 8 ssh-keyscan github.com ssh.github.com 2>/dev/null >> "$GITHUB_KNOWN_HOSTS" && keys_ok=1 || true
+    fi
+    if (( keys_ok == 1 )); then
+        sort -u "$GITHUB_KNOWN_HOSTS" -o "$GITHUB_KNOWN_HOSTS" 2>/dev/null || true
+        msg_ok "GitHub 主机密钥已自动获取并写入 known_hosts。"
+        return 0
+    fi
+    msg_err "GitHub 主机密钥获取失败。"
+    return 1
+}
+
 ensure_nginx_installed() {
     if have_cmd nginx; then
         return 0
@@ -548,7 +677,7 @@ ensure_nginx_installed() {
 }
 nginx_list_sites() {
     local files file
-    files=$(find /etc/nginx/conf.d /etc/nginx/sites-enabled -maxdepth 1 -type f -name '*.conf' 2>/dev/null)
+    files=$(find /etc/nginx/conf.d /etc/nginx/sites-enabled -maxdepth 1 \( -type f -o -type l \) -name '*.conf' 2>/dev/null)
     if [[ -z "$files" ]]; then
         echo "未发现站点配置。"
         return 0
@@ -566,6 +695,10 @@ nginx_add_reverse_proxy() {
     [[ -n "$domain" && -n "$upstream" ]] || { msg_err "域名和上游不能为空。"; return 1; }
     file="/etc/nginx/conf.d/${domain}.conf"
     cat > "$file" <<EOF_NGX
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    '' close;
+}
 server {
     listen 80;
     listen [::]:80;
@@ -583,11 +716,6 @@ server {
         proxy_set_header Connection \$connection_upgrade;
         proxy_pass http://${upstream};
     }
-}
-
-map \$http_upgrade \$connection_upgrade {
-    default upgrade;
-    '' close;
 }
 EOF_NGX
     nginx -t || { rm -f "$file"; msg_err "Nginx 配置校验失败。"; return 1; }
@@ -609,6 +737,173 @@ nginx_repair() {
     nginx -t || { msg_err "Nginx 配置校验失败。"; return 1; }
     service_use_systemd && systemctl restart nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1
     msg_ok "Nginx 已修复并重载。"
+}
+
+cf_api_call() {
+    local method="$1" path="$2" data="${3:-}"
+    source "$DDNS_CFG_FILE" || return 1
+    if [[ -n "$data" ]]; then
+        curl -fsSL -X "$method" "https://api.cloudflare.com/client/v4${path}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$data"
+    else
+        curl -fsSL -X "$method" "https://api.cloudflare.com/client/v4${path}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json"
+    fi
+}
+json_extract() {
+    local expr="$1"
+    if have_cmd jq; then
+        jq -r "$expr" 2>/dev/null
+    else
+        python3 - "$expr" <<'PY'
+import json,sys
+expr=sys.argv[1]
+obj=json.load(sys.stdin)
+# very small extractor for simple .a.b[0].c paths or booleans
+path=expr.strip()
+if path.startswith('.'):
+    path=path[1:]
+cur=obj
+for part in path.replace(']','').split('.'):
+    if not part:
+        continue
+    if '[' in part:
+        name,idx=part.split('[',1)
+        if name:
+            cur=cur.get(name)
+        cur=cur[int(idx)] if cur is not None else None
+    else:
+        if isinstance(cur,dict):
+            cur=cur.get(part)
+        else:
+            cur=None
+if cur is True: print('true')
+elif cur is False: print('false')
+elif cur is None: print('')
+else: print(cur)
+PY
+    fi
+}
+ddns_detect_public_ip() {
+    local ip
+    for url in https://api.ipify.org https://ifconfig.me https://ip.sb; do
+        ip="$(curl -4fsSL --connect-timeout 5 --max-time 8 "$url" 2>/dev/null | tr -d '\r\n')"
+        [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$ip"; return 0; }
+    done
+    return 1
+}
+ddns_cf_resolve_zone_id() {
+    local resp zone_id
+    resp="$(cf_api_call GET "/zones?name=${CF_ZONE_NAME}&status=active" 2>/dev/null)" || return 1
+    zone_id="$(printf '%s' "$resp" | json_extract '.result[0].id')"
+    [[ -n "$zone_id" && "$zone_id" != null ]] || return 1
+    echo "$zone_id"
+}
+ddns_cf_resolve_record_id() {
+    local zone_id="$1" resp record_id
+    resp="$(cf_api_call GET "/zones/${zone_id}/dns_records?type=A&name=${RECORD_NAME}" 2>/dev/null)" || return 1
+    record_id="$(printf '%s' "$resp" | json_extract '.result[0].id')"
+    [[ -n "$record_id" && "$record_id" != null ]] || return 1
+    echo "$record_id"
+}
+ddns_setup() {
+    local token zone record proxied ttl zone_id record_id public_ip create_payload update_payload tmp
+    ensure_jq_or_python || { msg_err "缺少 jq/python3，无法配置 DDNS。"; return 1; }
+    read -rp "Cloudflare API Token: " token
+    read -rp "Zone 名称（例如 example.com）: " zone
+    read -rp "记录全名（例如 home.example.com）: " record
+    read -rp "是否启用代理（true/false，默认 false）: " proxied
+    read -rp "TTL（默认 120）: " ttl
+    [[ -n "$token" && -n "$zone" && -n "$record" ]] || { msg_err "Token / Zone / 记录名不能为空。"; return 1; }
+    [[ "$proxied" == "true" || "$proxied" == "false" ]] || proxied=false
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=120
+    public_ip="$(ddns_detect_public_ip)" || { msg_err "获取公网 IP 失败。"; return 1; }
+    tmp="$(mktemp /tmp/my-ddns.XXXXXX)" || return 1
+    cat > "$tmp" <<EOF_CFG
+CF_API_TOKEN=${token}
+CF_ZONE_NAME=${zone}
+RECORD_NAME=${record}
+PROXIED=${proxied}
+TTL=${ttl}
+EOF_CFG
+    mv -f "$tmp" "$DDNS_CFG_FILE"
+    chmod 600 "$DDNS_CFG_FILE" 2>/dev/null || true
+    zone_id="$(ddns_cf_resolve_zone_id)" || { msg_err "获取 Cloudflare Zone ID 失败。"; return 1; }
+    sed -i "/^ZONE_ID=/d" "$DDNS_CFG_FILE"
+    printf 'ZONE_ID=%s\n' "$zone_id" >> "$DDNS_CFG_FILE"
+    source "$DDNS_CFG_FILE"
+    record_id="$(ddns_cf_resolve_record_id "$zone_id" 2>/dev/null || true)"
+    if [[ -n "$record_id" ]]; then
+        sed -i "/^RECORD_ID=/d" "$DDNS_CFG_FILE"
+        printf 'RECORD_ID=%s\n' "$record_id" >> "$DDNS_CFG_FILE"
+    else
+        create_payload=$(printf '{"type":"A","name":"%s","content":"%s","ttl":%s,"proxied":%s}' "$record" "$public_ip" "$ttl" "$proxied")
+        record_id="$(cf_api_call POST "/zones/${zone_id}/dns_records" "$create_payload" 2>/dev/null | json_extract '.result.id')"
+        [[ -n "$record_id" && "$record_id" != null ]] || { msg_err "创建 DDNS 记录失败。"; return 1; }
+        printf 'RECORD_ID=%s\n' "$record_id" >> "$DDNS_CFG_FILE"
+    fi
+    ddns_update_now || return 1
+    ddns_install_cron
+    msg_ok "DDNS 已配置完成。"
+}
+ddns_update_now() {
+    local public_ip resp current_ip payload record_id zone_id
+    [[ -s "$DDNS_CFG_FILE" ]] || { msg_err "DDNS 未配置。"; return 1; }
+    source "$DDNS_CFG_FILE" || return 1
+    public_ip="$(ddns_detect_public_ip)" || { msg_err "获取公网 IP 失败。"; return 1; }
+    zone_id="${ZONE_ID:-$(ddns_cf_resolve_zone_id)}"
+    record_id="${RECORD_ID:-$(ddns_cf_resolve_record_id "$zone_id" 2>/dev/null || true)}"
+    [[ -n "$record_id" ]] || { msg_err "获取记录 ID 失败。"; return 1; }
+    resp="$(cf_api_call GET "/zones/${zone_id}/dns_records/${record_id}" 2>/dev/null)" || { msg_err "读取当前 DDNS 记录失败。"; return 1; }
+    current_ip="$(printf '%s' "$resp" | json_extract '.result.content')"
+    if [[ "$current_ip" == "$public_ip" ]]; then
+        printf '%s IP unchanged %s\n' "$(date '+%F %T')" "$public_ip" >> "$DDNS_LOG_FILE"
+        msg_ok "DDNS 无需更新，当前 IP：${public_ip}"
+        return 0
+    fi
+    payload=$(printf '{"type":"A","name":"%s","content":"%s","ttl":%s,"proxied":%s}' "$RECORD_NAME" "$public_ip" "$TTL" "$PROXIED")
+    resp="$(cf_api_call PUT "/zones/${zone_id}/dns_records/${record_id}" "$payload" 2>/dev/null)" || { msg_err "DDNS 更新请求失败。"; return 1; }
+    if [[ "$(printf '%s' "$resp" | json_extract '.success')" == "true" ]]; then
+        printf '%s updated %s\n' "$(date '+%F %T')" "$public_ip" >> "$DDNS_LOG_FILE"
+        sed -i "/^ZONE_ID=/d;/^RECORD_ID=/d" "$DDNS_CFG_FILE"
+        printf 'ZONE_ID=%s\nRECORD_ID=%s\n' "$zone_id" "$record_id" >> "$DDNS_CFG_FILE"
+        msg_ok "DDNS 已更新为：${public_ip}"
+        return 0
+    fi
+    msg_err "DDNS 更新失败。"
+    return 1
+}
+ddns_install_cron() {
+    local tmp line
+    [[ -s "$DDNS_CFG_FILE" ]] || return 1
+    tmp="$(mktemp /tmp/my-ddns-cron.XXXXXX)" || return 1
+    crontab -l 2>/dev/null | grep -v '/usr/local/bin/my ddns update' > "$tmp" || true
+    line="*/5 * * * * /usr/local/bin/my ddns update >/dev/null 2>&1"
+    echo "$line" >> "$tmp"
+    crontab "$tmp" 2>/dev/null || true
+    rm -f "$tmp"
+    msg_ok "DDNS 定时任务已安装。"
+}
+ddns_remove() {
+    cron_remove_regex '/usr/local/bin/my ddns update'
+    rm -f "$DDNS_CFG_FILE" "$DDNS_LOG_FILE" 2>/dev/null || true
+    msg_ok "DDNS 配置与定时任务已移除。"
+}
+ddns_status() {
+    if [[ ! -s "$DDNS_CFG_FILE" ]]; then
+        msg_warn "DDNS 未配置。"
+        return 0
+    fi
+    source "$DDNS_CFG_FILE" || return 1
+    echo -e "记录名: ${YELLOW}${RECORD_NAME}${RESET}"
+    echo -e "Zone: ${YELLOW}${CF_ZONE_NAME}${RESET}"
+    echo -e "代理: ${YELLOW}${PROXIED}${RESET}"
+    echo -e "TTL: ${YELLOW}${TTL}${RESET}"
+    echo -e "公网 IP: ${YELLOW}$(ddns_detect_public_ip 2>/dev/null || echo 获取失败)${RESET}"
+    [[ -f "$DDNS_LOG_FILE" ]] && tail -n 5 "$DDNS_LOG_FILE" 2>/dev/null | sed 's/^/日志: /'
 }
 
 legacy_cleanup() {
@@ -641,11 +936,7 @@ uninstall_menu() {
         case "$choice" in
             1) legacy_cleanup; read -n 1 -s -r -p "按任意键继续..." ;;
             2) daily_clean; msg_ok "清理完成。"; read -n 1 -s -r -p "按任意键继续..." ;;
-            3)
-                rm -f /usr/local/bin/my
-                msg_ok "已删除 /usr/local/bin/my。"
-                exit 0
-                ;;
+            3) rm -f /usr/local/bin/my; msg_ok "已删除 /usr/local/bin/my。"; exit 0 ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
         esac
@@ -654,34 +945,37 @@ uninstall_menu() {
 
 status_page_loop() {
     while true; do
-        local dns dns_servers
+        local dns dns_servers optmode
         dns="$(get_dns_brief_status 2>/dev/null || echo 未知)"
         dns_servers="$(get_dns_servers_brief 2>/dev/null || echo 未探测到)"
+        optmode="$(status_opt_mode)"
         clear 2>/dev/null || true
         echo -e "${CYAN}============================================================${RESET}"
         echo -e "${CYAN}                    统一状态页 / 管理导航                   ${RESET}"
         echo -e "${CYAN}============================================================${RESET}"
         echo -e "${GREEN}网络调优${RESET}"
+        echo -e "  优化档位: ${YELLOW}${optmode}${RESET}"
         echo -e "  拥塞控制 / 队列: $(status_cc_colored)"
         status_timesync_line
         echo -e "  DNS: ${YELLOW}${dns}${RESET} / 当前 ${YELLOW}${dns_servers}${RESET}"
         echo -e ""
-        echo -e "${GREEN}Nginx 与建站${RESET}"
+        echo -e "${GREEN}Nginx 与服务${RESET}"
         status_nginx_line
+        status_ddns_line
         echo -e ""
         echo -e "${GREEN}系统基础${RESET}"
         status_ssh_line
         echo -e ""
         echo -e "${CYAN}快捷导航${RESET}"
-        echo -e "  ${YELLOW}1.${RESET} 优化与系统中心      ${YELLOW}3.${RESET} DD / 重装系统中心"
-        echo -e "  ${YELLOW}2.${RESET} Nginx 反向代理      ${YELLOW}4.${RESET} 刷新状态页"
+        echo -e "  ${YELLOW}1.${RESET} 优化中心          ${YELLOW}3.${RESET} DDNS / 建站 / DD 中心"
+        echo -e "  ${YELLOW}2.${RESET} 刷新 GitHub 密钥   ${YELLOW}4.${RESET} 刷新状态页"
         echo -e "  0. 返回主菜单"
         echo -e "${CYAN}============================================================${RESET}"
         read -rp "请输入数字 [0-4]: " choice
         case "$choice" in
-            1) system_menu ;;
-            2) nginx_menu ;;
-            3) dd_menu ;;
+            1) optimize_menu ;;
+            2) github_keys_auto_fetch; read -n 1 -s -r -p "按任意键继续..." ;;
+            3) services_menu ;;
             4) ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
@@ -689,35 +983,39 @@ status_page_loop() {
     done
 }
 
-system_menu() {
+optimize_menu() {
     while true; do
         clear 2>/dev/null || true
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}              优化与系统中心              ${RESET}"
+        echo -e "${CYAN}                优化中心                    ${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 应用系统网络优化"
-        echo -e "${YELLOW} 2.${RESET} DNS 智能调优"
-        echo -e "${YELLOW} 3.${RESET} 手动设置 DNS"
-        echo -e "${YELLOW} 4.${RESET} 查看 DNS 状态"
-        echo -e "${YELLOW} 5.${RESET} 恢复 DNS"
-        echo -e "${YELLOW} 6.${RESET} 修改 SSH 端口"
-        echo -e "${YELLOW} 7.${RESET} 修改 root 密码"
-        echo -e "${YELLOW} 8.${RESET} 关闭 SSH 密码登录"
-        echo -e "${YELLOW} 9.${RESET} 恢复 SSH 密码登录"
-        echo -e "${YELLOW}10.${RESET} 运行日常清理"
+        echo -e "${YELLOW} 1.${RESET} 常规机器极致优化"
+        echo -e "${YELLOW} 2.${RESET} NAT 小鸡极致优化"
+        echo -e "${YELLOW} 3.${RESET} DNS 智能调优（防卡死版）"
+        echo -e "${YELLOW} 4.${RESET} 手动设置 DNS"
+        echo -e "${YELLOW} 5.${RESET} 查看 DNS 状态"
+        echo -e "${YELLOW} 6.${RESET} 恢复 DNS"
+        echo -e "${YELLOW} 7.${RESET} 自动获取 GitHub 主机密钥"
+        echo -e "${YELLOW} 8.${RESET} 修改 SSH 端口"
+        echo -e "${YELLOW} 9.${RESET} 修改 root 密码"
+        echo -e "${YELLOW}10.${RESET} 关闭 SSH 密码登录"
+        echo -e "${YELLOW}11.${RESET} 恢复 SSH 密码登录"
+        echo -e "${YELLOW}12.${RESET} 运行日常清理"
         echo -e " 0. 返回"
-        read -rp "请输入数字 [0-10]: " choice
+        read -rp "请输入数字 [0-12]: " choice
         case "$choice" in
-            1) apply_sysctl_optimizer; msg_ok "系统网络优化已应用。"; read -n 1 -s -r -p "按任意键继续..." ;;
-            2) dns_auto_tune; read -n 1 -s -r -p "按任意键继续..." ;;
-            3) dns_manual_set; read -n 1 -s -r -p "按任意键继续..." ;;
-            4) dns_status; read -n 1 -s -r -p "按任意键继续..." ;;
-            5) dns_unlock_restore; read -n 1 -s -r -p "按任意键继续..." ;;
-            6) change_ssh_port; read -n 1 -s -r -p "按任意键继续..." ;;
-            7) change_root_password; read -n 1 -s -r -p "按任意键继续..." ;;
-            8) disable_password_login; read -n 1 -s -r -p "按任意键继续..." ;;
-            9) restore_password_login; read -n 1 -s -r -p "按任意键继续..." ;;
-            10) daily_clean; msg_ok "清理完成。"; read -n 1 -s -r -p "按任意键继续..." ;;
+            1) apply_general_extreme_opt && msg_ok "常规机器极致优化已应用。"; read -n 1 -s -r -p "按任意键继续..." ;;
+            2) apply_nat_extreme_opt && msg_ok "NAT 小鸡极致优化已应用。"; read -n 1 -s -r -p "按任意键继续..." ;;
+            3) dns_auto_tune; read -n 1 -s -r -p "按任意键继续..." ;;
+            4) dns_manual_set; read -n 1 -s -r -p "按任意键继续..." ;;
+            5) dns_status; read -n 1 -s -r -p "按任意键继续..." ;;
+            6) dns_unlock_restore; read -n 1 -s -r -p "按任意键继续..." ;;
+            7) github_keys_auto_fetch; read -n 1 -s -r -p "按任意键继续..." ;;
+            8) change_ssh_port; read -n 1 -s -r -p "按任意键继续..." ;;
+            9) change_root_password; read -n 1 -s -r -p "按任意键继续..." ;;
+            10) disable_password_login; read -n 1 -s -r -p "按任意键继续..." ;;
+            11) restore_password_login; read -n 1 -s -r -p "按任意键继续..." ;;
+            12) daily_clean; msg_ok "清理完成。"; read -n 1 -s -r -p "按任意键继续..." ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
         esac
@@ -749,6 +1047,31 @@ nginx_menu() {
     done
 }
 
+ddns_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${CYAN}                 DDNS 中心                 ${RESET}"
+        echo -e "${CYAN}============================================${RESET}"
+        echo -e "${YELLOW} 1.${RESET} 配置 Cloudflare DDNS"
+        echo -e "${YELLOW} 2.${RESET} 立即更新 DDNS"
+        echo -e "${YELLOW} 3.${RESET} 查看 DDNS 状态"
+        echo -e "${YELLOW} 4.${RESET} 安装 / 重装 DDNS 定时任务"
+        echo -e "${YELLOW} 5.${RESET} 删除 DDNS 配置"
+        echo -e " 0. 返回"
+        read -rp "请输入数字 [0-5]: " choice
+        case "$choice" in
+            1) ddns_setup; read -n 1 -s -r -p "按任意键继续..." ;;
+            2) ddns_update_now; read -n 1 -s -r -p "按任意键继续..." ;;
+            3) ddns_status; read -n 1 -s -r -p "按任意键继续..." ;;
+            4) ddns_install_cron; read -n 1 -s -r -p "按任意键继续..." ;;
+            5) ddns_remove; read -n 1 -s -r -p "按任意键继续..." ;;
+            0) return ;;
+            *) msg_err "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
 fetch_reinstall_script() {
     mkdir -p "$REINSTALL_WORKDIR" 2>/dev/null || true
     download_to "$REINSTALL_UPSTREAM_GLOBAL" "$REINSTALL_SCRIPT_PATH" || download_to "$REINSTALL_UPSTREAM_CN" "$REINSTALL_SCRIPT_PATH" || return 1
@@ -767,37 +1090,28 @@ dd_menu() {
         echo -e " 0. 返回"
         read -rp "请输入数字 [0-3]: " choice
         case "$choice" in
-            1)
-                fetch_reinstall_script || { msg_err "下载重装脚本失败。"; read -n 1 -s -r -p "按任意键继续..."; continue; }
-                bash "$REINSTALL_SCRIPT_PATH" debian 13
-                ;;
-            2)
-                fetch_reinstall_script || { msg_err "下载重装脚本失败。"; read -n 1 -s -r -p "按任意键继续..."; continue; }
-                bash "$REINSTALL_SCRIPT_PATH" debian 12
-                ;;
-            3)
-                fetch_reinstall_script || { msg_err "下载重装脚本失败。"; read -n 1 -s -r -p "按任意键继续..."; continue; }
-                bash "$REINSTALL_SCRIPT_PATH" ubuntu 24.04
-                ;;
+            1) fetch_reinstall_script || { msg_err "下载重装脚本失败。"; read -n 1 -s -r -p "按任意键继续..."; continue; }; bash "$REINSTALL_SCRIPT_PATH" debian 13 ;;
+            2) fetch_reinstall_script || { msg_err "下载重装脚本失败。"; read -n 1 -s -r -p "按任意键继续..."; continue; }; bash "$REINSTALL_SCRIPT_PATH" debian 12 ;;
+            3) fetch_reinstall_script || { msg_err "下载重装脚本失败。"; read -n 1 -s -r -p "按任意键继续..."; continue; }; bash "$REINSTALL_SCRIPT_PATH" ubuntu 24.04 ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
         esac
     done
 }
 
-comprehensive_menu() {
+services_menu() {
     while true; do
         clear 2>/dev/null || true
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}              系统与建站中心              ${RESET}"
+        echo -e "${CYAN}            DDNS / 建站 / DD 中心          ${RESET}"
         echo -e "${CYAN}============================================${RESET}"
-        echo -e "${YELLOW} 1.${RESET} 优化与系统中心"
+        echo -e "${YELLOW} 1.${RESET} DDNS 中心"
         echo -e "${YELLOW} 2.${RESET} Nginx 建站与反代"
-        echo -e "${GREEN} 3.${RESET} DD / 重装系统"
+        echo -e "${YELLOW} 3.${RESET} DD / 重装系统"
         echo -e " 0. 返回"
         read -rp "请输入数字 [0-3]: " choice
         case "$choice" in
-            1) system_menu ;;
+            1) ddns_menu ;;
             2) nginx_menu ;;
             3) dd_menu ;;
             0) return ;;
@@ -809,11 +1123,11 @@ comprehensive_menu() {
 main_menu() {
     clear 2>/dev/null || true
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${CYAN}            my 优化专用版 v${MY_VERSION}${RESET}"
+    echo -e "${CYAN}          my 优化专用版 v${MY_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${YELLOW} 1.${RESET} 状态页 / 快捷导航"
-    echo -e "${YELLOW} 2.${RESET} 优化与系统中心"
-    echo -e "${YELLOW} 3.${RESET} 系统与建站中心"
+    echo -e "${YELLOW} 2.${RESET} 优化中心"
+    echo -e "${YELLOW} 3.${RESET} DDNS / 建站 / DD 中心"
     echo -e "${YELLOW} 4.${RESET} 脚本更新"
     echo -e "${YELLOW} 5.${RESET} 清理残留 / 卸载"
     echo -e " 0. 退出"
@@ -821,8 +1135,8 @@ main_menu() {
     read -rp "请输入数字 [0-5]: " choice
     case "$choice" in
         1) status_page_loop ;;
-        2) system_menu ;;
-        3) comprehensive_menu ;;
+        2) optimize_menu ;;
+        3) services_menu ;;
         4) github_update; read -n 1 -s -r -p "按任意键继续..." ;;
         5) uninstall_menu ;;
         0) exit 0 ;;
@@ -842,6 +1156,7 @@ init() {
 if [[ $# -gt 0 ]]; then
     require_root
     ensure_state_dirs
+    ensure_base_tools
     install_self_command
     case "$1" in
         clean|daily_clean)
@@ -852,19 +1167,14 @@ if [[ $# -gt 0 ]]; then
             status_page_loop
             exit 0
             ;;
-        system|sys)
+        optimize)
             shift
-            if [[ "${1:-}" == "menu" || -z "${1:-}" ]]; then
-                system_menu
-            else
-                case "$1" in
-                    optimize) apply_sysctl_optimizer ;;
-                    ssh-port) change_ssh_port ;;
-                    disable-passwd) disable_password_login ;;
-                    enable-passwd) restore_password_login ;;
-                    *) msg_err "未知 system 子命令"; exit 1 ;;
-                esac
-            fi
+            case "${1:-menu}" in
+                menu) optimize_menu ;;
+                general) apply_general_extreme_opt ;;
+                nat) apply_nat_extreme_opt ;;
+                *) msg_err "未知 optimize 子命令"; exit 1 ;;
+            esac
             exit $?
             ;;
         dns)
@@ -878,6 +1188,25 @@ if [[ $# -gt 0 ]]; then
             esac
             exit $?
             ;;
+        github)
+            shift
+            case "${1:-keys}" in
+                keys|known-hosts) github_keys_auto_fetch ;;
+                *) msg_err "未知 github 子命令"; exit 1 ;;
+            esac
+            exit $?
+            ;;
+        ssh)
+            shift
+            case "${1:-menu}" in
+                port) change_ssh_port ;;
+                passwd) change_root_password ;;
+                disable-passwd) disable_password_login ;;
+                enable-passwd) restore_password_login ;;
+                *) msg_err "未知 ssh 子命令"; exit 1 ;;
+            esac
+            exit $?
+            ;;
         nginx)
             shift
             case "${1:-menu}" in
@@ -887,6 +1216,19 @@ if [[ $# -gt 0 ]]; then
                 delete) shift; nginx_delete_site "$1" ;;
                 repair) nginx_repair ;;
                 *) msg_err "未知 nginx 子命令"; exit 1 ;;
+            esac
+            exit $?
+            ;;
+        ddns)
+            shift
+            case "${1:-menu}" in
+                menu) ddns_menu ;;
+                setup) ddns_setup ;;
+                update) ddns_update_now ;;
+                status) ddns_status ;;
+                install-cron) ddns_install_cron ;;
+                remove) ddns_remove ;;
+                *) msg_err "未知 ddns 子命令"; exit 1 ;;
             esac
             exit $?
             ;;
@@ -903,7 +1245,7 @@ if [[ $# -gt 0 ]]; then
             exit $?
             ;;
         *)
-            msg_err "未知参数。可用：my status | my system <menu|optimize|ssh-port|disable-passwd|enable-passwd> | my dns <auto|manual|status|restore> | my nginx <menu|install|list|delete 域名|repair> | my dd | my update | my purge"
+            msg_err "未知参数。可用：my status | my optimize <menu|general|nat> | my dns <auto|manual|status|restore> | my github keys | my ssh <port|passwd|disable-passwd|enable-passwd> | my nginx <menu|install|list|delete 域名|repair> | my ddns <menu|setup|update|status|install-cron|remove> | my dd | my update | my purge"
             exit 1
             ;;
     esac
