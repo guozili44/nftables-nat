@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # ==========================================
-# nftables 端口转发管理面板 (Pro 稳定优化版)
+# nftables 端口转发管理面板 (Pro 极限性能版)
+# 包含: BBR + TCP MSS + Conntrack调优 + Flowtable
 # ==========================================
 
 set -o pipefail
@@ -16,9 +17,6 @@ CONFIG_FILE="/etc/nft_forward_list.conf"
 SETTINGS_FILE="/etc/nft_forward_settings.conf"
 
 NFT_MGR_DIR="/etc/nftables.d"
-# 持久化兼容模式（解决部分“节点管理/面板”只认 /etc/nftables.conf 的问题）
-#  - service: 使用 nft-mgr oneshot service 加载 /etc/nftables.d/nft_mgr.conf（默认，最不干扰系统）
-#  - system : 向 /etc/nftables.conf 注入 include "/etc/nftables.d/nft_mgr.conf" 并用 nftables.service 持久化（兼容性更好）
 NFTABLES_CONF="/etc/nftables.conf"
 NFTABLES_CREATED_MARK="/etc/nftables.conf.nftmgr_created"
 PERSIST_MODE_DEFAULT="service"
@@ -34,7 +32,7 @@ CMD_NAME="nf"
 
 
 # --------------------------
-# 设置读写（用于持久化模式开关）
+# 设置读写
 # --------------------------
 settings_get() {
     local key="$1"
@@ -79,9 +77,7 @@ script_realpath() {
     fi
 }
 
-# 基础工具
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
 
 # --------------------------
 # 环境与依赖
@@ -91,17 +87,15 @@ require_root() {
 }
 
 check_env() {
-    # 仅检查依赖，不自动安装，避免产生额外外连和系统改动
     local need=0
-    for c in nft dig curl flock ss sysctl; do
+    for c in nft dig curl flock ss sysctl ip; do
         have_cmd "$c" || need=1
     done
     if [[ $need -eq 1 ]]; then
-        msg_warn "缺少依赖，请手动安装：nftables dnsutils(bind-utils) curl util-linux iproute2/iproute"
+        msg_warn "缺少依赖，请手动安装：nftables dnsutils(bind-utils) curl util-linux iproute2"
     fi
 
-    # 再次检查
-    for c in nft dig curl flock ss sysctl; do
+    for c in nft dig curl flock ss sysctl ip; do
         have_cmd "$c" || msg_warn "⚠️ 未找到依赖命令: $c（部分功能可能不可用）"
     done
 
@@ -125,7 +119,6 @@ install_global_command() {
 # 锁（防并发踩踏）
 # --------------------------
 with_lock() {
-    # 用法：with_lock <func> [args...]
     if have_cmd flock; then
         (
             flock -n 200 || { msg_warn "⚠️ 任务繁忙：已有实例在运行，已跳过本次操作。"; exit 99; }
@@ -139,27 +132,19 @@ with_lock() {
 }
 
 # --------------------------
-# 参数/输入校验
-# --------------------------
-# DDNS 定时任务辅助函数（默认不自动启用，由用户手动开启）
+# 参数/输入校验与 DDNS 工具
 # --------------------------
 ensure_ddns_cron_enabled() {
     local script_path="/usr/local/bin/${CMD_NAME}"
     [[ -x "$script_path" ]] || script_path="$(script_realpath)"
-
-    # 已存在则不重复添加
     if crontab -l 2>/dev/null | grep -Fq "${script_path} --cron"; then
         return 0
     fi
-
-    # 追加定时任务：每 5 分钟运行一次 DDNS 更新
     (crontab -l 2>/dev/null; echo "*/5 * * * * ${script_path} --cron > /dev/null 2>&1") | crontab - 2>/dev/null || true
     return 0
 }
 
-
 has_domain_rules() {
-    # 如果配置中仍存在“目标为域名（非纯 IPv4）”的规则，则返回 0，否则返回 1
     while IFS='|' read -r lp addr tp last_ip proto; do
         [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
         [[ -z "$addr" ]] && continue
@@ -171,7 +156,6 @@ has_domain_rules() {
 }
 
 remove_ddns_cron_task() {
-    # 删除所有 nf/nftmgr --cron 的 crontab 行（避免路径差异导致残留）
     local cur
     cur="$(crontab -l 2>/dev/null || true)"
     [[ -z "$cur" ]] && return 0
@@ -180,15 +164,11 @@ remove_ddns_cron_task() {
 }
 
 ensure_ddns_cron_disabled_if_unused() {
-    # 当已无域名转发规则时，自动清理 DDNS 定时任务，避免 crontab 冗余
     if has_domain_rules; then
         return 0
     fi
-
-    # 已无域名规则 -> 清理任务
     local script_path="/usr/local/bin/${CMD_NAME}"
     [[ -x "$script_path" ]] || script_path="$(script_realpath)"
-
     if crontab -l 2>/dev/null | grep -Fq "${script_path} --cron" || crontab -l 2>/dev/null | grep -Eq '(^|\s)(/usr/local/bin/(nf|nftmgr)|(nf|nftmgr))\s+--cron(\s|$)'; then
         remove_ddns_cron_task
         msg_info "已无域名转发规则：已自动移除 DDNS 定时检测任务（crontab）。"
@@ -196,8 +176,6 @@ ensure_ddns_cron_disabled_if_unused() {
     return 0
 }
 
-
-# --------------------------
 is_port() {
     local p="$1"
     [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
@@ -217,28 +195,24 @@ normalize_proto() {
     esac
 }
 
-# --------------------------
-# DNS 解析
-# --------------------------
 get_ip() {
     local addr="$1"
     if is_ipv4 "$addr"; then
         echo "$addr"
         return 0
     fi
-    # 更稳健：限制超时/尝试次数，优先取第一条 A
     dig +time=2 +tries=1 +short -4 A "$addr" 2>/dev/null \
         | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
         | head -n 1
 }
 
 # --------------------------
-# 防火墙放行（优先 ufw/firewalld；避免强行改 nft 防火墙）
+# 防火墙放行
 # --------------------------
 manage_firewall() {
-    local action="$1"  # add|del
+    local action="$1"
     local port="$2"
-    local proto="$3"   # tcp|udp|both
+    local proto="$3"
     proto="$(normalize_proto "$proto")"
 
     if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
@@ -263,18 +237,13 @@ manage_firewall() {
         firewall-cmd --reload >/dev/null 2>&1
         return 0
     fi
-
     return 0
 }
 
 # --------------------------
-# sysctl 写入（只写本脚本自己的文件）
-
-# --------------------------
-# 持久化兼容：/etc/nftables.conf include 注入/回滚
+# 持久化兼容：/etc/nftables.conf
 # --------------------------
 nftables_conf_includes_mgr() {
-    # 已经包含 nft_mgr.conf 或通配包含 /etc/nftables.d/*.conf
     [[ -f "$NFTABLES_CONF" ]] || return 1
     grep -E '^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/\*\.conf"?[[:space:]]*$' "$NFTABLES_CONF" >/dev/null 2>&1 && return 0
     grep -E '^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/nft_mgr\.conf"?[[:space:]]*$' "$NFTABLES_CONF" >/dev/null 2>&1 && return 0
@@ -282,7 +251,6 @@ nftables_conf_includes_mgr() {
 }
 
 enable_persist_system() {
-    # 兼容模式：把 nft_mgr.conf 纳入 nftables.service 的持久化体系
     mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
     [[ -f "$NFT_MGR_CONF" ]] || generate_empty_conf "$NFT_MGR_CONF"
 
@@ -292,7 +260,6 @@ enable_persist_system() {
     fi
 
     if [[ ! -f "$NFTABLES_CONF" ]]; then
-        # 最小化创建（不 flush ruleset，避免破坏系统其它规则；如你本来就有系统防火墙规则，请手动合并）
         cat > "$NFTABLES_CONF" << EOF
 #!/usr/sbin/nft -f
 # generated by nf (compat mode)
@@ -301,19 +268,14 @@ EOF
         chmod 644 "$NFTABLES_CONF" 2>/dev/null || true
         echo "1" > "$NFTABLES_CREATED_MARK" 2>/dev/null || true
     else
-        # 备份并注入 include
         local bak="${NFTABLES_CONF}.nftmgr.bak.$(date +%s)"
         cp -a "$NFTABLES_CONF" "$bak" 2>/dev/null || true
 
         if ! nftables_conf_includes_mgr; then
-            printf "
-# nf include (added %s)
-include "%s"
-" "$(date '+%F %T')" "$NFT_MGR_CONF" >> "$NFTABLES_CONF"
+            printf "\n# nf include (added %s)\ninclude \"%s\"\n" "$(date '+%F %T')" "$NFT_MGR_CONF" >> "$NFTABLES_CONF"
         fi
     fi
 
-    # 校验 & 启用 nftables 持久化
     if have_cmd nft; then
         if ! nft -c -f "$NFTABLES_CONF" >/dev/null 2>&1; then
             msg_err "❌ 注入后 ${NFTABLES_CONF} 语法校验失败，已保留备份文件，请手动检查。"
@@ -324,10 +286,8 @@ include "%s"
     if have_cmd systemctl; then
         systemctl enable --now nftables >/dev/null 2>&1 || true
         systemctl restart nftables >/dev/null 2>&1 || true
-        # 为避免双重加载导致困惑，兼容模式下默认停用 nft-mgr oneshot
         systemctl disable --now nft-mgr >/dev/null 2>&1 || true
     else
-        # 无 systemd：至少立即加载一次
         nft -f "$NFTABLES_CONF" >/dev/null 2>&1 || true
     fi
     PERSIST_MODE="system"
@@ -336,7 +296,6 @@ include "%s"
 }
 
 enable_persist_service() {
-    # 回到默认：由 nft-mgr oneshot service 负责持久化加载
     if have_cmd systemctl; then
         ensure_nft_mgr_service
         systemctl enable --now nft-mgr >/dev/null 2>&1 || true
@@ -346,37 +305,8 @@ enable_persist_service() {
     return 0
 }
 
-persist_status() {
-    echo -e "${CYAN}========= 持久化状态 =========${PLAIN}"
-    echo -e "当前模式: ${YELLOW}${PERSIST_MODE}${PLAIN}"
-    if [[ -f "$NFT_MGR_CONF" ]]; then
-        echo -e "规则文件: ${GREEN}${NFT_MGR_CONF}${PLAIN}"
-    else
-        echo -e "规则文件: ${RED}${NFT_MGR_CONF} 不存在${PLAIN}"
-    fi
-    if [[ -f "$NFTABLES_CONF" ]]; then
-        if nftables_conf_includes_mgr; then
-            echo -e "/etc/nftables.conf: ${GREEN}已包含 nf 规则（include）${PLAIN}"
-        else
-            echo -e "/etc/nftables.conf: ${YELLOW}未包含 nf include${PLAIN}"
-        fi
-    else
-        echo -e "/etc/nftables.conf: ${YELLOW}不存在${PLAIN}"
-    fi
-    if have_cmd systemctl; then
-        systemctl is-enabled nftables >/dev/null 2>&1 && echo -e "nftables.service: ${GREEN}enabled${PLAIN}" || echo -e "nftables.service: ${YELLOW}disabled${PLAIN}"
-        systemctl is-enabled nft-mgr >/dev/null 2>&1 && echo -e "nft-mgr.service: ${GREEN}enabled${PLAIN}" || echo -e "nft-mgr.service: ${YELLOW}disabled${PLAIN}"
-    fi
-    echo -e "${CYAN}==============================${PLAIN}"
-}
-
 auto_persist_setup() {
-    # 自动检测并完成持久化设置（无需菜单项）
-    # 优先规则：
-    #  1) 若系统启用了 nftables.service 或 /etc/nftables.conf 已 include nft_mgr.conf -> system 模式
-    #  2) 否则使用 nft-mgr.service（service 模式）
     PERSIST_MODE="$PERSIST_MODE_DEFAULT"
-
     if [[ -f "$NFTABLES_CONF" ]] && nftables_conf_includes_mgr; then
         PERSIST_MODE="system"
     elif have_cmd systemctl && systemctl is-enabled nftables >/dev/null 2>&1; then
@@ -389,6 +319,9 @@ auto_persist_setup() {
         enable_persist_service >/dev/null 2>&1 || true
     fi
 }
+
+# --------------------------
+# 极限网络调优 (sysctl + conntrack)
 # --------------------------
 sysctl_set_kv() {
     local key="$1"; local value="$2"
@@ -417,35 +350,32 @@ bbr_available() {
 
 optimize_system() {
     clear
-    echo -e "${GREEN}--- 系统优化 (BBR + 转发 + 自启动) ---${PLAIN}"
-    echo "1) 稳定推荐：仅开启转发 + 尝试启用 BBR"
-    echo "2) 性能增强：在 1 的基础上，适度提升队列/并发（偏高负载）"
-    echo "0) 返回"
-    echo "--------------------------------"
-    read -rp "请选择 [0-2]: " pick
+    echo -e "${GREEN}--- 系统优化 (极限性能版：BBR + 连接跟踪极限调优) ---${PLAIN}"
+    echo "此操作将写入防丢包、抗高并发的极限底层参数。"
+    read -rp "确认应用优化配置？[y/N]: " pick
+    [[ "$pick" != "y" && "$pick" != "Y" ]] && return
 
-    case "$pick" in
-        0) return ;;
-        1|2) ;;
-        *) msg_err "无效选项"; sleep 1; return ;;
-    esac
+    echo -e "${CYAN}正在载入并写入 sysctl 内核配置...${PLAIN}"
+    # 确保 conntrack 模块加载
+    modprobe nf_conntrack 2>/dev/null || modprobe ip_conntrack 2>/dev/null || true
 
-    echo -e "${CYAN}正在写入 sysctl 配置...${PLAIN}"
     sysctl_set_kv "net.ipv4.ip_forward" "1"
 
-    # BBR: 仅在内核支持时写入，避免误导
     if bbr_available; then
         sysctl_set_kv "net.core.default_qdisc" "fq"
         sysctl_set_kv "net.ipv4.tcp_congestion_control" "bbr"
     else
-        msg_warn "⚠️ 当前内核未检测到 bbr（将仅启用转发）。"
+        msg_warn "⚠️ 当前内核未检测到 bbr 模块（将仅启用其他优化）。"
     fi
 
-    if [[ "$pick" == "2" ]]; then
-        sysctl_set_kv "net.core.somaxconn" "8192"
-        sysctl_set_kv "net.core.netdev_max_backlog" "8192"
-        sysctl_set_kv "fs.file-max" "524288"
-    fi
+    # 极限并发与连接跟踪调优
+    sysctl_set_kv "net.core.somaxconn" "32768"
+    sysctl_set_kv "net.core.netdev_max_backlog" "32768"
+    sysctl_set_kv "fs.file-max" "1048576"
+    sysctl_set_kv "net.ipv4.ip_local_port_range" "1024 65535"
+    sysctl_set_kv "net.netfilter.nf_conntrack_max" "1048576"
+    sysctl_set_kv "net.netfilter.nf_conntrack_tcp_timeout_established" "3600"
+    sysctl_set_kv "net.ipv4.tcp_fin_timeout" "15"
 
     sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
 
@@ -455,12 +385,12 @@ optimize_system() {
         ensure_nft_mgr_service
     fi
 
-    msg_ok "✅ 系统优化已应用。"
+    msg_ok "✅ 极限系统优化已应用完成！"
     sleep 2
 }
 
 # --------------------------
-# nft-mgr systemd 持久化服务
+# nft-mgr systemd 服务
 # --------------------------
 ensure_nft_mgr_service() {
     [[ -d "$NFT_MGR_DIR" ]] || mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
@@ -493,13 +423,47 @@ EOF
 }
 
 # --------------------------
-# 生成 nft 配置（只管理自己的表）
+# Flowtable 自动探测
+# --------------------------
+detect_flowtable() {
+    local iface
+    iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}' | head -n 1)
+    if [[ -z "$iface" ]]; then
+        echo "0:"
+        return
+    fi
+    if have_cmd nft; then
+        if nft -c 'table ip test_ft { flowtable f { hook ingress priority 0; devices = { "'"$iface"'" }; }; }' >/dev/null 2>&1; then
+            echo "1:$iface"
+            return
+        fi
+    fi
+    echo "0:"
+}
+
+# --------------------------
+# 生成 nft 配置 (含 Flowtable 与 TCP MSS)
 # --------------------------
 generate_empty_conf() {
     local out="$1"
-    cat > "$out" << 'EOF'
+    local ft_info iface has_ft
+    ft_info=$(detect_flowtable)
+    has_ft="${ft_info%%:*}"
+    iface="${ft_info##*:}"
+
+    cat > "$out" << EOF
 # nft-mgr empty ruleset (generated)
 table ip nft_mgr_nat {
+EOF
+    if [[ "$has_ft" == "1" && -n "$iface" ]]; then
+        cat >> "$out" << EOF
+    flowtable f {
+        hook ingress priority 0;
+        devices = { $iface };
+    }
+EOF
+    fi
+    cat >> "$out" << EOF
     chain prerouting {
         type nat hook prerouting priority -100; policy accept;
     }
@@ -509,49 +473,55 @@ table ip nft_mgr_nat {
     chain forward {
         type filter hook forward priority 0; policy accept;
         tcp flags syn tcp option maxseg size set rt mtu
+EOF
+    if [[ "$has_ft" == "1" ]]; then
+        echo "        ip protocol { tcp, udp } flow offload @f" >> "$out"
+    fi
+    cat >> "$out" << EOF
     }
 }
 EOF
     chmod 600 "$out" 2>/dev/null || true
 }
 
-
 generate_nft_conf() {
     local out="$1"
     local any=0
+    local ft_info iface has_ft
+    ft_info=$(detect_flowtable)
+    has_ft="${ft_info%%:*}"
+    iface="${ft_info##*:}"
 
     {
         echo "# nft-mgr ruleset (generated at $(date '+%F %T'))"
         echo "table ip nft_mgr_nat {"
+        
+        # 智能加载 Flowtable
+        if [[ "$has_ft" == "1" && -n "$iface" ]]; then
+            echo "    flowtable f {"
+            echo "        hook ingress priority 0;"
+            echo "        devices = { $iface };"
+            echo "    }"
+        fi
+
         echo "    chain prerouting {"
         echo "        type nat hook prerouting priority -100;"
 
         while IFS='|' read -r lp addr tp last_ip proto; do
             [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
             proto="$(normalize_proto "$proto")"
-            is_port "$lp" || continue
-            is_port "$tp" || continue
-            [[ -z "$addr" ]] && continue
-
-            local ip
-            ip="$last_ip"
+            is_port "$lp" || continue; is_port "$tp" || continue; [[ -z "$addr" ]] && continue
+            local ip="$last_ip"
             [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
             is_ipv4 "$ip" || continue
 
             case "$proto" in
-                tcp)
-                    echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"
-                    any=1
-                    ;;
-                udp)
-                    echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"
-                    any=1
-                    ;;
+                tcp) echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"; any=1 ;;
+                udp) echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"; any=1 ;;
                 both)
                     echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"
                     echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"
-                    any=1
-                    ;;
+                    any=1 ;;
             esac
         done < "$CONFIG_FILE"
 
@@ -562,39 +532,32 @@ generate_nft_conf() {
         while IFS='|' read -r lp addr tp last_ip proto; do
             [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
             proto="$(normalize_proto "$proto")"
-            is_port "$lp" || continue
-            is_port "$tp" || continue
-            [[ -z "$addr" ]] && continue
-
-            local ip
-            ip="$last_ip"
+            is_port "$lp" || continue; is_port "$tp" || continue; [[ -z "$addr" ]] && continue
+            local ip="$last_ip"
             [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
             is_ipv4 "$ip" || continue
 
             case "$proto" in
-                tcp)
-                    echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"
-                    any=1
-                    ;;
-                udp)
-                    echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"
-                    any=1
-                    ;;
+                tcp) echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"; any=1 ;;
+                udp) echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"; any=1 ;;
                 both)
                     echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"
                     echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"
-                    any=1
-                    ;;
+                    any=1 ;;
             esac
         done < "$CONFIG_FILE"
 
         echo "    }"
-        
+
+        # 智能加载 Forward 优化链 (TCP MSS + 硬件卸载)
         echo "    chain forward {"
         echo "        type filter hook forward priority 0; policy accept;"
         echo "        tcp flags syn tcp option maxseg size set rt mtu"
+        if [[ "$has_ft" == "1" ]]; then
+            echo "        ip protocol { tcp, udp } flow offload @f"
+        fi
         echo "    }"
-        
+
         echo "}"
     } > "$out"
 
@@ -603,9 +566,8 @@ generate_nft_conf() {
     return 0
 }
 
-
 # --------------------------
-# 原子化应用规则到内核 + 持久化
+# 原子化应用规则
 # --------------------------
 apply_rules_impl() {
     ensure_forwarding
@@ -627,7 +589,6 @@ apply_rules_impl() {
         return 1
     fi
 
-    # 语法检查
     local chk_err
     chk_err="$(nft -c -f "$tmp" 2>&1)"
     if [[ $? -ne 0 ]]; then
@@ -640,8 +601,6 @@ apply_rules_impl() {
         return 1
     fi
 
-
-    # 应用（只动自己的表）
     nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
     local apply_err
     apply_err="$(nft -f "$tmp" 2>&1)"
@@ -655,8 +614,6 @@ apply_rules_impl() {
         return 1
     fi
 
-
-    # 持久化写入（原子替换）
     mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
     if [[ -f "$NFT_MGR_CONF" ]]; then
         cp -a "$NFT_MGR_CONF" "${NFT_MGR_CONF}.bak.$(date +%s)" 2>/dev/null || true
@@ -664,11 +621,7 @@ apply_rules_impl() {
     mv -f "$tmp" "$NFT_MGR_CONF"
     chmod 600 "$NFT_MGR_CONF" 2>/dev/null || true
 
-    # 持久化策略：
-    #  - service: 启用 nft-mgr oneshot（默认，最不干扰系统）
-    #  - system : 注入 /etc/nftables.conf include，并通过 nftables.service 持久化（兼容部分面板/节点管理）
     if [[ "$PERSIST_MODE" == "system" ]]; then
-        # 仅确保 include 存在，不强行重写系统规则
         enable_persist_system >/dev/null 2>&1 || true
     else
         if have_cmd systemctl; then
@@ -685,27 +638,7 @@ apply_rules_impl() {
 }
 
 apply_rules() {
-    with_lock apply_rules_impl;
-}
-
-# --------------------------
-# 流量格式化
-# --------------------------
-format_bytes() {
-    local bytes="$1"
-    if [[ -z "$bytes" || "$bytes" -eq 0 ]]; then
-        echo "0 B"
-    elif [ "$bytes" -lt 1024 ]; then
-        echo "${bytes} B"
-    elif [ "$bytes" -lt 1048576 ]; then
-        echo "$(( bytes / 1024 )) KB"
-    elif [ "$bytes" -lt 1073741824 ]; then
-        echo "$(( bytes / 1048576 )) MB"
-    elif [ "$bytes" -lt 1099511627776 ]; then
-        awk "BEGIN {printf \"%.2f GB\", $bytes/1073741824}"
-    else
-        awk "BEGIN {printf \"%.2f TB\", $bytes/1099511627776}"
-    fi
+    with_lock apply_rules_impl
 }
 
 # --------------------------
@@ -885,7 +818,7 @@ list_and_del_forward_impl() {
 list_and_del_forward() { with_lock list_and_del_forward_impl; }
 
 # --------------------------
-# DDNS 追踪更新（域名 -> IP 变化） + 严格模式失败通知
+# DDNS 追踪更新
 # --------------------------
 ddns_update_impl() {
     local changed=0
@@ -918,7 +851,6 @@ ddns_update_impl() {
         current_ip="$(get_ip "$addr")"
 
         if [[ -z "$current_ip" ]] && ! is_ipv4 "$addr"; then
-            # 域名解析失败：记录并（严格模式）判定失败
             echo "[$(date '+%H:%M:%S')] [ERROR] 端口 ${lp}: 域名 ${addr} 解析失败（保持 last_ip=${last_ip:-N/A}）" >> "$today_log"
             echo "${lp}|${addr}|${tp}|${last_ip}|${proto}" >> "$temp_file"
             continue
@@ -941,13 +873,11 @@ ddns_update_impl() {
         fi
     fi
 
-    # 日志保留
     find "$LOG_DIR" -type f -name "*.log" -mtime +7 -exec rm -f {} \; 2>/dev/null || true
     return 0
 }
 
 ddns_update() { with_lock ddns_update_impl; }
-
 
 # --------------------------
 # 定时任务管理（DDNS）
@@ -1038,7 +968,7 @@ clear_all_rules_impl() {
     rm -f "$conf_bak" 2>/dev/null || true
     ensure_ddns_cron_disabled_if_unused
 
-msg_ok "✅ 所有规则已清空。"
+    msg_ok "✅ 所有规则已清空。"
     sleep 2
 }
 
@@ -1053,7 +983,6 @@ uninstall_script_impl() {
     read -rp "警告: 此操作将删除本脚本、规则配置、定时任务、systemd 服务，并移除本脚本创建的 nft 表。确认？[y/N]: " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
 
-    # 1) 删除防火墙放行（尽量清理）
     while IFS='|' read -r lp addr tp last_ip proto; do
         [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
         is_port "$lp" || continue
@@ -1061,27 +990,22 @@ uninstall_script_impl() {
         manage_firewall "del" "$lp" "$proto" || true
     done < "$CONFIG_FILE" 2>/dev/null || true
 
-    # 2) 删除 nft 表（仅本脚本的表）
     have_cmd nft && nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
 
-    # 3) 删除 DDNS cron（无论路径差异）
     remove_ddns_cron_task || true
 
-    # 4) systemd：停用并删除 nft-mgr 服务
     if have_cmd systemctl; then
         systemctl disable --now nft-mgr >/dev/null 2>&1 || true
         rm -f "$NFT_MGR_SERVICE" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
-    # 5) 还原 /etc/nftables.conf 中的 include（只删我们添加的 include 行及标注）
     if [[ -f "$NFTABLES_CONF" ]]; then
         sed -i '/# nf include (added .*$/d' "$NFTABLES_CONF" 2>/dev/null || true
         sed -i '/# nftmgr persistent include$/d' "$NFTABLES_CONF" 2>/dev/null || true
         sed -i '\|include "/etc/nftables.d/nft_mgr.conf"|d' "$NFTABLES_CONF" 2>/dev/null || true
     fi
 
-    # 6) 如果 /etc/nftables.conf 是我们创建的（marker 存在），则尝试恢复备份，否则删除并关闭 nftables.service
     if [[ -f "$NFTABLES_CREATED_MARK" ]]; then
         rm -f "$NFTABLES_CREATED_MARK" 2>/dev/null || true
         local latest_bak
@@ -1096,22 +1020,17 @@ uninstall_script_impl() {
         fi
     fi
 
-    # 7) 删除我们创建的备份（仅 nftmgr 命名的）
     rm -f ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null || true
-
-    # 8) 删除脚本相关文件与目录（不留残留）
     rm -f "$NFT_MGR_CONF" "$CONFIG_FILE" "$SETTINGS_FILE" "$SYSCTL_FILE" "$LOCK_FILE" 2>/dev/null || true
     rm -rf "$LOG_DIR" 2>/dev/null || true
     rmdir "$NFT_MGR_DIR" 2>/dev/null || true
 
-    # 9) 刷新 nftables（可选）
     if have_cmd systemctl; then
         systemctl restart nftables >/dev/null 2>&1 || true
     fi
 
     msg_ok "✅ 卸载完成（已清理脚本残留）。"
 
-    # 10) 删除自身
     rm -f "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
     exit 0
 }
@@ -1124,9 +1043,9 @@ uninstall_script() { with_lock uninstall_script_impl; }
 main_menu() {
     clear
     echo -e "${GREEN}==========================================${PLAIN}"
-    echo -e "${GREEN}     nftables 端口转发管理面板 (Pro)      ${PLAIN}"
+    echo -e "${GREEN}     nftables 端口转发管理面板 (Pro 极限版)${PLAIN}"
     echo -e "${GREEN}==========================================${PLAIN}"
-    echo "1. 开启 BBR + 转发 + 自启动 (稳定/性能)"
+    echo "1. 开启 极限网络调优 (BBR+大并发+连接跟踪优化)"
     echo "2. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
     echo "3. 规则管理 (查看/删除)"
     echo "4. 清空所有转发规则"
@@ -1155,14 +1074,11 @@ main_menu() {
 require_root
 check_env
 install_global_command
-
-# 自动检测并完成持久化设置（无单独菜单项）
 auto_persist_setup
 
 # CLI 模式
 case "${1:-}" in
     --cron)
-        # DDNS 更新（温和模式：失败只记录日志，不中断）
         ddns_update
         exit $?
         ;;
