@@ -506,6 +506,10 @@ table ip nft_mgr_nat {
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
     }
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        tcp flags syn tcp option maxseg size set rt mtu
+    }
 }
 EOF
     chmod 600 "$out" 2>/dev/null || true
@@ -585,6 +589,12 @@ generate_nft_conf() {
         done < "$CONFIG_FILE"
 
         echo "    }"
+        
+        echo "    chain forward {"
+        echo "        type filter hook forward priority 0; policy accept;"
+        echo "        tcp flags syn tcp option maxseg size set rt mtu"
+        echo "    }"
+        
         echo "}"
     } > "$out"
 
@@ -675,7 +685,7 @@ apply_rules_impl() {
 }
 
 apply_rules() {
-    with_lock apply_rules_impl
+    with_lock apply_rules_impl;
 }
 
 # --------------------------
