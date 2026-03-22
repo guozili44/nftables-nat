@@ -1,56 +1,38 @@
-#!/bin/bash
+cat << 'EOF' > /root/nf.sh
+#!/usr/bin/env bash
 
 # ==========================================
-# nftables 端口转发管理面板 (Pro 极限性能版)
-# 包含: BBR + TCP MSS + Conntrack调优 + Flowtable
+# nftables 端口转发管理面板 (Pro Max)
+# - 独立表管理，不清空全局 ruleset
+# - 配置与内核规则分离提交，避免状态分叉
+# - IPv4 / IPv6 双栈转发
+# - Flowtable / DDNS 开关与状态显示
+# - 先 dry-run，再原子切换
 # ==========================================
 
 set -o pipefail
 
-# 兼容 cron/systemd 的精简 PATH
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
 # --------------------------
 # 可配置常量
 # --------------------------
+CMD_NAME="nf"
 CONFIG_FILE="/etc/nft_forward_list.conf"
 SETTINGS_FILE="/etc/nft_forward_settings.conf"
-
 NFT_MGR_DIR="/etc/nftables.d"
-NFTABLES_CONF="/etc/nftables.conf"
-NFTABLES_CREATED_MARK="/etc/nftables.conf.nftmgr_created"
-PERSIST_MODE_DEFAULT="service"
-NFT_MGR_CONF="${NFT_MGR_DIR}/nft_mgr.conf"
+NFT_RUNTIME_CONF="${NFT_MGR_DIR}/nft_mgr_runtime.conf"
 NFT_MGR_SERVICE="/etc/systemd/system/nft-mgr.service"
-
 SYSCTL_FILE="/etc/sysctl.d/99-nft-mgr.conf"
-
 LOG_DIR="/var/log/nft_ddns"
 LOCK_FILE="/var/lock/nft_mgr.lock"
 
-CMD_NAME="nf"
+TABLE_V4="nft_mgr_nat_v4"
+TABLE_V6="nft_mgr_nat_v6"
+TABLE_INET="nft_mgr_fwd"
 
-
-# --------------------------
-# 设置读写
-# --------------------------
-settings_get() {
-    local key="$1"
-    [[ -f "$SETTINGS_FILE" ]] || return 1
-    grep -E "^${key}=" "$SETTINGS_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | sed 's/^"//; s/"$//'
-}
-settings_set() {
-    local key="$1"; local value="$2"
-    touch "$SETTINGS_FILE" 2>/dev/null || true
-    chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
-    if grep -qE "^${key}=" "$SETTINGS_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}="${value}"|g" "$SETTINGS_FILE"
-    else
-        echo "${key}="${value}"" >> "$SETTINGS_FILE"
-    fi
-}
-PERSIST_MODE="$(settings_get "PERSIST_MODE" || true)"
-[[ -z "$PERSIST_MODE" ]] && PERSIST_MODE="$PERSIST_MODE_DEFAULT"
+DEFAULT_FLOWTABLE_ENABLED="1"
+DEFAULT_DDNS_ENABLED="1"
 
 # --------------------------
 # 颜色
@@ -66,6 +48,8 @@ msg_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
 msg_err()  { echo -e "${RED}$*${PLAIN}"; }
 msg_info() { echo -e "${CYAN}$*${PLAIN}"; }
 
+pause() { read -rp "按回车继续..."; }
+
 script_realpath() {
     local src="$0"
     if command -v realpath >/dev/null 2>&1; then
@@ -80,100 +64,117 @@ script_realpath() {
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # --------------------------
-# 环境与依赖
+# 设置读写
+# --------------------------
+ensure_state_dirs() {
+    mkdir -p "$(dirname "$CONFIG_FILE")" "$NFT_MGR_DIR" "$LOG_DIR" 2>/dev/null || true
+}
+
+settings_get() {
+    local key="$1" default_value="$2" value
+    [[ -f "$SETTINGS_FILE" ]] || { printf '%s\n' "$default_value"; return 0; }
+    value=$(awk -F= -v k="$key" '$1==k {print $2; found=1} END{if(!found) print "__NFTMGR_UNSET__"}' "$SETTINGS_FILE" 2>/dev/null | tail -n 1 | sed 's/[[:space:]]*$//')
+    [[ "$value" == "__NFTMGR_UNSET__" || -z "$value" ]] && printf '%s\n' "$default_value" || printf '%s\n' "$value"
+}
+
+settings_set() {
+    local key="$1" value="$2"
+    local tmp
+    ensure_state_dirs
+    tmp="$(mktemp /tmp/nftmgr-settings.XXXXXX)"
+    [[ -f "$SETTINGS_FILE" ]] && awk -F= -v k="$key" '$1!=k {print $0}' "$SETTINGS_FILE" > "$tmp" || :
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$SETTINGS_FILE"
+}
+
+load_settings() {
+    FLOWTABLE_ENABLED="$(settings_get FLOWTABLE_ENABLED "$DEFAULT_FLOWTABLE_ENABLED")"
+    DDNS_ENABLED="$(settings_get DDNS_ENABLED "$DEFAULT_DDNS_ENABLED")"
+    [[ "$FLOWTABLE_ENABLED" == "1" ]] || FLOWTABLE_ENABLED="0"
+    [[ "$DDNS_ENABLED" == "1" ]] || DDNS_ENABLED="0"
+}
+
+ensure_default_settings() {
+    local current
+    current=$(settings_get FLOWTABLE_ENABLED "")
+    [[ -n "$current" ]] || settings_set FLOWTABLE_ENABLED "$DEFAULT_FLOWTABLE_ENABLED"
+    current=$(settings_get DDNS_ENABLED "")
+    [[ -n "$current" ]] || settings_set DDNS_ENABLED "$DEFAULT_DDNS_ENABLED"
+}
+
+# --------------------------
+# 环境与锁
 # --------------------------
 require_root() {
     [[ $EUID -ne 0 ]] && msg_err "错误: 必须使用 root 权限运行!" && exit 1
 }
 
 check_env() {
-    local need=0
-    for c in nft dig curl flock ss sysctl ip; do
-        have_cmd "$c" || need=1
-    done
-    if [[ $need -eq 1 ]]; then
-        msg_warn "缺少依赖，请手动安装：nftables dnsutils(bind-utils) curl util-linux iproute2"
-    fi
+    local hard_missing=0
+    local hard_deps=(nft dig sysctl ip awk sed grep cut head tail sort mktemp chmod mv cp rm find)
+    local soft_deps=(flock ss crontab systemctl ufw firewall-cmd modprobe)
 
-    for c in nft dig curl flock ss sysctl ip; do
-        have_cmd "$c" || msg_warn "⚠️ 未找到依赖命令: $c（部分功能可能不可用）"
+    for c in "${hard_deps[@]}"; do
+        if ! have_cmd "$c"; then
+            msg_err "❌ 缺少必要命令: $c"
+            hard_missing=1
+        fi
     done
 
-    mkdir -p "$(dirname "$CONFIG_FILE")" "$LOG_DIR" "$NFT_MGR_DIR" 2>/dev/null || true
-    [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
+    for c in "${soft_deps[@]}"; do
+        have_cmd "$c" || msg_warn "⚠️ 未找到可选命令: $c（对应功能将降级）"
+    done
+
+    [[ $hard_missing -eq 1 ]] && {
+        msg_err "请先安装必要依赖后再运行。"
+        exit 1
+    }
+
+    ensure_state_dirs
+    [[ -f "$CONFIG_FILE" ]] || : > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-    [[ -f "$SETTINGS_FILE" ]] || touch "$SETTINGS_FILE"
+    [[ -f "$SETTINGS_FILE" ]] || : > "$SETTINGS_FILE"
     chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
 }
 
-install_global_command() {
-    local self
-    self="$(script_realpath)"
-    if [[ "$self" != "/usr/local/bin/${CMD_NAME}" ]]; then
-        cp -f "$self" "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
-        chmod +x "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
-    fi
-}
-
-# --------------------------
-# 锁（防并发踩踏）
-# --------------------------
 with_lock() {
     if have_cmd flock; then
         (
-            flock -n 200 || { msg_warn "⚠️ 任务繁忙：已有实例在运行，已跳过本次操作。"; exit 99; }
+            flock -n 200 || { msg_warn "⚠️ 任务繁忙：已有实例在运行。"; exit 99; }
             "$@"
         ) 200>"$LOCK_FILE"
         return $?
-    else
-        "$@"
-        return $?
     fi
+    "$@"
 }
 
 # --------------------------
-# 参数/输入校验与 DDNS 工具
+# 命令安装（仅在需要 cron 时做）
 # --------------------------
-ensure_ddns_cron_enabled() {
-    local script_path="/usr/local/bin/${CMD_NAME}"
-    [[ -x "$script_path" ]] || script_path="$(script_realpath)"
-    if crontab -l 2>/dev/null | grep -Fq "${script_path} --cron"; then
-        return 0
-    fi
-    (crontab -l 2>/dev/null; echo "*/5 * * * * ${script_path} --cron > /dev/null 2>&1") | crontab - 2>/dev/null || true
+install_global_command_if_needed() {
+    local self target
+    self="$(script_realpath)"
+    target="/usr/local/bin/${CMD_NAME}"
+    [[ "$self" == "$target" ]] && return 0
+    cp -f "$self" "$target" 2>/dev/null || return 1
+    chmod +x "$target" 2>/dev/null || true
     return 0
 }
 
-has_domain_rules() {
-    while IFS='|' read -r lp addr tp last_ip proto; do
-        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-        [[ -z "$addr" ]] && continue
-        if ! is_ipv4 "$addr"; then
-            return 0
-        fi
-    done < "$CONFIG_FILE"
-    return 1
+# --------------------------
+# 基础校验
+# --------------------------
+trim() {
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
-remove_ddns_cron_task() {
-    local cur
-    cur="$(crontab -l 2>/dev/null || true)"
-    [[ -z "$cur" ]] && return 0
-    echo "$cur" | grep -vE '(^|\s)(/usr/local/bin/(nf|nftmgr)|(nf|nftmgr))\s+--cron(\s|$)' | crontab - 2>/dev/null || true
-    return 0
-}
-
-ensure_ddns_cron_disabled_if_unused() {
-    if has_domain_rules; then
-        return 0
-    fi
-    local script_path="/usr/local/bin/${CMD_NAME}"
-    [[ -x "$script_path" ]] || script_path="$(script_realpath)"
-    if crontab -l 2>/dev/null | grep -Fq "${script_path} --cron" || crontab -l 2>/dev/null | grep -Eq '(^|\s)(/usr/local/bin/(nf|nftmgr)|(nf|nftmgr))\s+--cron(\s|$)'; then
-        remove_ddns_cron_task
-        msg_info "已无域名转发规则：已自动移除 DDNS 定时检测任务（crontab）。"
-    fi
-    return 0
+normalize_proto() {
+    local p="${1,,}"
+    case "$p" in
+        tcp|udp|both) printf '%s\n' "$p" ;;
+        *) printf '%s\n' "both" ;;
+    esac
 }
 
 is_port() {
@@ -182,166 +183,273 @@ is_port() {
 }
 
 is_ipv4() {
+    local ip="$1" IFS=.
+    local a b c d
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    read -r a b c d <<< "$ip"
+    for n in "$a" "$b" "$c" "$d"; do
+        [[ "$n" =~ ^[0-9]+$ ]] || return 1
+        [ "$n" -ge 0 ] && [ "$n" -le 255 ] || return 1
+    done
+    return 0
+}
+
+is_ipv6_basic() {
     local ip="$1"
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+    [[ "$ip" == *:* ]] || return 1
+    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]]
 }
 
-normalize_proto() {
-    local p="${1,,}"
-    case "$p" in
-        tcp|udp|both) echo "$p" ;;
-        "") echo "both" ;;
-        *) echo "both" ;;
-    esac
+is_ipv6() {
+    local ip="$1" tmp rc
+    is_ipv6_basic "$ip" || return 1
+    tmp="$(mktemp /tmp/nftmgr-ip6check.XXXXXX)"
+    cat > "$tmp" <<EOF_IP6
+add table ip6 __nftmgr_ip6check
+add chain ip6 __nftmgr_ip6check c { type nat hook prerouting priority -100; }
+add rule ip6 __nftmgr_ip6check c tcp dport 1 dnat to [${ip}]:1
+EOF_IP6
+    nft -c -f "$tmp" >/dev/null 2>&1
+    rc=$?
+    rm -f "$tmp"
+    return $rc
 }
 
-get_ip() {
+is_literal_ip() {
+    is_ipv4 "$1" || is_ipv6 "$1"
+}
+
+is_domain_like() {
+    local v="$1"
+    [[ -n "$v" ]] || return 1
+    [[ "$v" != *[[:space:]]* ]] || return 1
+    [[ "$v" != *"/"* ]] || return 1
+    [[ "$v" != *"["* ]] || return 1
+    [[ "$v" != *"]"* ]] || return 1
+    return 0
+}
+
+note_addr_type() {
     local addr="$1"
     if is_ipv4 "$addr"; then
-        echo "$addr"
+        printf '%s\n' "IPv4"
+    elif is_ipv6 "$addr"; then
+        printf '%s\n' "IPv6"
+    else
+        printf '%s\n' "域名"
+    fi
+}
+
+# --------------------------
+# 配置行读写与兼容旧格式
+# 新格式: lport|addr|tport|last_v4|last_v6|proto
+# 旧格式: lport|addr|tport|last_v4|proto
+# --------------------------
+RULE_LPORT=""
+RULE_ADDR=""
+RULE_TPORT=""
+RULE_LAST_V4=""
+RULE_LAST_V6=""
+RULE_PROTO=""
+
+parse_rule_line() {
+    local line="$1"
+    RULE_LPORT=""
+    RULE_ADDR=""
+    RULE_TPORT=""
+    RULE_LAST_V4=""
+    RULE_LAST_V6=""
+    RULE_PROTO=""
+
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && return 1
+
+    local f1 f2 f3 f4 f5 f6
+    IFS='|' read -r f1 f2 f3 f4 f5 f6 <<< "$line"
+    [[ -n "$f6" ]] || {
+        RULE_LPORT="$f1"
+        RULE_ADDR="$f2"
+        RULE_TPORT="$f3"
+        RULE_LAST_V4="$f4"
+        RULE_LAST_V6=""
+        RULE_PROTO="$(normalize_proto "$f5")"
+        return 0
+    }
+
+    RULE_LPORT="$f1"
+    RULE_ADDR="$f2"
+    RULE_TPORT="$f3"
+    RULE_LAST_V4="$f4"
+    RULE_LAST_V6="$f5"
+    RULE_PROTO="$(normalize_proto "$f6")"
+    return 0
+}
+
+emit_rule_line() {
+    local lport="$1" addr="$2" tport="$3" last_v4="$4" last_v6="$5" proto="$6"
+    printf '%s|%s|%s|%s|%s|%s\n' "$lport" "$addr" "$tport" "$last_v4" "$last_v6" "$(normalize_proto "$proto")"
+}
+
+rule_is_valid() {
+    is_port "$RULE_LPORT" || return 1
+    is_port "$RULE_TPORT" || return 1
+    [[ -n "$RULE_ADDR" ]] || return 1
+    return 0
+}
+
+has_domain_rules_in_file() {
+    local file="$1" line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        if ! is_literal_ip "$RULE_ADDR"; then
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
+
+# --------------------------
+# DNS 解析
+# --------------------------
+pick_first_v4() {
+    awk 'NF{print $0}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | awk -F. '($1<=255 && $2<=255 && $3<=255 && $4<=255)' | sort -u | head -n 1
+}
+
+pick_first_v6() {
+    awk 'NF{print $0}' | grep ':' | sort -u | head -n 1
+}
+
+resolve_target_pair() {
+    local addr="$1"
+    RESOLVED_V4=""
+    RESOLVED_V6=""
+
+    if is_ipv4 "$addr"; then
+        RESOLVED_V4="$addr"
         return 0
     fi
-    dig +time=2 +tries=1 +short -4 A "$addr" 2>/dev/null \
-        | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
-        | head -n 1
+    if is_ipv6 "$addr"; then
+        RESOLVED_V6="$addr"
+        return 0
+    fi
+
+    is_domain_like "$addr" || return 1
+
+    RESOLVED_V4="$(dig +time=2 +tries=1 +short A "$addr" 2>/dev/null | pick_first_v4)"
+    RESOLVED_V6="$(dig +time=2 +tries=1 +short AAAA "$addr" 2>/dev/null | pick_first_v6)"
+
+    [[ -n "$RESOLVED_V4" || -n "$RESOLVED_V6" ]]
+}
+
+# --------------------------
+# DDNS / 调度
+# --------------------------
+cron_entry() {
+    printf '%s\n' "*/5 * * * * /usr/local/bin/${CMD_NAME} --cron > /dev/null 2>&1"
+}
+
+cron_is_enabled() {
+    have_cmd crontab || return 1
+    crontab -l 2>/dev/null | grep -Fqx "$(cron_entry)"
+}
+
+remove_legacy_cron_entries() {
+    have_cmd crontab || return 0
+    local cur
+    cur="$(crontab -l 2>/dev/null || true)"
+    [[ -n "$cur" ]] || return 0
+    printf '%s\n' "$cur" \
+        | grep -vE '(^|[[:space:]])(/usr/local/bin/(nf|nftmgr)|(nf|nftmgr))[[:space:]]+--cron([[:space:]]|$)' \
+        | crontab - 2>/dev/null || true
+}
+
+ensure_ddns_scheduler_state() {
+    load_settings
+    have_cmd crontab || return 0
+    remove_legacy_cron_entries
+
+    if [[ "$DDNS_ENABLED" == "1" ]] && has_domain_rules_in_file "$CONFIG_FILE"; then
+        install_global_command_if_needed || {
+            msg_warn "⚠️ 无法安装 /usr/local/bin/${CMD_NAME}，DDNS 定时任务未启用。"
+            return 1
+        }
+        if ! cron_is_enabled; then
+            (crontab -l 2>/dev/null; cron_entry) | crontab - 2>/dev/null || true
+        fi
+    else
+        if cron_is_enabled; then
+            crontab -l 2>/dev/null | grep -Fvx "$(cron_entry)" | crontab - 2>/dev/null || true
+        fi
+    fi
+    return 0
 }
 
 # --------------------------
 # 防火墙放行
 # --------------------------
-manage_firewall() {
-    local action="$1"
-    local port="$2"
-    local proto="$3"
-    proto="$(normalize_proto "$proto")"
-
+firewall_backend() {
     if have_cmd ufw && ufw status 2>/dev/null | grep -qw active; then
-        if [[ "$action" == "add" ]]; then
-            [[ "$proto" == "tcp" || "$proto" == "both" ]] && ufw allow "$port"/tcp >/dev/null 2>&1
-            [[ "$proto" == "udp" || "$proto" == "both" ]] && ufw allow "$port"/udp >/dev/null 2>&1
-        else
-            [[ "$proto" == "tcp" || "$proto" == "both" ]] && ufw --force delete allow "$port"/tcp >/dev/null 2>&1
-            [[ "$proto" == "udp" || "$proto" == "both" ]] && ufw --force delete allow "$port"/udp >/dev/null 2>&1
-        fi
+        printf '%s\n' "ufw"
         return 0
     fi
-
-    if have_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
-        if [[ "$action" == "add" ]]; then
-            [[ "$proto" == "tcp" || "$proto" == "both" ]] && firewall-cmd --add-port="${port}/tcp" --permanent >/dev/null 2>&1
-            [[ "$proto" == "udp" || "$proto" == "both" ]] && firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1
-        else
-            [[ "$proto" == "tcp" || "$proto" == "both" ]] && firewall-cmd --remove-port="${port}/tcp" --permanent >/dev/null 2>&1
-            [[ "$proto" == "udp" || "$proto" == "both" ]] && firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1
-        fi
-        firewall-cmd --reload >/dev/null 2>&1
+    if have_cmd firewall-cmd && have_cmd systemctl && systemctl is-active --quiet firewalld 2>/dev/null; then
+        printf '%s\n' "firewalld"
         return 0
     fi
-    return 0
+    printf '%s\n' "none"
+}
+
+manage_firewall() {
+    local action="$1" port="$2" proto
+    proto="$(normalize_proto "$3")"
+
+    case "$(firewall_backend)" in
+        ufw)
+            if [[ "$action" == "add" ]]; then
+                [[ "$proto" == "tcp" || "$proto" == "both" ]] && ufw allow "$port"/tcp >/dev/null 2>&1 || true
+                [[ "$proto" == "udp" || "$proto" == "both" ]] && ufw allow "$port"/udp >/dev/null 2>&1 || true
+            else
+                [[ "$proto" == "tcp" || "$proto" == "both" ]] && ufw --force delete allow "$port"/tcp >/dev/null 2>&1 || true
+                [[ "$proto" == "udp" || "$proto" == "both" ]] && ufw --force delete allow "$port"/udp >/dev/null 2>&1 || true
+            fi
+            ;;
+        firewalld)
+            if [[ "$action" == "add" ]]; then
+                [[ "$proto" == "tcp" || "$proto" == "both" ]] && firewall-cmd --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
+                [[ "$proto" == "udp" || "$proto" == "both" ]] && firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
+            else
+                [[ "$proto" == "tcp" || "$proto" == "both" ]] && firewall-cmd --remove-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
+                [[ "$proto" == "udp" || "$proto" == "both" ]] && firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1 || true
+            fi
+            firewall-cmd --reload >/dev/null 2>&1 || true
+            ;;
+        *)
+            ;;
+    esac
 }
 
 # --------------------------
-# 持久化兼容：/etc/nftables.conf
-# --------------------------
-nftables_conf_includes_mgr() {
-    [[ -f "$NFTABLES_CONF" ]] || return 1
-    grep -E '^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/\*\.conf"?[[:space:]]*$' "$NFTABLES_CONF" >/dev/null 2>&1 && return 0
-    grep -E '^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/nft_mgr\.conf"?[[:space:]]*$' "$NFTABLES_CONF" >/dev/null 2>&1 && return 0
-    return 1
-}
-
-enable_persist_system() {
-    mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
-    [[ -f "$NFT_MGR_CONF" ]] || generate_empty_conf "$NFT_MGR_CONF"
-
-    if [[ -e "$NFTABLES_CONF" && ! -f "$NFTABLES_CONF" ]]; then
-        msg_err "❌ ${NFTABLES_CONF} 存在但不是普通文件，无法注入 include。"
-        return 1
-    fi
-
-    if [[ ! -f "$NFTABLES_CONF" ]]; then
-        cat > "$NFTABLES_CONF" << EOF
-#!/usr/sbin/nft -f
-# generated by nf (compat mode)
-include "${NFT_MGR_CONF}"
-EOF
-        chmod 644 "$NFTABLES_CONF" 2>/dev/null || true
-        echo "1" > "$NFTABLES_CREATED_MARK" 2>/dev/null || true
-    else
-        local bak="${NFTABLES_CONF}.nftmgr.bak.$(date +%s)"
-        cp -a "$NFTABLES_CONF" "$bak" 2>/dev/null || true
-
-        if ! nftables_conf_includes_mgr; then
-            printf "\n# nf include (added %s)\ninclude \"%s\"\n" "$(date '+%F %T')" "$NFT_MGR_CONF" >> "$NFTABLES_CONF"
-        fi
-    fi
-
-    if have_cmd nft; then
-        if ! nft -c -f "$NFTABLES_CONF" >/dev/null 2>&1; then
-            msg_err "❌ 注入后 ${NFTABLES_CONF} 语法校验失败，已保留备份文件，请手动检查。"
-            return 1
-        fi
-    fi
-
-    if have_cmd systemctl; then
-        systemctl enable --now nftables >/dev/null 2>&1 || true
-        systemctl restart nftables >/dev/null 2>&1 || true
-        systemctl disable --now nft-mgr >/dev/null 2>&1 || true
-    else
-        nft -f "$NFTABLES_CONF" >/dev/null 2>&1 || true
-    fi
-    PERSIST_MODE="system"
-    msg_ok "✅ 已启用【系统持久化兼容模式】：/etc/nftables.conf 已包含 nft_mgr.conf。"
-    return 0
-}
-
-enable_persist_service() {
-    if have_cmd systemctl; then
-        ensure_nft_mgr_service
-        systemctl enable --now nft-mgr >/dev/null 2>&1 || true
-    fi
-    PERSIST_MODE="service"
-    msg_ok "✅ 已启用【服务持久化模式】：由 nft-mgr.service 加载 nft_mgr.conf。"
-    return 0
-}
-
-auto_persist_setup() {
-    PERSIST_MODE="$PERSIST_MODE_DEFAULT"
-    if [[ -f "$NFTABLES_CONF" ]] && nftables_conf_includes_mgr; then
-        PERSIST_MODE="system"
-    elif have_cmd systemctl && systemctl is-enabled nftables >/dev/null 2>&1; then
-        PERSIST_MODE="system"
-    fi
-
-    if [[ "$PERSIST_MODE" == "system" ]]; then
-        enable_persist_system >/dev/null 2>&1 || true
-    else
-        enable_persist_service >/dev/null 2>&1 || true
-    fi
-}
-
-# --------------------------
-# 极限网络调优 (sysctl + conntrack)
+# 系统调优 / 转发
 # --------------------------
 sysctl_set_kv() {
-    local key="$1"; local value="$2"
+    local key="$1" value="$2"
     mkdir -p /etc/sysctl.d 2>/dev/null || true
     touch "$SYSCTL_FILE" 2>/dev/null || true
-
-    if grep -qE "^\s*${key}\s*=" "$SYSCTL_FILE" 2>/dev/null; then
-        sed -i "s|^\s*${key}\s*=.*|${key} = ${value}|g" "$SYSCTL_FILE"
+    if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$SYSCTL_FILE" 2>/dev/null; then
+        sed -i "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|g" "$SYSCTL_FILE"
     else
-        echo "${key} = ${value}" >> "$SYSCTL_FILE"
+        printf '%s = %s\n' "$key" "$value" >> "$SYSCTL_FILE"
     fi
+}
+
+apply_sysctl_file() {
+    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1
 }
 
 ensure_forwarding() {
-    local cur
-    cur="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
-    if [[ "$cur" != "1" ]]; then
-        sysctl_set_kv "net.ipv4.ip_forward" "1"
-        sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-    fi
+    sysctl_set_kv "net.ipv4.ip_forward" "1"
+    sysctl_set_kv "net.ipv6.conf.all.forwarding" "1"
+    apply_sysctl_file >/dev/null 2>&1 || true
 }
 
 bbr_available() {
@@ -350,306 +458,406 @@ bbr_available() {
 
 optimize_system() {
     clear
-    echo -e "${GREEN}--- 系统优化 (极限性能版：BBR + 连接跟踪极限调优) ---${PLAIN}"
-    echo "此操作将写入防丢包、抗高并发的极限底层参数。"
-    read -rp "确认应用优化配置？[y/N]: " pick
-    [[ "$pick" != "y" && "$pick" != "Y" ]] && return
+    echo -e "${GREEN}--- 系统优化 (极限性能版) ---${PLAIN}"
+    echo "将写入高并发、队列、连接跟踪、BBR 等极限参数。"
+    read -rp "确认应用？[y/N]: " pick
+    [[ "$pick" =~ ^[Yy]$ ]] || return 0
 
-    echo -e "${CYAN}正在载入并写入 sysctl 内核配置...${PLAIN}"
-    # 确保 conntrack 模块加载
-    modprobe nf_conntrack 2>/dev/null || modprobe ip_conntrack 2>/dev/null || true
+    have_cmd modprobe && {
+        modprobe nf_conntrack 2>/dev/null || modprobe ip_conntrack 2>/dev/null || true
+        modprobe tcp_bbr 2>/dev/null || true
+        modprobe nft_flow_offload 2>/dev/null || true
+    }
 
     sysctl_set_kv "net.ipv4.ip_forward" "1"
+    sysctl_set_kv "net.ipv6.conf.all.forwarding" "1"
 
     if bbr_available; then
         sysctl_set_kv "net.core.default_qdisc" "fq"
         sysctl_set_kv "net.ipv4.tcp_congestion_control" "bbr"
     else
-        msg_warn "⚠️ 当前内核未检测到 bbr 模块（将仅启用其他优化）。"
+        msg_warn "⚠️ 当前内核未检测到 BBR，已跳过 BBR。"
     fi
 
-    # 极限并发与连接跟踪调优
-    sysctl_set_kv "net.core.somaxconn" "32768"
-    sysctl_set_kv "net.core.netdev_max_backlog" "32768"
-    sysctl_set_kv "fs.file-max" "1048576"
+    sysctl_set_kv "fs.file-max" "2097152"
+    sysctl_set_kv "fs.inotify.max_user_instances" "8192"
+    sysctl_set_kv "fs.inotify.max_user_watches" "1048576"
+    sysctl_set_kv "net.core.somaxconn" "65535"
+    sysctl_set_kv "net.core.netdev_max_backlog" "262144"
+    sysctl_set_kv "net.core.optmem_max" "25165824"
     sysctl_set_kv "net.ipv4.ip_local_port_range" "1024 65535"
-    sysctl_set_kv "net.netfilter.nf_conntrack_max" "1048576"
-    sysctl_set_kv "net.netfilter.nf_conntrack_tcp_timeout_established" "3600"
-    sysctl_set_kv "net.ipv4.tcp_fin_timeout" "15"
+    sysctl_set_kv "net.ipv4.tcp_max_syn_backlog" "262144"
+    sysctl_set_kv "net.ipv4.tcp_fin_timeout" "10"
+    sysctl_set_kv "net.ipv4.tcp_keepalive_time" "600"
+    sysctl_set_kv "net.ipv4.tcp_keepalive_intvl" "30"
+    sysctl_set_kv "net.ipv4.tcp_keepalive_probes" "5"
+    sysctl_set_kv "net.ipv4.tcp_mtu_probing" "1"
+    sysctl_set_kv "net.ipv4.tcp_slow_start_after_idle" "0"
+    sysctl_set_kv "net.ipv4.tcp_tw_reuse" "1"
+    sysctl_set_kv "net.netfilter.nf_conntrack_max" "2097152"
+    sysctl_set_kv "net.netfilter.nf_conntrack_buckets" "524288"
+    sysctl_set_kv "net.netfilter.nf_conntrack_tcp_timeout_established" "7200"
+    sysctl_set_kv "net.netfilter.nf_conntrack_tcp_timeout_time_wait" "30"
+    sysctl_set_kv "vm.max_map_count" "1048576"
 
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-
-    if have_cmd systemctl; then
-        echo -e "${CYAN}正在设置 nftables 开机自启...${PLAIN}"
-        systemctl enable --now nftables >/dev/null 2>&1 || true
-        ensure_nft_mgr_service
+    if apply_sysctl_file; then
+        msg_ok "✅ 极限系统调优已应用。"
+    else
+        msg_warn "⚠️ sysctl 部分参数应用失败，请手动检查 ${SYSCTL_FILE}。"
     fi
-
-    msg_ok "✅ 极限系统优化已应用完成！"
     sleep 2
 }
 
 # --------------------------
-# nft-mgr systemd 服务
+# Flowtable 探测
 # --------------------------
-ensure_nft_mgr_service() {
-    [[ -d "$NFT_MGR_DIR" ]] || mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
-    [[ -f "$NFT_MGR_CONF" ]] || generate_empty_conf "$NFT_MGR_CONF"
+flowtable_iface_list() {
+    ip -o link show up 2>/dev/null \
+        | awk -F': ' '{print $2}' \
+        | sed 's/@.*//' \
+        | grep -vE '^(lo|docker[0-9]*|veth.*|br-.*|virbr.*|cni.*|flannel.*|kube.*)$' \
+        | sort -u
+}
 
-    if ! have_cmd systemctl; then
+flowtable_devices_csv() {
+    local devices line first=1 out=""
+    devices="$(flowtable_iface_list)"
+    [[ -n "$devices" ]] || return 1
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ $first -eq 1 ]]; then
+            out="$line"
+            first=0
+        else
+            out+=", $line"
+        fi
+    done <<< "$devices"
+    [[ -n "$out" ]] || return 1
+    printf '%s\n' "$out"
+}
+
+flowtable_supported() {
+    local devices tmp rc
+    load_settings
+    [[ "$FLOWTABLE_ENABLED" == "1" ]] || return 1
+
+    devices="$(flowtable_devices_csv)" || return 1
+    tmp="$(mktemp /tmp/nftmgr-flowcheck.XXXXXX)"
+    cat > "$tmp" <<EOF_FLOW
+add table inet __nftmgr_flowcheck
+add flowtable inet __nftmgr_flowcheck f { hook ingress priority 0; devices = { ${devices} }; }
+add chain inet __nftmgr_flowcheck fwd { type filter hook forward priority 0; policy accept; }
+add rule inet __nftmgr_flowcheck fwd meta l4proto { tcp, udp } flow offload @f
+EOF_FLOW
+    nft -c -f "$tmp" >/dev/null 2>&1
+    rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
+flowtable_status_text() {
+    load_settings
+    if [[ "$FLOWTABLE_ENABLED" != "1" ]]; then
+        printf '%s\n' "关闭"
         return 0
     fi
+    if flowtable_supported; then
+        printf '%s\n' "开启"
+    else
+        printf '%s\n' "开启(当前内核/接口不支持，运行时自动跳过)"
+    fi
+}
 
+# --------------------------
+# 运行时/持久化配置生成
+# --------------------------
+quote_nft_ipv6_target() {
+    printf '[%s]' "$1"
+}
+
+emit_table_v4_body() {
+    local file="$1" line
+    echo "chain prerouting {"
+    echo "    type nat hook prerouting priority -100; policy accept;"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        [[ -n "$RULE_LAST_V4" ]] || continue
+        case "$RULE_PROTO" in
+            tcp)  echo "    tcp dport ${RULE_LPORT} counter dnat to ${RULE_LAST_V4}:${RULE_TPORT}" ;;
+            udp)  echo "    udp dport ${RULE_LPORT} counter dnat to ${RULE_LAST_V4}:${RULE_TPORT}" ;;
+            both)
+                echo "    tcp dport ${RULE_LPORT} counter dnat to ${RULE_LAST_V4}:${RULE_TPORT}"
+                echo "    udp dport ${RULE_LPORT} counter dnat to ${RULE_LAST_V4}:${RULE_TPORT}"
+                ;;
+        esac
+    done < "$file"
+    echo "}"
+    echo "chain postrouting {"
+    echo "    type nat hook postrouting priority 100; policy accept;"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        [[ -n "$RULE_LAST_V4" ]] || continue
+        case "$RULE_PROTO" in
+            tcp)  echo "    ip daddr ${RULE_LAST_V4} tcp dport ${RULE_TPORT} counter masquerade" ;;
+            udp)  echo "    ip daddr ${RULE_LAST_V4} udp dport ${RULE_TPORT} counter masquerade" ;;
+            both)
+                echo "    ip daddr ${RULE_LAST_V4} tcp dport ${RULE_TPORT} counter masquerade"
+                echo "    ip daddr ${RULE_LAST_V4} udp dport ${RULE_TPORT} counter masquerade"
+                ;;
+        esac
+    done < "$file"
+    echo "}"
+}
+
+emit_table_v6_body() {
+    local file="$1" line target
+    echo "chain prerouting {"
+    echo "    type nat hook prerouting priority -100; policy accept;"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        [[ -n "$RULE_LAST_V6" ]] || continue
+        target="$(quote_nft_ipv6_target "$RULE_LAST_V6")"
+        case "$RULE_PROTO" in
+            tcp)  echo "    tcp dport ${RULE_LPORT} counter dnat to ${target}:${RULE_TPORT}" ;;
+            udp)  echo "    udp dport ${RULE_LPORT} counter dnat to ${target}:${RULE_TPORT}" ;;
+            both)
+                echo "    tcp dport ${RULE_LPORT} counter dnat to ${target}:${RULE_TPORT}"
+                echo "    udp dport ${RULE_LPORT} counter dnat to ${target}:${RULE_TPORT}"
+                ;;
+        esac
+    done < "$file"
+    echo "}"
+    echo "chain postrouting {"
+    echo "    type nat hook postrouting priority 100; policy accept;"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        [[ -n "$RULE_LAST_V6" ]] || continue
+        case "$RULE_PROTO" in
+            tcp)  echo "    ip6 daddr ${RULE_LAST_V6} tcp dport ${RULE_TPORT} counter masquerade" ;;
+            udp)  echo "    ip6 daddr ${RULE_LAST_V6} udp dport ${RULE_TPORT} counter masquerade" ;;
+            both)
+                echo "    ip6 daddr ${RULE_LAST_V6} tcp dport ${RULE_TPORT} counter masquerade"
+                echo "    ip6 daddr ${RULE_LAST_V6} udp dport ${RULE_TPORT} counter masquerade"
+                ;;
+        esac
+    done < "$file"
+    echo "}"
+}
+
+emit_table_inet_body() {
+    local devices
+    echo "chain forward {"
+    echo "    type filter hook forward priority 0; policy accept;"
+    echo "    tcp flags syn tcp option maxseg size set rt mtu"
+    if flowtable_supported; then
+        echo "    meta l4proto { tcp, udp } flow offload @f"
+    fi
+    echo "}"
+}
+
+runtime_table_ip() {
+    local file="$1"
+    echo "table ip ${TABLE_V4} {"
+    emit_table_v4_body "$file"
+    echo "}"
+}
+
+runtime_table_ip6() {
+    local file="$1"
+    echo "table ip6 ${TABLE_V6} {"
+    emit_table_v6_body "$file"
+    echo "}"
+}
+
+runtime_table_inet() {
+    local file="$1" devices
+    echo "table inet ${TABLE_INET} {"
+    if flowtable_supported; then
+        devices="$(flowtable_devices_csv)"
+        echo "flowtable f {"
+        echo "    hook ingress priority 0;"
+        echo "    devices = { ${devices} };"
+        echo "}"
+    fi
+    emit_table_inet_body "$file"
+    echo "}"
+}
+
+build_runtime_conf() {
+    local file="$1" out="$2"
+    {
+        echo "# nft-mgr runtime ruleset (generated at $(date '+%F %T'))"
+        runtime_table_ip "$file"
+        runtime_table_ip6 "$file"
+        runtime_table_inet "$file"
+    } > "$out"
+    chmod 600 "$out" 2>/dev/null || true
+}
+
+write_transaction_table() {
+    local family="$1" name="$2" temp_name="$3" body_func="$4" file="$5"
+    if nft list table "$family" "$name" >/dev/null 2>&1; then
+        echo "table ${family} ${temp_name} {"
+        if [[ "$family" == "ip" ]]; then
+            emit_table_v4_body "$file"
+        elif [[ "$family" == "ip6" ]]; then
+            emit_table_v6_body "$file"
+        else
+            if flowtable_supported; then
+                local devices
+                devices="$(flowtable_devices_csv)"
+                echo "flowtable f {"
+                echo "    hook ingress priority 0;"
+                echo "    devices = { ${devices} };"
+                echo "}"
+            fi
+            emit_table_inet_body "$file"
+        fi
+        echo "}"
+        echo "delete table ${family} ${name}"
+        echo "rename table ${family} ${temp_name} ${name}"
+    else
+        echo "table ${family} ${name} {"
+        if [[ "$family" == "ip" ]]; then
+            emit_table_v4_body "$file"
+        elif [[ "$family" == "ip6" ]]; then
+            emit_table_v6_body "$file"
+        else
+            if flowtable_supported; then
+                local devices
+                devices="$(flowtable_devices_csv)"
+                echo "flowtable f {"
+                echo "    hook ingress priority 0;"
+                echo "    devices = { ${devices} };"
+                echo "}"
+            fi
+            emit_table_inet_body "$file"
+        fi
+        echo "}"
+    fi
+}
+
+build_transaction_conf() {
+    local file="$1" out="$2"
+    local suffix
+    suffix="$(date +%s)_$$"
+    {
+        echo "# nft-mgr transaction ruleset (generated at $(date '+%F %T'))"
+        write_transaction_table ip "$TABLE_V4" "${TABLE_V4}_new_${suffix}" emit_table_v4_body "$file"
+        write_transaction_table ip6 "$TABLE_V6" "${TABLE_V6}_new_${suffix}" emit_table_v6_body "$file"
+        write_transaction_table inet "$TABLE_INET" "${TABLE_INET}_new_${suffix}" emit_table_inet_body "$file"
+    } > "$out"
+    chmod 600 "$out" 2>/dev/null || true
+}
+
+# --------------------------
+# 持久化服务（仅在成功应用后安装）
+# --------------------------
+ensure_nft_mgr_service() {
+    have_cmd systemctl || return 0
     local nftbin
     nftbin="$(command -v nft 2>/dev/null || echo /usr/sbin/nft)"
-
-    cat > "$NFT_MGR_SERVICE" << EOF
+    mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
+    cat > "$NFT_MGR_SERVICE" <<EOF_SERVICE
 [Unit]
 Description=nftables Port Forwarding Manager (nf)
-After=network-online.target nftables.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c '${nftbin} delete table ip nft_mgr_nat 2>/dev/null || true; ${nftbin} -f ${NFT_MGR_CONF}'
+ExecStart=/bin/sh -c '${nftbin} delete table inet ${TABLE_INET} >/dev/null 2>&1 || true; ${nftbin} delete table ip ${TABLE_V4} >/dev/null 2>&1 || true; ${nftbin} delete table ip6 ${TABLE_V6} >/dev/null 2>&1 || true; ${nftbin} -f ${NFT_RUNTIME_CONF}'
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
+EOF_SERVICE
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable nft-mgr >/dev/null 2>&1 || true
 }
 
 # --------------------------
-# Flowtable 自动探测
+# 原子提交：先校验，再切换，再写状态
 # --------------------------
-detect_flowtable() {
-    local iface
-    iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}' | head -n 1)
-    if [[ -z "$iface" ]]; then
-        echo "0:"
-        return
-    fi
-    if have_cmd nft; then
-        if nft -c 'table ip test_ft { flowtable f { hook ingress priority 0; devices = { "'"$iface"'" }; }; }' >/dev/null 2>&1; then
-            echo "1:$iface"
-            return
-        fi
-    fi
-    echo "0:"
-}
+apply_candidate_rules() {
+    local candidate_file="$1"
+    local tx_tmp runtime_tmp check_err apply_err
 
-# --------------------------
-# 生成 nft 配置 (含 Flowtable 与 TCP MSS)
-# --------------------------
-generate_empty_conf() {
-    local out="$1"
-    local ft_info iface has_ft
-    ft_info=$(detect_flowtable)
-    has_ft="${ft_info%%:*}"
-    iface="${ft_info##*:}"
-
-    cat > "$out" << EOF
-# nft-mgr empty ruleset (generated)
-table ip nft_mgr_nat {
-EOF
-    if [[ "$has_ft" == "1" && -n "$iface" ]]; then
-        cat >> "$out" << EOF
-    flowtable f {
-        hook ingress priority 0;
-        devices = { $iface };
-    }
-EOF
-    fi
-    cat >> "$out" << EOF
-    chain prerouting {
-        type nat hook prerouting priority -100; policy accept;
-    }
-    chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
-    }
-    chain forward {
-        type filter hook forward priority 0; policy accept;
-        tcp flags syn tcp option maxseg size set rt mtu
-EOF
-    if [[ "$has_ft" == "1" ]]; then
-        echo "        ip protocol { tcp, udp } flow offload @f" >> "$out"
-    fi
-    cat >> "$out" << EOF
-    }
-}
-EOF
-    chmod 600 "$out" 2>/dev/null || true
-}
-
-generate_nft_conf() {
-    local out="$1"
-    local any=0
-    local ft_info iface has_ft
-    ft_info=$(detect_flowtable)
-    has_ft="${ft_info%%:*}"
-    iface="${ft_info##*:}"
-
-    {
-        echo "# nft-mgr ruleset (generated at $(date '+%F %T'))"
-        echo "table ip nft_mgr_nat {"
-        
-        # 智能加载 Flowtable
-        if [[ "$has_ft" == "1" && -n "$iface" ]]; then
-            echo "    flowtable f {"
-            echo "        hook ingress priority 0;"
-            echo "        devices = { $iface };"
-            echo "    }"
-        fi
-
-        echo "    chain prerouting {"
-        echo "        type nat hook prerouting priority -100;"
-
-        while IFS='|' read -r lp addr tp last_ip proto; do
-            [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-            proto="$(normalize_proto "$proto")"
-            is_port "$lp" || continue; is_port "$tp" || continue; [[ -z "$addr" ]] && continue
-            local ip="$last_ip"
-            [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
-            is_ipv4 "$ip" || continue
-
-            case "$proto" in
-                tcp) echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"; any=1 ;;
-                udp) echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"; any=1 ;;
-                both)
-                    echo "        tcp dport ${lp} counter dnat to ${ip}:${tp}"
-                    echo "        udp dport ${lp} counter dnat to ${ip}:${tp}"
-                    any=1 ;;
-            esac
-        done < "$CONFIG_FILE"
-
-        echo "    }"
-        echo "    chain postrouting {"
-        echo "        type nat hook postrouting priority 100;"
-
-        while IFS='|' read -r lp addr tp last_ip proto; do
-            [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-            proto="$(normalize_proto "$proto")"
-            is_port "$lp" || continue; is_port "$tp" || continue; [[ -z "$addr" ]] && continue
-            local ip="$last_ip"
-            [[ -z "$ip" ]] && ip="$(get_ip "$addr")"
-            is_ipv4 "$ip" || continue
-
-            case "$proto" in
-                tcp) echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"; any=1 ;;
-                udp) echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"; any=1 ;;
-                both)
-                    echo "        ip daddr ${ip} tcp dport ${tp} counter masquerade"
-                    echo "        ip daddr ${ip} udp dport ${tp} counter masquerade"
-                    any=1 ;;
-            esac
-        done < "$CONFIG_FILE"
-
-        echo "    }"
-
-        # 智能加载 Forward 优化链 (TCP MSS + 硬件卸载)
-        echo "    chain forward {"
-        echo "        type filter hook forward priority 0; policy accept;"
-        echo "        tcp flags syn tcp option maxseg size set rt mtu"
-        if [[ "$has_ft" == "1" ]]; then
-            echo "        ip protocol { tcp, udp } flow offload @f"
-        fi
-        echo "    }"
-
-        echo "}"
-    } > "$out"
-
-    chmod 600 "$out" 2>/dev/null || true
-    [[ $any -eq 1 ]] || return 2
-    return 0
-}
-
-# --------------------------
-# 原子化应用规则
-# --------------------------
-apply_rules_impl() {
     ensure_forwarding
-    ensure_nft_mgr_service
 
-    local tmp
-    tmp="$(mktemp /tmp/nftmgr.XXXXXX)"
-    local has_rules=0
+    tx_tmp="$(mktemp /tmp/nftmgr-tx.XXXXXX)"
+    runtime_tmp="$(mktemp /tmp/nftmgr-runtime.XXXXXX)"
 
-    if generate_nft_conf "$tmp"; then
-        has_rules=1
-    else
-        generate_empty_conf "$tmp"
-        has_rules=0
-    fi
+    build_transaction_conf "$candidate_file" "$tx_tmp"
+    build_runtime_conf "$candidate_file" "$runtime_tmp"
 
-    if ! have_cmd nft; then
-        rm -f "$tmp"
+    check_err="$(nft -c -f "$tx_tmp" 2>&1)"
+    if [[ $? -ne 0 ]]; then
+        mkdir -p "$LOG_DIR" 2>/dev/null || true
+        {
+            echo "[$(date '+%F %T')] nft dry-run error:"
+            echo "$check_err"
+        } > "${LOG_DIR}/last_nft_error.log"
+        msg_err "❌ nft 规则校验失败，未应用。详情见 ${LOG_DIR}/last_nft_error.log"
+        rm -f "$tx_tmp" "$runtime_tmp"
         return 1
     fi
 
-    local chk_err
-    chk_err="$(nft -c -f "$tmp" 2>&1)"
+    apply_err="$(nft -f "$tx_tmp" 2>&1)"
     if [[ $? -ne 0 ]]; then
         mkdir -p "$LOG_DIR" 2>/dev/null || true
-        echo "[$(date '+%F %T')] nft -c error:" > "${LOG_DIR}/last_nft_error.log"
-        echo "$chk_err" >> "${LOG_DIR}/last_nft_error.log"
-        msg_err "❌ nft 规则语法校验失败：未应用、未写入持久化文件。"
-        msg_err "   详情: ${LOG_DIR}/last_nft_error.log"
-        rm -f "$tmp"
-        return 1
-    fi
-
-    nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
-    local apply_err
-    apply_err="$(nft -f "$tmp" 2>&1)"
-    if [[ $? -ne 0 ]]; then
-        mkdir -p "$LOG_DIR" 2>/dev/null || true
-        echo "[$(date '+%F %T')] nft apply error:" > "${LOG_DIR}/last_nft_error.log"
-        echo "$apply_err" >> "${LOG_DIR}/last_nft_error.log"
-        msg_err "❌ nft 规则应用失败：未写入持久化文件。"
-        msg_err "   详情: ${LOG_DIR}/last_nft_error.log"
-        rm -f "$tmp"
+        {
+            echo "[$(date '+%F %T')] nft apply error:"
+            echo "$apply_err"
+        } > "${LOG_DIR}/last_nft_error.log"
+        msg_err "❌ nft 规则应用失败，原有内核规则未切换。详情见 ${LOG_DIR}/last_nft_error.log"
+        rm -f "$tx_tmp" "$runtime_tmp"
         return 1
     fi
 
     mkdir -p "$NFT_MGR_DIR" 2>/dev/null || true
-    if [[ -f "$NFT_MGR_CONF" ]]; then
-        cp -a "$NFT_MGR_CONF" "${NFT_MGR_CONF}.bak.$(date +%s)" 2>/dev/null || true
-    fi
-    mv -f "$tmp" "$NFT_MGR_CONF"
-    chmod 600 "$NFT_MGR_CONF" 2>/dev/null || true
+    mv -f "$runtime_tmp" "$NFT_RUNTIME_CONF"
+    chmod 600 "$NFT_RUNTIME_CONF" 2>/dev/null || true
+    mv -f "$candidate_file" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+    rm -f "$tx_tmp"
 
-    if [[ "$PERSIST_MODE" == "system" ]]; then
-        enable_persist_system >/dev/null 2>&1 || true
-    else
-        if have_cmd systemctl; then
-            systemctl enable nft-mgr >/dev/null 2>&1 || true
-        fi
+    ensure_nft_mgr_service
+    if have_cmd systemctl; then
+        systemctl enable nft-mgr >/dev/null 2>&1 || true
     fi
-
-    if [[ $has_rules -eq 1 ]]; then
-        msg_ok "✅ 规则已原子化应用并持久化。"
-    else
-        msg_ok "✅ 当前无有效转发规则：已应用空表并持久化。"
-    fi
+    ensure_ddns_scheduler_state >/dev/null 2>&1 || true
     return 0
 }
 
-apply_rules() {
-    with_lock apply_rules_impl
+apply_rules_current() {
+    local candidate
+    candidate="$(mktemp /tmp/nftmgr-current.XXXXXX)"
+    cp -a "$CONFIG_FILE" "$candidate" 2>/dev/null || : > "$candidate"
+    apply_candidate_rules "$candidate"
 }
 
 # --------------------------
-# 新增转发
+# 规则辅助
 # --------------------------
+port_rule_exists() {
+    local file="$1" port="$2" line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        [[ "$RULE_LPORT" == "$port" ]] && return 0
+    done < "$file"
+    return 1
+}
+
 port_in_use() {
-    local port="$1"
-    local proto="$2"
+    local port="$1" proto="$2"
     proto="$(normalize_proto "$proto")"
     local used=1
-
     if have_cmd ss; then
         if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
             ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port" && used=0
@@ -661,14 +869,42 @@ port_in_use() {
     return $used
 }
 
+rule_count() {
+    local file="$1" line count=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        count=$((count + 1))
+    done < "$file"
+    printf '%s\n' "$count"
+}
+
+get_rule_line_number_by_index() {
+    local file="$1" want="$2" line nr=0 idx=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        nr=$((nr + 1))
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        idx=$((idx + 1))
+        if [[ "$idx" == "$want" ]]; then
+            printf '%s\n' "$nr"
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
+
+# --------------------------
+# 新增规则
+# --------------------------
 add_forward_impl() {
-    local lport taddr tport proto tip
+    local lport taddr tport proto psel tmp_candidate
 
     read -rp "请输入本地监听端口 (1-65535): " lport
     is_port "$lport" || { msg_err "错误: 本地端口必须是 1-65535 的纯数字。"; sleep 2; return 1; }
 
-    if grep -qE "^${lport}\|" "$CONFIG_FILE" 2>/dev/null; then
-        msg_err "错误: 本地端口 $lport 已存在规则！请先删除旧规则。"
+    if port_rule_exists "$CONFIG_FILE" "$lport"; then
+        msg_err "错误: 本地端口 ${lport} 已存在规则，请先删除旧规则。"
         sleep 2
         return 1
     fi
@@ -678,43 +914,43 @@ add_forward_impl() {
     case "$psel" in
         1) proto="tcp" ;;
         2) proto="udp" ;;
-        3|"") proto="both" ;;
         *) proto="both" ;;
     esac
 
     if port_in_use "$lport" "$proto"; then
-        msg_warn "⚠️ 检测到本机已有进程监听该端口（${lport}/${proto}）。继续添加转发会导致外部访问被 DNAT 劫持。"
+        msg_warn "⚠️ 检测到本机已有进程监听 ${lport}/${proto}，外部访问可能被 DNAT 劫持。"
         read -rp "仍要继续？[y/N]: " go
-        [[ "$go" != "y" && "$go" != "Y" ]] && return 1
+        [[ "$go" =~ ^[Yy]$ ]] || return 1
     fi
 
-    read -rp "请输入目标地址 (IP 或 域名): " taddr
-    [[ -z "$taddr" ]] && { msg_err "错误: 目标地址不能为空。"; sleep 2; return 1; }
+    read -rp "请输入目标地址 (IPv4 / IPv6 / 域名): " taddr
+    taddr="$(printf '%s' "$taddr" | trim)"
+    [[ -n "$taddr" ]] || { msg_err "错误: 目标地址不能为空。"; sleep 2; return 1; }
 
     read -rp "请输入目标端口 (1-65535): " tport
     is_port "$tport" || { msg_err "错误: 目标端口必须是 1-65535 的纯数字。"; sleep 2; return 1; }
 
     echo -e "${CYAN}正在解析并验证目标地址...${PLAIN}"
-    tip="$(get_ip "$taddr")"
-    [[ -z "$tip" ]] && { msg_err "错误: 解析失败，请检查域名或服务器网络/DNS。"; sleep 2; return 1; }
-
-    local conf_bak
-    conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
-    cp -a "$CONFIG_FILE" "$conf_bak" 2>/dev/null || true
-
-    echo "${lport}|${taddr}|${tport}|${tip}|${proto}" >> "$CONFIG_FILE"
-
-    if ! apply_rules_impl; then
-        [[ -s "$conf_bak" ]] && mv -f "$conf_bak" "$CONFIG_FILE" || true
-        msg_err "❌ 应用规则失败：已回滚本次新增配置。"
+    if ! resolve_target_pair "$taddr"; then
+        msg_err "错误: 目标地址非法，或域名 A/AAAA 解析失败。"
         sleep 2
         return 1
     fi
-    rm -f "$conf_bak" 2>/dev/null || true
 
-    manage_firewall "add" "$lport" "$proto" || true
+    tmp_candidate="$(mktemp /tmp/nftmgr-add.XXXXXX)"
+    cp -a "$CONFIG_FILE" "$tmp_candidate" 2>/dev/null || : > "$tmp_candidate"
+    emit_rule_line "$lport" "$taddr" "$tport" "$RESOLVED_V4" "$RESOLVED_V6" "$proto" >> "$tmp_candidate"
 
-    msg_ok "添加成功！映射路径: [本机] ${lport}/${proto} -> [目标] ${taddr}:${tport} (${tip})"
+    if ! apply_candidate_rules "$tmp_candidate"; then
+        msg_err "❌ 应用规则失败：本次新增未提交。"
+        sleep 2
+        return 1
+    fi
+
+    manage_firewall add "$lport" "$proto"
+    msg_ok "✅ 添加成功：${lport}/${proto} -> ${taddr}:${tport}"
+    [[ -n "$RESOLVED_V4" ]] && msg_info "   IPv4: ${RESOLVED_V4}"
+    [[ -n "$RESOLVED_V6" ]] && msg_info "   IPv6: ${RESOLVED_V6}"
     sleep 2
     return 0
 }
@@ -722,95 +958,73 @@ add_forward_impl() {
 add_forward() { with_lock add_forward_impl; }
 
 # --------------------------
-# 规则管理（查看/删除）
+# 规则管理
 # --------------------------
 list_and_del_forward_impl() {
     clear
-    if [[ ! -s "$CONFIG_FILE" ]]; then
+    if [[ ! -s "$CONFIG_FILE" ]] || [[ "$(rule_count "$CONFIG_FILE")" == "0" ]]; then
         msg_warn "当前没有任何转发规则。"
-        read -rp "按回车返回主菜单..."
+        pause
         return 0
     fi
 
-    echo -e "${CYAN}=========================== 规则管理 ===========================${PLAIN}"
-    printf "%-4s | %-6s | %-5s | %-24s | %-6s\n" "序号" "本地" "协议" "目标地址" "目标"
-    echo "----------------------------------------------------------------"
+    echo -e "${CYAN}============================= 规则管理 =============================${PLAIN}"
+    printf "%-4s | %-6s | %-5s | %-8s | %-24s | %-6s | %-15s | %-24s\n" "序号" "本地" "协议" "类型" "目标地址" "目标" "IPv4" "IPv6"
+    echo "---------------------------------------------------------------------------------------------------------------"
 
-    local i=1
-    while IFS='|' read -r lp addr tp last_ip proto; do
-        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-        proto="$(normalize_proto "$proto")"
-        is_port "$lp" || continue
-        is_port "$tp" || continue
-        printf "%-4s | %-6s | %-5s | %-24s | %-6s\n" "$i" "$lp" "$proto" "$addr" "$tp"
-        ((i++))
+    local i=1 line v4show v6show
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        v4show="${RULE_LAST_V4:--}"
+        v6show="${RULE_LAST_V6:--}"
+        printf "%-4s | %-6s | %-5s | %-8s | %-24s | %-6s | %-15s | %-24s\n" \
+            "$i" "$RULE_LPORT" "$RULE_PROTO" "$(note_addr_type "$RULE_ADDR")" "$RULE_ADDR" "$RULE_TPORT" "$v4show" "$v6show"
+        i=$((i + 1))
     done < "$CONFIG_FILE"
 
-    echo "----------------------------------------------------------------"
-    echo -e "\n${YELLOW}提示: 输入规则前面的【序号】即可删除，输入【0】或直接按回车返回。${PLAIN}"
+    echo "---------------------------------------------------------------------------------------------------------------"
+    echo -e "${YELLOW}输入序号即可删除；输入 0 或直接回车返回。${PLAIN}"
 
-    local action
+    local action line_no del_line del_port del_proto tmp_candidate
     read -rp "请选择操作: " action
+    [[ -z "$action" || "$action" == "0" ]] && return 0
+    [[ "$action" =~ ^[0-9]+$ ]] || { msg_err "输入无效。"; sleep 2; return 1; }
 
-    if [[ -z "$action" || "$action" == "0" ]]; then
-        return 0
-    fi
-    if ! [[ "$action" =~ ^[0-9]+$ ]]; then
-        msg_err "输入无效，请输入正确的数字。"
+    local total
+    total="$(rule_count "$CONFIG_FILE")"
+    if [[ "$action" -lt 1 || "$action" -gt "$total" ]]; then
+        msg_err "序号超出范围。"
         sleep 2
         return 1
     fi
 
-    local total_lines
-    total_lines="$(awk -F'|' 'BEGIN{c=0}
-        $0!~/^[[:space:]]*($|#)/{
-            if($1~/^[0-9]+$/ && $1>=1 && $1<=65535 && $3~/^[0-9]+$/ && $3>=1 && $3<=65535){
-                c++
-            }
-        }
-        END{print c+0}' "$CONFIG_FILE" 2>/dev/null)"
-
-    if [[ "$action" -lt 1 || "$action" -gt "$total_lines" ]]; then
-        msg_err "序号超出范围！"
+    line_no="$(get_rule_line_number_by_index "$CONFIG_FILE" "$action")" || {
+        msg_err "删除失败：无法定位规则行。"
         sleep 2
         return 1
-    fi
+    }
 
-    local line_no
-    line_no="$(awk -F'|' -v N="$action" 'BEGIN{c=0}
-        $0!~/^[[:space:]]*($|#)/{
-            if($1~/^[0-9]+$/ && $1>=1 && $1<=65535 && $3~/^[0-9]+$/ && $3>=1 && $3<=65535){
-                c++
-                if(c==N){print NR; exit}
-            }
-        }' "$CONFIG_FILE")"
-
-    [[ -z "$line_no" ]] && { msg_err "删除失败：无法定位规则行。"; sleep 2; return 1; }
-
-    local del_line del_port del_proto
     del_line="$(sed -n "${line_no}p" "$CONFIG_FILE")"
-    del_port="$(echo "$del_line" | cut -d'|' -f1)"
-    del_proto="$(echo "$del_line" | cut -d'|' -f5)"
-    del_proto="$(normalize_proto "$del_proto")"
+    parse_rule_line "$del_line" || {
+        msg_err "删除失败：规则格式异常。"
+        sleep 2
+        return 1
+    }
+    del_port="$RULE_LPORT"
+    del_proto="$RULE_PROTO"
 
-    local conf_bak
-    conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
-    cp -a "$CONFIG_FILE" "$conf_bak" 2>/dev/null || true
+    tmp_candidate="$(mktemp /tmp/nftmgr-del.XXXXXX)"
+    sed "${line_no}d" "$CONFIG_FILE" > "$tmp_candidate"
 
-    sed -i "${line_no}d" "$CONFIG_FILE"
-
-    if ! apply_rules_impl; then
-        [[ -s "$conf_bak" ]] && mv -f "$conf_bak" "$CONFIG_FILE" || true
-        msg_err "❌ 应用规则失败：已回滚本次删除操作。"
+    if ! apply_candidate_rules "$tmp_candidate"; then
+        msg_err "❌ 删除失败：内核规则未切换，配置未变更。"
         sleep 2
         return 1
     fi
-    rm -f "$conf_bak" 2>/dev/null || true
 
-    manage_firewall "del" "$del_port" "$del_proto" || true
-    ensure_ddns_cron_disabled_if_unused
-
-    msg_ok "已成功删除本地端口为 ${del_port}/${del_proto} 的转发规则。"
+    manage_firewall del "$del_port" "$del_proto"
+    msg_ok "✅ 已删除本地端口 ${del_port}/${del_proto}。"
     sleep 2
     return 0
 }
@@ -818,181 +1032,231 @@ list_and_del_forward_impl() {
 list_and_del_forward() { with_lock list_and_del_forward_impl; }
 
 # --------------------------
-# DDNS 追踪更新
+# DDNS 更新
 # --------------------------
 ddns_update_impl() {
-    local changed=0
-    local temp_file
-    temp_file="$(mktemp /tmp/nftmgr-ddns.XXXXXX)"
+    load_settings
+    [[ "$DDNS_ENABLED" == "1" ]] || return 0
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    has_domain_rules_in_file "$CONFIG_FILE" || return 0
 
-    [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR"
-    local today_log="$LOG_DIR/$(date '+%Y-%m-%d').log"
+    local changed=0 line tmp_candidate today_log old_v4 old_v6
+    tmp_candidate="$(mktemp /tmp/nftmgr-ddns.XXXXXX)"
+    today_log="${LOG_DIR}/$(date '+%Y-%m-%d').log"
 
     while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ -z "$line" ]]; then
-            echo "" >> "$temp_file"
-            continue
-        fi
-        if [[ "${line:0:1}" == "#" ]]; then
-            echo "$line" >> "$temp_file"
+        if [[ -z "$line" || "${line:0:1}" == "#" ]]; then
+            printf '%s\n' "$line" >> "$tmp_candidate"
             continue
         fi
 
-        local lp addr tp last_ip proto
-        IFS='|' read -r lp addr tp last_ip proto <<< "$line"
-        proto="$(normalize_proto "$proto")"
+        parse_rule_line "$line" || { printf '%s\n' "$line" >> "$tmp_candidate"; continue; }
+        rule_is_valid || { printf '%s\n' "$line" >> "$tmp_candidate"; continue; }
 
-        if ! is_port "$lp" || ! is_port "$tp" || [[ -z "$addr" ]]; then
-            echo "$line" >> "$temp_file"
+        if is_literal_ip "$RULE_ADDR"; then
+            emit_rule_line "$RULE_LPORT" "$RULE_ADDR" "$RULE_TPORT" "$RULE_LAST_V4" "$RULE_LAST_V6" "$RULE_PROTO" >> "$tmp_candidate"
             continue
         fi
 
-        local current_ip
-        current_ip="$(get_ip "$addr")"
-
-        if [[ -z "$current_ip" ]] && ! is_ipv4 "$addr"; then
-            echo "[$(date '+%H:%M:%S')] [ERROR] 端口 ${lp}: 域名 ${addr} 解析失败（保持 last_ip=${last_ip:-N/A}）" >> "$today_log"
-            echo "${lp}|${addr}|${tp}|${last_ip}|${proto}" >> "$temp_file"
+        old_v4="$RULE_LAST_V4"
+        old_v6="$RULE_LAST_V6"
+        if ! resolve_target_pair "$RULE_ADDR"; then
+            printf '[%s] [ERROR] 端口 %s: 域名 %s A/AAAA 解析失败（保持旧值）\n' "$(date '+%H:%M:%S')" "$RULE_LPORT" "$RULE_ADDR" >> "$today_log"
+            emit_rule_line "$RULE_LPORT" "$RULE_ADDR" "$RULE_TPORT" "$RULE_LAST_V4" "$RULE_LAST_V6" "$RULE_PROTO" >> "$tmp_candidate"
             continue
         fi
 
-        if [[ -n "$current_ip" && "$current_ip" != "$last_ip" ]]; then
-            echo "${lp}|${addr}|${tp}|${current_ip}|${proto}" >> "$temp_file"
+        if [[ "$RESOLVED_V4" != "$old_v4" || "$RESOLVED_V6" != "$old_v6" ]]; then
             changed=1
-            echo "[$(date '+%H:%M:%S')] 端口 ${lp}: ${addr} 变动 (${last_ip:-N/A} -> ${current_ip})" >> "$today_log"
-        else
-            echo "${lp}|${addr}|${tp}|${last_ip}|${proto}" >> "$temp_file"
+            printf '[%s] 端口 %s: %s 变动 (IPv4 %s -> %s, IPv6 %s -> %s)\n' \
+                "$(date '+%H:%M:%S')" "$RULE_LPORT" "$RULE_ADDR" \
+                "${old_v4:--}" "${RESOLVED_V4:--}" "${old_v6:--}" "${RESOLVED_V6:--}" >> "$today_log"
         fi
+        emit_rule_line "$RULE_LPORT" "$RULE_ADDR" "$RULE_TPORT" "$RESOLVED_V4" "$RESOLVED_V6" "$RULE_PROTO" >> "$tmp_candidate"
     done < "$CONFIG_FILE"
 
-    mv -f "$temp_file" "$CONFIG_FILE"
-
     if [[ $changed -eq 1 ]]; then
-        if ! apply_rules_impl; then
-            echo "[$(date '+%H:%M:%S')] [ERROR] 应用 nft 规则失败（已保留配置，但规则未更新）" >> "$today_log"
+        if ! apply_candidate_rules "$tmp_candidate"; then
+            printf '[%s] [ERROR] nft 规则应用失败，本次 DDNS 更新已丢弃，配置保持不变\n' "$(date '+%H:%M:%S')" >> "$today_log"
+            rm -f "$tmp_candidate"
+            return 1
         fi
+        printf '[%s] [OK] DDNS 更新已提交\n' "$(date '+%H:%M:%S')" >> "$today_log"
+    else
+        rm -f "$tmp_candidate"
     fi
 
-    find "$LOG_DIR" -type f -name "*.log" -mtime +7 -exec rm -f {} \; 2>/dev/null || true
+    find "$LOG_DIR" -type f -name '*.log' -mtime +7 -exec rm -f {} \; 2>/dev/null || true
     return 0
 }
 
+# 修补了嵌套死锁问题的封装
 ddns_update() { with_lock ddns_update_impl; }
 
 # --------------------------
-# 定时任务管理（DDNS）
+# 开关 / 状态管理
 # --------------------------
-manage_cron() {
+manage_features_impl() {
+    load_settings
     clear
-    local script_path="/usr/local/bin/${CMD_NAME}"
-    [[ -x "$script_path" ]] || script_path="$(script_realpath)"
-    if crontab -l 2>/dev/null | grep -Fq "${script_path} --cron"; then
-        echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) --- [已启用]${PLAIN}"
+    echo -e "${GREEN}--- 加速与监控开关 ---${PLAIN}"
+    echo "1. 切换 Flowtable 加速   [当前: $(flowtable_status_text)]"
+    if cron_is_enabled; then
+        echo "2. 切换 DDNS 自动监控   [当前: $( [[ "$DDNS_ENABLED" == "1" ]] && echo "开启 / 定时任务已安装" || echo "关闭 / 定时任务仍存在" )]"
     else
-        echo -e "${GREEN}--- 管理定时监控 (DDNS 同步) --- [未启用]${PLAIN}"
+        echo "2. 切换 DDNS 自动监控   [当前: $( [[ "$DDNS_ENABLED" == "1" ]] && echo "开启 / 定时任务未安装(无域名规则或未同步)" || echo "关闭" )]"
     fi
-    echo "1. 手动添加定时任务 (每 5 分钟检测)"
-    echo "2. 一键删除定时任务"
-    echo "3. 查看 DDNS 变动历史日志 (仅保留最近7天)"
+    echo "3. 立即执行一次 DDNS 检查"
+    echo "4. 查看 DDNS 日志（最近 7 天）"
     echo "0. 返回主菜单"
     echo "--------------------------------"
-    local cron_choice
-    read -rp "请选择操作 [0-3]: " cron_choice
 
-    local SCRIPT_PATH="/usr/local/bin/${CMD_NAME}"
-
-    case "$cron_choice" in
+    local pick
+    read -rp "请选择 [0-4]: " pick
+    case "$pick" in
         1)
-            if crontab -l 2>/dev/null | grep -q "${SCRIPT_PATH} --cron"; then
-                msg_warn "定时任务已存在。"
-                sleep 2
-                return
+            if [[ "$FLOWTABLE_ENABLED" == "1" ]]; then
+                settings_set FLOWTABLE_ENABLED 0
+                msg_info "已关闭 Flowtable。"
+            else
+                settings_set FLOWTABLE_ENABLED 1
+                msg_info "已开启 Flowtable（若内核/接口不支持，将在应用时自动跳过）。"
             fi
-            (crontab -l 2>/dev/null; echo "*/5 * * * * ${SCRIPT_PATH} --cron > /dev/null 2>&1") | crontab - 2>/dev/null
-            msg_ok "定时任务已添加！将每 5 分钟检查 IP 并生成日志。"
+            load_settings
+            if [[ -s "$CONFIG_FILE" ]]; then
+                apply_rules_current >/dev/null 2>&1 || msg_warn "⚠️ 已保存开关，但当前规则重载失败，请稍后检查。"
+            fi
             sleep 2
             ;;
         2)
-            crontab -l 2>/dev/null | grep -v "${SCRIPT_PATH} --cron" | crontab - 2>/dev/null
-            msg_warn "定时任务已清除。"
+            if [[ "$DDNS_ENABLED" == "1" ]]; then
+                settings_set DDNS_ENABLED 0
+                msg_info "已关闭 DDNS 自动监控。"
+            else
+                settings_set DDNS_ENABLED 1
+                msg_info "已开启 DDNS 自动监控。"
+            fi
+            load_settings
+            ensure_ddns_scheduler_state
             sleep 2
             ;;
         3)
+            # 【修复点】：避免双重获取 flock 死锁，直接调用内层业务逻辑
+            if ddns_update_impl; then
+                msg_ok "DDNS 检查完成。"
+            else
+                msg_warn "DDNS 检查已完成，但存在失败项，请查看日志。"
+            fi
+            sleep 2
+            ;;
+        4)
             clear
             if [[ -d "$LOG_DIR" ]] && ls "$LOG_DIR"/*.log >/dev/null 2>&1; then
-                echo -e "${GREEN}--- 近 7 天 DDNS 变动日志（末20行） ---${PLAIN}"
-                cat "$LOG_DIR"/*.log 2>/dev/null | tail -n 20
+                echo -e "${GREEN}--- DDNS 日志（末 50 行） ---${PLAIN}"
+                cat "$LOG_DIR"/*.log 2>/dev/null | tail -n 50
             else
-                msg_warn "暂无 IP 变动记录。"
+                msg_warn "暂无 DDNS 日志。"
             fi
-            echo ""
-            read -rp "按回车键返回..."
+            echo
+            pause
             ;;
-        0) return ;;
+        0) return 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
     esac
 }
+
+manage_features() { with_lock manage_features_impl; }
 
 # --------------------------
 # 清空规则
 # --------------------------
 clear_all_rules_impl() {
-    if [[ ! -s "$CONFIG_FILE" ]]; then
+    if [[ ! -s "$CONFIG_FILE" ]] || [[ "$(rule_count "$CONFIG_FILE")" == "0" ]]; then
         msg_warn "当前没有规则，无需清空。"
         sleep 1
         return 0
     fi
 
-    msg_warn "⚠️ 将清空所有转发规则（并移除 ufw/firewalld 放行）。"
+    msg_warn "⚠️ 将清空所有转发规则。"
     read -rp "确认清空？[y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
 
-    while IFS='|' read -r lp addr tp last_ip proto; do
-        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-        is_port "$lp" || continue
-        proto="$(normalize_proto "$proto")"
-        manage_firewall "del" "$lp" "$proto" || true
-    done < "$CONFIG_FILE"
+    local tmp_candidate old_copy line
+    tmp_candidate="$(mktemp /tmp/nftmgr-clear.XXXXXX)"
+    old_copy="$(mktemp /tmp/nftmgr-oldrules.XXXXXX)"
+    cp -a "$CONFIG_FILE" "$old_copy"
+    : > "$tmp_candidate"
 
-    local conf_bak
-    conf_bak="$(mktemp /tmp/nftmgr-conf.XXXXXX)"
-    cp -a "$CONFIG_FILE" "$conf_bak" 2>/dev/null || true
-
-    > "$CONFIG_FILE"
-    if ! apply_rules_impl; then
-        [[ -s "$conf_bak" ]] && mv -f "$conf_bak" "$CONFIG_FILE" || true
-        msg_err "❌ 清空后应用规则失败：已回滚配置。"
+    if ! apply_candidate_rules "$tmp_candidate"; then
+        rm -f "$old_copy"
+        msg_err "❌ 清空失败：原有规则保持不变。"
         sleep 2
         return 1
     fi
-    rm -f "$conf_bak" 2>/dev/null || true
-    ensure_ddns_cron_disabled_if_unused
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        manage_firewall del "$RULE_LPORT" "$RULE_PROTO"
+    done < "$old_copy"
+    rm -f "$old_copy"
 
     msg_ok "✅ 所有规则已清空。"
     sleep 2
+    return 0
 }
 
 clear_all_rules() { with_lock clear_all_rules_impl; }
 
 # --------------------------
-# 完全卸载
+# 卸载
 # --------------------------
+remove_old_system_include_if_present() {
+    local nft_conf="/etc/nftables.conf"
+    [[ -f "$nft_conf" ]] || return 0
+    local bak tmp
+    bak="${nft_conf}.nftmgr.uninstall.bak.$(date +%s)"
+    cp -a "$nft_conf" "$bak" 2>/dev/null || true
+    tmp="$(mktemp /tmp/nftmgr-uninstall-nftconf.XXXXXX)"
+    sed '/# nf include (added .*$/d; /# nftmgr persistent include$/d; \|include "/etc/nftables.d/nft_mgr.conf"|d' "$nft_conf" > "$tmp"
+    if nft -c -f "$tmp" >/dev/null 2>&1; then
+        mv -f "$tmp" "$nft_conf"
+    else
+        rm -f "$tmp"
+        msg_warn "⚠️ 检测到旧版 /etc/nftables.conf include，已保留原文件与备份 ${bak}，请按需手动清理。"
+    fi
+}
+
 uninstall_script_impl() {
     clear
     echo -e "${RED}--- 卸载 nftables 端口转发管理面板 ---${PLAIN}"
-    read -rp "警告: 此操作将删除本脚本、规则配置、定时任务、systemd 服务，并移除本脚本创建的 nft 表。确认？[y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
+    read -rp "确认卸载？这将删除规则、配置、DDNS 定时任务与 systemd 服务。[y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
 
-    while IFS='|' read -r lp addr tp last_ip proto; do
-        [[ -z "$lp" || "${lp:0:1}" == "#" ]] && continue
-        is_port "$lp" || continue
-        proto="$(normalize_proto "$proto")"
-        manage_firewall "del" "$lp" "$proto" || true
-    done < "$CONFIG_FILE" 2>/dev/null || true
+    local old_copy line
+    old_copy="$(mktemp /tmp/nftmgr-uninstall-rules.XXXXXX)"
+    cp -a "$CONFIG_FILE" "$old_copy" 2>/dev/null || : > "$old_copy"
 
-    have_cmd nft && nft delete table ip nft_mgr_nat >/dev/null 2>&1 || true
+    : > "$CONFIG_FILE"
+    apply_rules_current >/dev/null 2>&1 || true
 
-    remove_ddns_cron_task || true
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_rule_line "$line" || continue
+        rule_is_valid || continue
+        manage_firewall del "$RULE_LPORT" "$RULE_PROTO"
+    done < "$old_copy"
+    rm -f "$old_copy"
+
+    if have_cmd crontab; then
+        remove_legacy_cron_entries
+        if cron_is_enabled; then
+            crontab -l 2>/dev/null | grep -Fvx "$(cron_entry)" | crontab - 2>/dev/null || true
+        fi
+    fi
+
+    have_cmd nft && nft delete table inet "$TABLE_INET" >/dev/null 2>&1 || true
+    have_cmd nft && nft delete table ip "$TABLE_V4" >/dev/null 2>&1 || true
+    have_cmd nft && nft delete table ip6 "$TABLE_V6" >/dev/null 2>&1 || true
 
     if have_cmd systemctl; then
         systemctl disable --now nft-mgr >/dev/null 2>&1 || true
@@ -1000,38 +1264,14 @@ uninstall_script_impl() {
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
-    if [[ -f "$NFTABLES_CONF" ]]; then
-        sed -i '/# nf include (added .*$/d' "$NFTABLES_CONF" 2>/dev/null || true
-        sed -i '/# nftmgr persistent include$/d' "$NFTABLES_CONF" 2>/dev/null || true
-        sed -i '\|include "/etc/nftables.d/nft_mgr.conf"|d' "$NFTABLES_CONF" 2>/dev/null || true
-    fi
+    remove_old_system_include_if_present
 
-    if [[ -f "$NFTABLES_CREATED_MARK" ]]; then
-        rm -f "$NFTABLES_CREATED_MARK" 2>/dev/null || true
-        local latest_bak
-        latest_bak="$(ls -1t ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null | head -n 1)"
-        if [[ -n "$latest_bak" && -f "$latest_bak" ]]; then
-            cp -a "$latest_bak" "$NFTABLES_CONF" 2>/dev/null || true
-        else
-            rm -f "$NFTABLES_CONF" 2>/dev/null || true
-            if have_cmd systemctl; then
-                systemctl disable --now nftables >/dev/null 2>&1 || true
-            fi
-        fi
-    fi
-
-    rm -f ${NFTABLES_CONF}.nftmgr.bak.* 2>/dev/null || true
-    rm -f "$NFT_MGR_CONF" "$CONFIG_FILE" "$SETTINGS_FILE" "$SYSCTL_FILE" "$LOCK_FILE" 2>/dev/null || true
+    rm -f "$NFT_RUNTIME_CONF" "$CONFIG_FILE" "$SETTINGS_FILE" "$SYSCTL_FILE" "$LOCK_FILE" 2>/dev/null || true
     rm -rf "$LOG_DIR" 2>/dev/null || true
     rmdir "$NFT_MGR_DIR" 2>/dev/null || true
-
-    if have_cmd systemctl; then
-        systemctl restart nftables >/dev/null 2>&1 || true
-    fi
-
-    msg_ok "✅ 卸载完成（已清理脚本残留）。"
-
     rm -f "/usr/local/bin/${CMD_NAME}" 2>/dev/null || true
+
+    msg_ok "✅ 卸载完成。"
     exit 0
 }
 
@@ -1041,27 +1281,36 @@ uninstall_script() { with_lock uninstall_script_impl; }
 # 主菜单
 # --------------------------
 main_menu() {
+    load_settings
     clear
-    echo -e "${GREEN}==========================================${PLAIN}"
-    echo -e "${GREEN}     nftables 端口转发管理面板 (Pro 极限版)${PLAIN}"
-    echo -e "${GREEN}==========================================${PLAIN}"
-    echo "1. 开启 极限网络调优 (BBR+大并发+连接跟踪优化)"
-    echo "2. 新增端口转发 (支持域名/IP，支持TCP/UDP选择)"
+    echo -e "${GREEN}====================================================${PLAIN}"
+    echo -e "${GREEN}       nftables 端口转发管理面板 (Pro Max)${PLAIN}"
+    echo -e "${GREEN}====================================================${PLAIN}"
+    echo "Flowtable: $(flowtable_status_text)"
+    if cron_is_enabled; then
+        echo "DDNS 自动监控: $( [[ "$DDNS_ENABLED" == "1" ]] && echo "开启（定时任务已安装）" || echo "关闭（但残留定时任务，请进菜单同步）" )"
+    else
+        echo "DDNS 自动监控: $( [[ "$DDNS_ENABLED" == "1" ]] && echo "开启（当前未安装定时任务）" || echo "关闭" )"
+    fi
+    echo "当前规则数: $(rule_count "$CONFIG_FILE")"
+    echo "----------------------------------------------------"
+    echo "1. 开启极限网络调优 (BBR+高并发+连接跟踪)"
+    echo "2. 新增端口转发 (IPv4/IPv6/域名, TCP/UDP)"
     echo "3. 规则管理 (查看/删除)"
     echo "4. 清空所有转发规则"
-    echo "5. 管理 DDNS 定时监控与日志"
+    echo "5. 管理 Flowtable / DDNS 开关与日志"
     echo "6. 一键完全卸载本脚本"
     echo "0. 退出面板"
-    echo "------------------------------------------"
+    echo "----------------------------------------------------"
+
     local choice
     read -rp "请选择操作 [0-6]: " choice
-
     case "$choice" in
         1) optimize_system ;;
         2) add_forward ;;
         3) list_and_del_forward ;;
         4) clear_all_rules ;;
-        5) manage_cron ;;
+        5) manage_features ;;
         6) uninstall_script ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
@@ -1073,10 +1322,9 @@ main_menu() {
 # --------------------------
 require_root
 check_env
-install_global_command
-auto_persist_setup
+ensure_default_settings
+load_settings
 
-# CLI 模式
 case "${1:-}" in
     --cron)
         ddns_update
@@ -1084,7 +1332,10 @@ case "${1:-}" in
         ;;
 esac
 
-# 菜单循环
 while true; do
     main_menu
 done
+EOF
+
+chmod +x /root/nf.sh
+bash /root/nf.sh
