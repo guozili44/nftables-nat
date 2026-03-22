@@ -1,8 +1,8 @@
 #!/bin/bash
-# my 综合管理（修复增强版）
-# 功能：优化 / DNS / SSH / GitHub known_hosts / DDNS / Nginx / DD / 清理卸载 / 远程更新
-# 说明：配置与状态独立存储，升级覆盖脚本时默认保留现有配置
-# 版本：v2.2.0-fixed
+# my 综合管理（优化专用版）
+# 已移除：Xray / Reality / SS2022 / NFT 转发相关代码
+# 更新地址：https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh
+# 版本：v2.1.0-optimized
 # 指纹：CMD_NAME="my" / MY_SCRIPT_ID="my-manager"
 
 set -o pipefail
@@ -10,12 +10,12 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 
 CMD_NAME="my"
 MY_SCRIPT_ID="my-manager"
-MY_VERSION="2.2.0-fixed"
+MY_VERSION="2.1.0-optimized"
 MY_STATE_DIR="/usr/local/lib/my/state"
 DNS_STATE_DIR="${MY_STATE_DIR}/dns"
 DDNS_STATE_DIR="${MY_STATE_DIR}/ddns"
-UPDATE_URL_DIRECT=""
-UPDATE_URL_PROXY=""
+UPDATE_URL_DIRECT="https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh"
+UPDATE_URL_PROXY="https://mirror.ghproxy.com/https://raw.githubusercontent.com/guozili44/nftables-nat/refs/heads/main/my.sh"
 REINSTALL_UPSTREAM_GLOBAL="https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
 REINSTALL_UPSTREAM_CN="https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh"
 REINSTALL_WORKDIR="/tmp/my-reinstall"
@@ -27,9 +27,6 @@ DNS_BACKUP_FILE="${DNS_STATE_DIR}/resolv.conf.bak"
 DNS_META_FILE="${DNS_STATE_DIR}/meta.conf"
 DDNS_CFG_FILE="${DDNS_STATE_DIR}/cloudflare.env"
 DDNS_LOG_FILE="${DDNS_STATE_DIR}/update.log"
-UPDATE_URL_FILE="${MY_STATE_DIR}/update-url.conf"
-OPTIMIZER_REPORT_FILE="${MY_STATE_DIR}/optimizer-report.conf"
-SSH_BACKUP_DIR="${MY_STATE_DIR}/ssh-backups"
 GITHUB_KNOWN_HOSTS="/root/.ssh/known_hosts"
 
 RED='\033[0;31m'
@@ -81,7 +78,7 @@ run_with_timeout() {
     fi
 }
 ensure_state_dirs() {
-    mkdir -p "$MY_STATE_DIR" "$DNS_STATE_DIR" "$DDNS_STATE_DIR" "$SSH_BACKUP_DIR" /root/.ssh 2>/dev/null || true
+    mkdir -p "$MY_STATE_DIR" "$DNS_STATE_DIR" "$DDNS_STATE_DIR" /root/.ssh 2>/dev/null || true
 }
 install_self_command() {
     local self
@@ -120,8 +117,6 @@ ensure_base_tools() {
     have_cmd grep || missing+=(grep)
     have_cmd ss || missing+=(iproute2)
     have_cmd python3 || missing+=(python3)
-    have_cmd ssh-keygen || missing+=(openssh-client)
-    have_cmd ssh-keyscan || missing+=(openssh-client)
     if [[ ${#missing[@]} -gt 0 ]]; then
         pkg_update_once >/dev/null 2>&1 || true
         pkg_install "${missing[@]}" >/dev/null 2>&1 || true
@@ -133,106 +128,6 @@ ensure_jq_or_python() {
     pkg_update_once >/dev/null 2>&1 || true
     pkg_install jq python3 >/dev/null 2>&1 || pkg_install python3 >/dev/null 2>&1 || true
     have_cmd jq || have_cmd python3
-}
-
-trim_ws() {
-    local s="$*"
-    s="${s#${s%%[![:space:]]*}}"
-    s="${s%${s##*[![:space:]]}}"
-    printf '%s' "$s"
-}
-
-path_token() {
-    printf '%s' "$1" | sed 's#[/ ]#_#g'
-}
-
-backup_file_once() {
-    local file="$1" backup
-    [[ -f "$file" ]] || return 0
-    mkdir -p "$SSH_BACKUP_DIR" 2>/dev/null || true
-    backup="${SSH_BACKUP_DIR}/$(path_token "$file").bak"
-    [[ -f "$backup" ]] || cp -a "$file" "$backup" 2>/dev/null || return 1
-}
-
-restore_ssh_backups() {
-    local backup file token
-    [[ -d "$SSH_BACKUP_DIR" ]] || return 0
-    for backup in "$SSH_BACKUP_DIR"/*.bak; do
-        [[ -f "$backup" ]] || continue
-        token="$(basename "$backup" .bak)"
-        file="${token//_//}"
-        cp -a "$backup" "$file" 2>/dev/null || true
-    done
-}
-
-sysctl_key_exists() {
-    local key="$1"
-    sysctl -aN 2>/dev/null | grep -Fxq "$key"
-}
-
-sysctl_get_quiet() {
-    sysctl -n "$1" 2>/dev/null || true
-}
-
-update_url_get() {
-    if [[ -n "${MY_UPDATE_URL:-}" ]]; then
-        printf '%s
-' "$MY_UPDATE_URL"
-        return 0
-    fi
-    if [[ -s "$UPDATE_URL_FILE" ]]; then
-        awk -F= '/^url=/{sub(/^url=/,""); print; exit}' "$UPDATE_URL_FILE" 2>/dev/null
-        return 0
-    fi
-    if [[ -n "$UPDATE_URL_DIRECT" ]]; then
-        printf '%s
-' "$UPDATE_URL_DIRECT"
-        return 0
-    fi
-    return 1
-}
-
-update_url_set() {
-    local url="$1"
-    [[ -n "$url" ]] || return 1
-    mkdir -p "$MY_STATE_DIR" 2>/dev/null || true
-    printf 'url=%s
-updated_at=%s
-' "$url" "$(date '+%F %T')" > "$UPDATE_URL_FILE"
-}
-
-normalize_github_raw_url() {
-    local url="$1"
-    url="$(trim_ws "$url")"
-    [[ -n "$url" ]] || return 1
-    if [[ "$url" =~ ^https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$ ]]; then
-        printf 'https://raw.githubusercontent.com/%s/%s/%s/%s
-' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
-        return 0
-    fi
-    printf '%s
-' "$url"
-}
-
-update_url_candidates() {
-    local base="$1"
-    base="$(normalize_github_raw_url "$base")" || return 1
-    printf '%s
-' "$base"
-    if [[ "$base" == https://raw.githubusercontent.com/* ]]; then
-        printf 'https://mirror.ghproxy.com/%s
-' "$base"
-    fi
-}
-
-show_update_source() {
-    local url
-    url="$(update_url_get 2>/dev/null || true)"
-    if [[ -n "$url" ]]; then
-        echo -e "当前远程更新地址: ${YELLOW}${url}${RESET}"
-    else
-        echo -e "当前远程更新地址: ${YELLOW}未设置${RESET}"
-    fi
 }
 
 status_colorize() {
@@ -381,7 +276,7 @@ verify_update_file() {
     [[ -s "$f" ]] || return 11
     [[ "$(wc -c < "$f" 2>/dev/null)" =~ ^[0-9]+$ ]] || return 18
     (( $(wc -c < "$f") >= 12000 )) || return 19
-    head -n 20 "$f" | grep -Eqi '^[[:space:]]*<(!DOCTYPE[[:space:]]+html|html)([[:space:]>]|$)' && return 20
+    grep -qi '<html' "$f" && return 20
     grep -q '^#!/bin/bash' "$f" || return 12
     grep -q 'CMD_NAME="my"' "$f" || return 13
     grep -q 'MY_SCRIPT_ID="my-manager"' "$f" || return 14
@@ -391,52 +286,43 @@ verify_update_file() {
     return 0
 }
 github_update() {
-    local requested_url="${1-}" target tmp bak rc new_ver size url real_url found=0
-    target="/usr/local/bin/${CMD_NAME}"
-    [[ -f "$target" ]] || target="$(script_realpath)"
-    real_url="$(trim_ws "${requested_url:-$(update_url_get 2>/dev/null || true)}")"
-    if [[ -z "$real_url" ]]; then
-        msg_warn "未设置远程 GitHub 更新地址。"
-        msg_info "请先在“脚本更新”菜单中设置 raw.githubusercontent.com 地址，或使用：my update set <URL>"
-        return 1
-    fi
+    local self tmp bak rc new_ver size url
+    self="$(script_realpath)"
     tmp="$(mktemp /tmp/my-update.XXXXXX.sh)" || { msg_err "创建临时文件失败。"; return 1; }
-    bak="${target}.bak.$(date +%Y%m%d%H%M%S)"
-    while IFS= read -r url; do
+    bak="${self}.bak.$(date +%Y%m%d%H%M%S)"
+    for url in "$UPDATE_URL_DIRECT" "$UPDATE_URL_PROXY"; do
         [[ -n "$url" ]] || continue
-        found=1
         : > "$tmp"
         if download_to "$url" "$tmp" >/dev/null 2>&1; then
             normalize_update_file "$tmp"
             verify_update_file "$tmp"
             rc=$?
             if (( rc == 0 )); then
-                if cmp -s "$tmp" "$target" 2>/dev/null; then
+                if cmp -s "$tmp" "$self" 2>/dev/null; then
                     msg_ok "已经是最新内容，无需更新。"
                     rm -f "$tmp"
                     return 0
                 fi
-                cp -f "$target" "$bak" 2>/dev/null || { msg_err "备份当前脚本失败。"; rm -f "$tmp"; return 1; }
-                cp -f "$tmp" "$target" 2>/dev/null || { msg_err "写入新脚本失败。"; rm -f "$tmp"; return 1; }
-                chmod +x "$target" 2>/dev/null || true
-                if ! bash -n "$target" >/dev/null 2>&1; then
-                    cp -f "$bak" "$target" 2>/dev/null || true
+                cp -f "$self" "$bak" 2>/dev/null || { msg_err "备份当前脚本失败。"; rm -f "$tmp"; return 1; }
+                cp -f "$tmp" "$self" 2>/dev/null || { msg_err "写入新脚本失败。"; rm -f "$tmp"; return 1; }
+                chmod +x "$self" 2>/dev/null || true
+                if ! bash -n "$self" >/dev/null 2>&1; then
+                    cp -f "$bak" "$self" 2>/dev/null || true
                     msg_err "新脚本语法检查失败，已自动回滚。"
                     rm -f "$tmp"
                     return 1
                 fi
-                new_ver="$(grep -m1 '^MY_VERSION=' "$target" | sed -E 's/^[^"]*"([^"]+)".*/\1/')"
-                msg_ok "远程 GitHub 更新成功。当前版本：${new_ver:-未知}"
-                msg_info "更新目标：${target}"
-                msg_info "旧版本备份：${bak}"
+                install_self_command >/dev/null 2>&1 || true
+                new_ver="$(grep -m1 '^MY_VERSION=' "$self" | sed -E 's/^[^"]*"([^"]+)".*/\1/')"
+                msg_ok "在线自更新成功。当前版本：${new_ver:-未知}"
+                msg_info "备份文件：${bak}"
                 rm -f "$tmp"
                 return 0
             fi
         else
             rc=2
         fi
-    done < <(update_url_candidates "$real_url")
-    (( found == 1 )) || rc=2
+    done
     size=$(wc -c < "$tmp" 2>/dev/null || echo 0)
     rm -f "$tmp"
     case "$rc" in
@@ -449,71 +335,55 @@ github_update() {
         17) msg_err "更新失败：新脚本语法错误。" ;;
         19) msg_err "更新失败：下载文件过小（${size} 字节）。" ;;
         20) msg_err "更新失败：下载结果像是网页，不是脚本。" ;;
-        *) msg_err "远程更新失败，请检查更新地址或网络。" ;;
+        *) msg_err "在线自更新失败，请稍后重试或检查上游地址。" ;;
     esac
     return 1
 }
 
 write_optimizer_profile() {
-    local profile="$1" applied="$2" skipped="$3" failed="$4"
-    printf 'profile=%s
-updated_at=%s
-applied=%s
-skipped=%s
-failed=%s
-' "$profile" "$(date '+%F %T')" "$applied" "$skipped" "$failed" > "$MY_STATE_DIR/optimizer.conf"
+    local profile="$1"
+    printf 'profile=%s\nupdated_at=%s\n' "$profile" "$(date '+%F %T')" > "$MY_STATE_DIR/optimizer.conf"
 }
 apply_sysctl_lines() {
     local profile="$1"
     shift
-    local line key value applied=0 skipped=0 failed=0 current_cc
-    mkdir -p /etc/sysctl.d 2>/dev/null || true
-    : > "$SYSCTL_OPT_FILE"
-    current_cc="$(sysctl_get_quiet net.ipv4.tcp_congestion_control)"
-    for line in "$@"; do
-        key="$(trim_ws "${line%%=*}")"
-        value="$(trim_ws "${line#*=}")"
-        [[ -n "$key" && -n "$value" ]] || continue
-        if [[ "$key" == "net.ipv4.tcp_congestion_control" ]] && ! sysctl_get_quiet net.ipv4.tcp_available_congestion_control | grep -qw "$value"; then
-            msg_warn "当前内核不支持拥塞控制算法 ${value}，保留当前值 ${current_cc:-未知}。"
-            skipped=$((skipped+1))
-            continue
-        fi
-        if ! sysctl_key_exists "$key"; then
-            msg_warn "跳过当前内核不存在的参数：${key}"
-            skipped=$((skipped+1))
-            continue
-        fi
-        printf '%s = %s
-' "$key" "$value" >> "$SYSCTL_OPT_FILE"
-        if sysctl -q -w "${key}=${value}" >/dev/null 2>&1; then
-            applied=$((applied+1))
-        else
-            msg_warn "参数写入失败：${key}=${value}"
-            failed=$((failed+1))
-        fi
-    done
-    sysctl -q -p "$SYSCTL_OPT_FILE" >/dev/null 2>&1 || true
-    write_optimizer_profile "$profile" "$applied" "$skipped" "$failed"
-    printf 'profile=%s
-applied=%s
-skipped=%s
-failed=%s
-current_cc=%s
-current_qdisc=%s
-' "$profile" "$applied" "$skipped" "$failed" "$(sysctl_get_quiet net.ipv4.tcp_congestion_control)" "$(sysctl_get_quiet net.core.default_qdisc)" > "$OPTIMIZER_REPORT_FILE"
-    if (( applied > 0 )); then
-        msg_ok "调优已写入：成功 ${applied} 项，跳过 ${skipped} 项，失败 ${failed} 项。"
-        return 0
-    fi
-    msg_err "没有任何调优参数成功写入。"
-    return 1
+    printf '%s\n' "$@" > "$SYSCTL_OPT_FILE"
+    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_OPT_FILE" >/dev/null 2>&1 || return 1
+    write_optimizer_profile "$profile"
 }
 apply_general_extreme_opt() {
-    apply_sysctl_lines "general-extreme" "net.core.default_qdisc = fq" "net.ipv4.tcp_congestion_control = bbr" "fs.file-max = 2097152" "fs.inotify.max_user_instances = 8192" "fs.inotify.max_user_watches = 1048576" "net.core.somaxconn = 65535" "net.core.netdev_max_backlog = 262144" "net.core.optmem_max = 25165824" "net.ipv4.ip_local_port_range = 10240 65535" "net.ipv4.tcp_max_syn_backlog = 262144" "net.ipv4.tcp_fin_timeout = 10" "net.ipv4.tcp_fastopen = 3" "net.ipv4.tcp_keepalive_time = 600" "net.ipv4.tcp_keepalive_intvl = 30" "net.ipv4.tcp_keepalive_probes = 5" "net.ipv4.tcp_mtu_probing = 1" "net.ipv4.tcp_slow_start_after_idle = 0" "net.ipv4.tcp_tw_reuse = 1" "vm.max_map_count = 1048576" "vm.swappiness = 10"
+    apply_sysctl_lines "general-extreme" \
+"net.core.default_qdisc = fq" \
+"net.ipv4.tcp_congestion_control = bbr" \
+"net.ipv4.tcp_fastopen = 3" \
+"net.ipv4.tcp_mtu_probing = 1" \
+"net.ipv4.tcp_slow_start_after_idle = 0" \
+"net.ipv4.ip_local_port_range = 10240 65535" \
+"net.ipv4.tcp_fin_timeout = 15" \
+"net.ipv4.tcp_keepalive_time = 600" \
+"net.ipv4.tcp_keepalive_intvl = 30" \
+"net.ipv4.tcp_keepalive_probes = 5" \
+"net.core.somaxconn = 4096" \
+"net.ipv4.tcp_max_syn_backlog = 8192" \
+"vm.swappiness = 10"
 }
 apply_nat_extreme_opt() {
-    apply_sysctl_lines "nat-extreme" "net.core.default_qdisc = fq" "net.ipv4.tcp_congestion_control = bbr" "net.ipv4.ip_forward = 1" "net.ipv6.conf.all.forwarding = 1" "fs.file-max = 2097152" "net.core.somaxconn = 65535" "net.core.netdev_max_backlog = 262144" "net.core.optmem_max = 25165824" "net.ipv4.ip_local_port_range = 10240 65535" "net.ipv4.tcp_max_syn_backlog = 262144" "net.ipv4.tcp_fin_timeout = 10" "net.ipv4.tcp_fastopen = 3" "net.ipv4.tcp_keepalive_time = 600" "net.ipv4.tcp_keepalive_intvl = 30" "net.ipv4.tcp_keepalive_probes = 5" "net.ipv4.tcp_mtu_probing = 1" "net.ipv4.tcp_slow_start_after_idle = 0" "net.ipv4.tcp_tw_reuse = 1" "net.netfilter.nf_conntrack_max = 2097152" "net.netfilter.nf_conntrack_buckets = 524288" "net.netfilter.nf_conntrack_tcp_timeout_established = 7200" "net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30"
+    apply_sysctl_lines "nat-extreme" \
+"net.core.default_qdisc = fq" \
+"net.ipv4.tcp_congestion_control = bbr" \
+"net.ipv4.tcp_fastopen = 3" \
+"net.ipv4.tcp_mtu_probing = 1" \
+"net.ipv4.tcp_slow_start_after_idle = 0" \
+"net.ipv4.ip_local_port_range = 10240 65535" \
+"net.ipv4.tcp_fin_timeout = 15" \
+"net.ipv4.tcp_tw_reuse = 1" \
+"net.netfilter.nf_conntrack_max = 262144" \
+"net.netfilter.nf_conntrack_tcp_timeout_established = 1200" \
+"net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30" \
+"net.core.somaxconn = 8192" \
+"net.ipv4.tcp_max_syn_backlog = 16384" \
+"net.netfilter.nf_conntrack_buckets = 65536" \
+"vm.swappiness = 10"
 }
 
 _dns_now_ms() {
@@ -714,39 +584,6 @@ KbdInteractiveAuthentication ${pass_mode}
 ChallengeResponseAuthentication ${pass_mode}
 EOF_SSHAUTH
 }
-comment_out_port_directives_in_file() {
-    local file="$1"
-    [[ -f "$file" ]] || return 0
-    backup_file_once "$file" || return 1
-    python3 - "$file" <<'PY'
-from pathlib import Path
-import re,sys
-p=Path(sys.argv[1])
-lines=p.read_text(encoding='utf-8', errors='ignore').splitlines()
-out=[]
-changed=False
-for line in lines:
-    if re.match(r'^\s*Port\s+[0-9]+\s*$', line) and '# my-disabled-port' not in line:
-        out.append('# my-disabled-port ' + line.lstrip())
-        changed=True
-    else:
-        out.append(line)
-if changed:
-    p.write_text('\n'.join(out)+'\n', encoding='utf-8')
-PY
-}
-prepare_ssh_single_port() {
-    local file
-    comment_out_port_directives_in_file /etc/ssh/sshd_config || return 1
-    if [[ -d /etc/ssh/sshd_config.d ]]; then
-        for file in /etc/ssh/sshd_config.d/*.conf; do
-            [[ -f "$file" ]] || continue
-            [[ "$file" == "$SSH_PORT_DROPIN" ]] && continue
-            [[ "$file" == "$SSH_AUTH_DROPIN" ]] && continue
-            comment_out_port_directives_in_file "$file" || return 1
-        done
-    fi
-}
 restart_ssh_service() {
     if service_use_systemd; then
         systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1
@@ -754,50 +591,24 @@ restart_ssh_service() {
         service ssh restart >/dev/null 2>&1 || service sshd restart >/dev/null 2>&1
     fi
 }
-ssh_port_listening() {
-    local port="$1"
-    ss -lntH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port"
-}
-rollback_ssh_port_change() {
-    restore_ssh_backups
-    rm -f "$SSH_PORT_DROPIN" 2>/dev/null || true
-    restart_ssh_service >/dev/null 2>&1 || true
-}
 change_ssh_port() {
     local new_port old_port
     read -rp "新的 SSH 端口号 (1-65535): " new_port
     [[ "$new_port" =~ ^[0-9]+$ ]] || { msg_err "端口格式错误。"; return 1; }
     (( new_port >= 1 && new_port <= 65535 )) || { msg_err "端口范围错误。"; return 1; }
     old_port="$(sshd_effective_port 2>/dev/null || echo 22)"
-    prepare_ssh_single_port || { msg_err "处理已有 SSH 端口配置失败。"; return 1; }
     write_ssh_port_dropin "$new_port"
     if ! sshd -t; then
-        msg_err "sshd 配置校验失败，已自动回滚。"
-        rollback_ssh_port_change
+        rm -f "$SSH_PORT_DROPIN"
+        msg_err "sshd 配置校验失败，已取消。"
         return 1
     fi
-    if ! restart_ssh_service; then
-        msg_err "SSH 重启失败，已自动回滚。"
-        rollback_ssh_port_change
-        return 1
-    fi
-    sleep 1
-    if ! ssh_port_listening "$new_port"; then
-        msg_err "新端口 ${new_port} 未监听，已自动回滚。"
-        rollback_ssh_port_change
-        return 1
-    fi
+    restart_ssh_service || { msg_err "SSH 重启失败。"; return 1; }
     if have_cmd ufw; then
         ufw allow "$new_port"/tcp >/dev/null 2>&1 || true
         [[ "$old_port" != "$new_port" ]] && ufw delete allow "$old_port"/tcp >/dev/null 2>&1 || true
     fi
-    if have_cmd firewall-cmd; then
-        firewall-cmd --permanent --add-port="${new_port}/tcp" >/dev/null 2>&1 || true
-        [[ "$old_port" != "$new_port" ]] && firewall-cmd --permanent --remove-port="${old_port}/tcp" >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    fi
-    msg_ok "SSH 端口已切换为 ${new_port}，旧端口 ${old_port} 已不再作为脚本管理目标。"
-    msg_info "请先新开一个终端测试 ${new_port} 可登录，再关闭当前会话。"
+    msg_ok "SSH 端口已修改为 ${new_port}。"
 }
 change_root_password() { passwd root; }
 disable_password_login() {
@@ -814,69 +625,105 @@ restore_password_login() {
 }
 
 github_keys_auto_fetch() {
-    local tmp meta_ok=0 added_count=0 host_count443=0 host_count22=0
-    local work_keys work_hosts backup_file
+    local verify_user input_host host tmp work_keys work_hosts meta_ok=0 added_count=0 host_count22=0 host_count443=0 ans want_443=1
     mkdir -p /root/.ssh 2>/dev/null || true
     touch "$GITHUB_KNOWN_HOSTS" 2>/dev/null || true
     chmod 600 "$GITHUB_KNOWN_HOSTS" 2>/dev/null || true
-    tmp="$(mktemp /tmp/my-ghmeta.XXXXXX.json)" || return 1
-    work_keys="$(mktemp /tmp/my-ghkeys.XXXXXX)" || { rm -f "$tmp"; return 1; }
-    work_hosts="$(mktemp /tmp/my-knownhosts.XXXXXX)" || { rm -f "$tmp" "$work_keys"; return 1; }
-    backup_file="${GITHUB_KNOWN_HOSTS}.bak.$(date +%Y%m%d%H%M%S)"
 
-    if download_to "https://api.github.com/meta" "$tmp" >/dev/null 2>&1; then
-        if have_cmd python3; then
-            python3 - "$tmp" "$work_keys" <<'PY'
+    msg_info "将获取并校验 GitHub SSH 主机密钥。"
+    printf "请输入 GitHub 用户名（可留空，仅用于本次连通性标记）: "
+    read -r verify_user
+    printf "请输入 GitHub SSH 主机（默认 github.com，支持 ssh.github.com）: "
+    read -r input_host
+    host="${input_host:-github.com}"
+    case "$host" in
+        github.com|ssh.github.com) ;;
+        *)
+            msg_warn "当前仅支持 github.com / ssh.github.com，已自动回退为 github.com。"
+            host="github.com"
+            ;;
+    esac
+    printf "是否同时写入 [ssh.github.com]:443 主机密钥？[Y/n]: "
+    read -r ans
+    case "${ans,,}" in
+        n|no) want_443=0 ;;
+        *) want_443=1 ;;
+    esac
+
+    tmp="$(mktemp /tmp/my-ghkeys.XXXXXX)" || return 1
+    work_keys="$(mktemp /tmp/my-ghkeys-lines.XXXXXX)" || { rm -f "$tmp"; return 1; }
+    work_hosts="$(mktemp /tmp/my-known-hosts.XXXXXX)" || { rm -f "$tmp" "$work_keys"; return 1; }
+
+    if download_to "https://api.github.com/meta" "$tmp" >/dev/null 2>&1 && have_cmd python3; then
+        if python3 - "$tmp" "$work_keys" "$want_443" <<'PY'
 import json,sys
 meta=json.load(open(sys.argv[1],'r',encoding='utf-8'))
 keys=meta.get('ssh_keys',[])
-seen=set(); out=[]
+want443=(sys.argv[3]=='1')
+out=[]
 for k in keys:
-    for host in ('github.com','ssh.github.com','[ssh.github.com]:443'):
-        line=f"{host} {k}"
-        if line not in seen:
-            seen.add(line)
-            out.append(line)
+    out.append(f"github.com {k}")
+    out.append(f"ssh.github.com {k}")
+    if want443:
+        out.append(f"[ssh.github.com]:443 {k}")
+seen=set()
 with open(sys.argv[2],'w',encoding='utf-8') as f:
     for line in out:
-        f.write(line+'\n')
+        if line not in seen:
+            seen.add(line)
+            f.write(line+'\n')
 PY
-            [[ -s "$work_keys" ]] && meta_ok=1
+        then
+            meta_ok=1
         fi
     fi
     rm -f "$tmp"
-    if (( meta_ok == 0 )) && have_cmd ssh-keyscan; then
-        ssh-keyscan -T 5 github.com 2>/dev/null | sed '/^#/d' >> "$work_keys" || true
-        ssh-keyscan -T 5 ssh.github.com 2>/dev/null | sed '/^#/d' >> "$work_keys" || true
-        ssh-keyscan -T 5 -p 443 ssh.github.com 2>/dev/null | sed '/^#/d; s/^ssh\.github\.com /[ssh.github.com]:443 /' >> "$work_keys" || true
-    fi
-    [[ -s "$work_keys" ]] || { rm -f "$work_keys" "$work_hosts"; msg_err "GitHub 主机密钥获取失败。"; return 1; }
 
-    cp -a "$GITHUB_KNOWN_HOSTS" "$backup_file" 2>/dev/null || true
-    grep -Ev '^(github\.com|ssh\.github\.com|\[ssh\.github\.com\]:443)[[:space:]]' "$GITHUB_KNOWN_HOSTS" 2>/dev/null > "$work_hosts" || true
+    if (( meta_ok == 0 )); then
+        : > "$work_keys"
+        if have_cmd ssh-keyscan; then
+            ssh-keyscan -T 5 github.com 2>/dev/null | sed '/^#/d' >> "$work_keys" || true
+            ssh-keyscan -T 5 ssh.github.com 2>/dev/null | sed '/^#/d' >> "$work_keys" || true
+            if (( want_443 == 1 )); then
+                ssh-keyscan -T 5 -p 443 ssh.github.com 2>/dev/null | sed '/^#/d; s/^ssh\.github\.com /[ssh.github.com]:443 /' >> "$work_keys" || true
+            fi
+        fi
+    fi
+
+    grep -Ev '^(github\.com|ssh\.github\.com|\[ssh\.github\.com\]:443)[[:space:],]' "$GITHUB_KNOWN_HOSTS" 2>/dev/null > "$work_hosts" || true
     cat "$work_keys" >> "$work_hosts"
     sort -u "$work_hosts" -o "$work_hosts" 2>/dev/null || true
     cp -f "$work_hosts" "$GITHUB_KNOWN_HOSTS" 2>/dev/null || { rm -f "$work_keys" "$work_hosts"; msg_err "写入 known_hosts 失败。"; return 1; }
     chmod 600 "$GITHUB_KNOWN_HOSTS" 2>/dev/null || true
 
+    added_count=$(grep -Ec '^(github\.com|ssh\.github\.com|\[ssh\.github\.com\]:443)[[:space:]]' "$work_keys" 2>/dev/null || true)
     if have_cmd ssh-keygen; then
-        host_count22=$(ssh-keygen -F github.com -f "$GITHUB_KNOWN_HOSTS" 2>/dev/null | grep -c '^github.com ' || true)
+        host_count22=$(ssh-keygen -F "$host" -f "$GITHUB_KNOWN_HOSTS" 2>/dev/null | grep -Ec '^(github\.com|ssh\.github\.com) ' || true)
         host_count443=$(ssh-keygen -F '[ssh.github.com]:443' -f "$GITHUB_KNOWN_HOSTS" 2>/dev/null | grep -c '^\[ssh.github.com\]:443 ' || true)
     else
-        host_count22=$(grep -c '^github\.com ' "$GITHUB_KNOWN_HOSTS" 2>/dev/null || true)
+        host_count22=$(grep -Ec '^(github\.com|ssh\.github\.com) ' "$GITHUB_KNOWN_HOSTS" 2>/dev/null || true)
         host_count443=$(grep -c '^\[ssh.github.com\]:443 ' "$GITHUB_KNOWN_HOSTS" 2>/dev/null || true)
     fi
-    added_count=$(wc -l < "$work_keys" 2>/dev/null || echo 0)
+
     rm -f "$work_keys" "$work_hosts"
+
     if (( host_count22 > 0 || host_count443 > 0 )); then
-        msg_ok "GitHub 主机密钥已刷新到 known_hosts。"
-        msg_info "github.com 条目: ${host_count22} | [ssh.github.com]:443 条目: ${host_count443} | 本次写入: ${added_count}"
-        msg_info "文件位置: ${GITHUB_KNOWN_HOSTS}"
+        msg_ok "GitHub 主机密钥已写入 known_hosts。"
+        msg_info "目标主机: ${host} | github/ssh.github 条目: ${host_count22} | [ssh.github.com]:443 条目: ${host_count443} | 本次写入: ${added_count}"
+        if [[ -n "$verify_user" ]]; then
+            msg_info "已记录本次输入的 GitHub 名称：${verify_user}（仅用于校验提示，主机密钥本身与用户名无关）"
+        fi
+        if (( want_443 == 1 )); then
+            msg_info "如需走 443 端口，请把 Git 远程主机写成 ssh.github.com，并使用端口 443。"
+        fi
+        msg_info "可执行检查：ssh-keygen -F github.com -f ${GITHUB_KNOWN_HOSTS}"
         return 0
     fi
-    msg_err "GitHub 主机密钥验证失败，已保留备份：${backup_file}"
+
+    msg_err "GitHub 主机密钥获取失败。"
     return 1
 }
+
 
 ensure_nginx_installed() {
     if have_cmd nginx; then
@@ -1132,26 +979,6 @@ legacy_cleanup() {
     service_use_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
     msg_ok "旧代理 / 转发残留已清理。"
 }
-full_uninstall() {
-    local self
-    self="$(script_realpath)"
-    msg_warn "开始完整卸载 my：删除脚本、配置、定时任务、SSH/DNS/DDNS/Nginx 管理残留。"
-    cron_remove_regex '/usr/local/bin/my ddns update'
-    cron_remove_regex '/usr/local/bin/my clean'
-    rm -f "$SYSCTL_OPT_FILE" "$DNS_META_FILE" "$DNS_BACKUP_FILE" "$DDNS_CFG_FILE" "$DDNS_LOG_FILE" "$UPDATE_URL_FILE" "$OPTIMIZER_REPORT_FILE" 2>/dev/null || true
-    rm -f "$SSH_PORT_DROPIN" "$SSH_AUTH_DROPIN" 2>/dev/null || true
-    rm -rf "$MY_STATE_DIR" 2>/dev/null || true
-    if [[ -f /etc/systemd/resolved.conf.d/99-my-dns.conf ]]; then
-        rm -f /etc/systemd/resolved.conf.d/99-my-dns.conf
-        systemctl restart systemd-resolved >/dev/null 2>&1 || true
-    fi
-    sysctl -q --system >/dev/null 2>&1 || true
-    rm -f /usr/local/bin/my 2>/dev/null || true
-    [[ "$self" != "/usr/local/bin/my" ]] && rm -f "$self" 2>/dev/null || true
-    msg_ok "my 已完整卸载。"
-    msg_info "若你曾通过本脚本修改过 SSH 主配置且需要恢复，请手动检查：/etc/ssh/sshd_config 与 /etc/ssh/sshd_config.d/"
-    exit 0
-}
 
 uninstall_menu() {
     while true; do
@@ -1161,13 +988,13 @@ uninstall_menu() {
         echo -e "${CYAN}============================================${RESET}"
         echo -e "${YELLOW} 1.${RESET} 清理旧代理 / 转发残留"
         echo -e "${YELLOW} 2.${RESET} 执行日常清理"
-        echo -e "${RED} 3.${RESET} 一键完整卸载（含脚本本体）"
+        echo -e "${RED} 3.${RESET} 卸载本脚本"
         echo -e " 0. 返回"
         read -rp "请输入数字 [0-3]: " choice
         case "$choice" in
             1) legacy_cleanup; read -n 1 -s -r -p "按任意键继续..." ;;
             2) daily_clean; msg_ok "清理完成。"; read -n 1 -s -r -p "按任意键继续..." ;;
-            3) full_uninstall ;;
+            3) rm -f /usr/local/bin/my; msg_ok "已删除 /usr/local/bin/my。"; exit 0 ;;
             0) return ;;
             *) msg_err "无效选项"; sleep 1 ;;
         esac
@@ -1226,7 +1053,7 @@ optimize_menu() {
         echo -e "${YELLOW} 4.${RESET} 手动设置 DNS"
         echo -e "${YELLOW} 5.${RESET} 查看 DNS 状态"
         echo -e "${YELLOW} 6.${RESET} 恢复 DNS"
-        echo -e "${YELLOW} 7.${RESET} 自动获取 GitHub 主机密钥"
+        echo -e "${YELLOW} 7.${RESET} 获取 / 校验 GitHub 主机密钥（会提示输入 GitHub 名称）"
         echo -e "${YELLOW} 8.${RESET} 修改 SSH 端口"
         echo -e "${YELLOW} 9.${RESET} 修改 root 密码"
         echo -e "${YELLOW}10.${RESET} 关闭 SSH 密码登录"
@@ -1351,45 +1178,15 @@ services_menu() {
     done
 }
 
-update_menu() {
-    while true; do
-        clear 2>/dev/null || true
-        echo -e "${CYAN}============================================${RESET}"
-        echo -e "${CYAN}                脚本更新中心                ${RESET}"
-        echo -e "${CYAN}============================================${RESET}"
-        show_update_source
-        echo -e "${YELLOW} 1.${RESET} 一键远程 GitHub 更新"
-        echo -e "${YELLOW} 2.${RESET} 设置 / 修改远程更新地址"
-        echo -e "${YELLOW} 3.${RESET} 查看当前更新地址"
-        echo -e "${YELLOW} 4.${RESET} 用当前运行文件覆盖安装（保留配置）"
-        echo -e " 0. 返回"
-        read -rp "请输入数字 [0-4]: " choice
-        case "$choice" in
-            1) github_update; read -n 1 -s -r -p "按任意键继续..." ;;
-            2)
-                read -rp "请输入 GitHub raw 脚本地址（或 github.com/blob 链接）: " url
-                url="$(normalize_github_raw_url "$url" 2>/dev/null || true)"
-                [[ -n "$url" ]] || { msg_err "更新地址不能为空。"; read -n 1 -s -r -p "按任意键继续..."; continue; }
-                update_url_set "$url" && msg_ok "远程更新地址已保存。" || msg_err "保存更新地址失败。"
-                read -n 1 -s -r -p "按任意键继续..."
-                ;;
-            3) show_update_source; read -n 1 -s -r -p "按任意键继续..." ;;
-            4) install_self_command && msg_ok "已用当前文件覆盖安装到 /usr/local/bin/my，配置已保留。"; read -n 1 -s -r -p "按任意键继续..." ;;
-            0) return ;;
-            *) msg_err "无效选项"; sleep 1 ;;
-        esac
-    done
-}
-
 main_menu() {
     clear 2>/dev/null || true
     echo -e "${CYAN}============================================${RESET}"
-    echo -e "${CYAN}          my 修复增强版 v${MY_VERSION}${RESET}"
+    echo -e "${CYAN}          my 优化专用版 v${MY_VERSION}${RESET}"
     echo -e "${CYAN}============================================${RESET}"
     echo -e "${YELLOW} 1.${RESET} 状态页 / 快捷导航"
     echo -e "${YELLOW} 2.${RESET} 优化中心"
     echo -e "${YELLOW} 3.${RESET} DDNS / 建站 / DD 中心"
-    echo -e "${YELLOW} 4.${RESET} 脚本更新 / 远程 GitHub 更新"
+    echo -e "${YELLOW} 4.${RESET} 脚本更新"
     echo -e "${YELLOW} 5.${RESET} 清理残留 / 卸载"
     echo -e " 0. 退出"
     echo -e "${CYAN}--------------------------------------------${RESET}"
@@ -1398,7 +1195,7 @@ main_menu() {
         1) status_page_loop ;;
         2) optimize_menu ;;
         3) services_menu ;;
-        4) update_menu ;;
+        4) github_update; read -n 1 -s -r -p "按任意键继续..." ;;
         5) uninstall_menu ;;
         0) exit 0 ;;
         *) msg_err "无效选项"; sleep 1 ;;
@@ -1453,7 +1250,6 @@ if [[ $# -gt 0 ]]; then
             shift
             case "${1:-keys}" in
                 keys|known-hosts) github_keys_auto_fetch ;;
-                update) shift; github_update "$1" ;;
                 *) msg_err "未知 github 子命令"; exit 1 ;;
             esac
             exit $?
@@ -1499,15 +1295,7 @@ if [[ $# -gt 0 ]]; then
             exit 0
             ;;
         update)
-            shift || true
-            case "${1:-run}" in
-                menu) update_menu ;;
-                run) shift || true; github_update "$1" ;;
-                set) shift || true; update_url_set "$1" && msg_ok "远程更新地址已保存。" ;;
-                show) show_update_source ;;
-                install-self) install_self_command && msg_ok "已覆盖安装到 /usr/local/bin/my。" ;;
-                *) msg_err "未知 update 子命令"; exit 1 ;;
-            esac
+            github_update
             exit $?
             ;;
         purge|cleanup-legacy)
@@ -1515,15 +1303,13 @@ if [[ $# -gt 0 ]]; then
             exit $?
             ;;
         *)
-            msg_err "未知参数。可用：my status | my optimize <menu|general|nat> | my dns <auto|manual|status|restore> | my github <keys|update [URL]> | my ssh <port|passwd|disable-passwd|enable-passwd> | my nginx <menu|install|list|delete 域名|repair> | my ddns <menu|setup|update|status|install-cron|remove> | my dd | my update <run|set URL|show|install-self> | my purge"
+            msg_err "未知参数。可用：my status | my optimize <menu|general|nat> | my dns <auto|manual|status|restore> | my github keys | my ssh <port|passwd|disable-passwd|enable-passwd> | my nginx <menu|install|list|delete 域名|repair> | my ddns <menu|setup|update|status|install-cron|remove> | my dd | my update | my purge"
             exit 1
             ;;
     esac
 fi
 
-if [[ "${MY_UNIT_TEST:-0}" != "1" ]]; then
-    init
-    while true; do
-        main_menu
-    done
-fi
+init
+while true; do
+    main_menu
+done
